@@ -27,6 +27,8 @@ struct AnthropicApiResponse {
 
 /// Cache entry for models
 struct CacheEntry {
+    /// The key the list was fetched with: another account sees other models.
+    api_key: String,
     models: Vec<AnthropicModel>,
     fetched_at: Instant,
 }
@@ -89,7 +91,9 @@ pub async fn get_anthropic_models(api_key: Option<String>) -> Result<Vec<Anthrop
     {
         let cache = MODELS_CACHE.read().map_err(|e| e.to_string())?;
         if let Some(entry) = cache.as_ref() {
-            if entry.fetched_at.elapsed() < Duration::from_secs(CACHE_TTL_SECS) {
+            if entry.api_key == api_key
+                && entry.fetched_at.elapsed() < Duration::from_secs(CACHE_TTL_SECS)
+            {
                 log::info!(
                     "Returning cached Anthropic models ({} models)",
                     entry.models.len()
@@ -160,6 +164,7 @@ pub async fn get_anthropic_models(api_key: Option<String>) -> Result<Vec<Anthrop
     {
         let mut cache = MODELS_CACHE.write().map_err(|e| e.to_string())?;
         *cache = Some(CacheEntry {
+            api_key,
             models: models.clone(),
             fetched_at: Instant::now(),
         });
@@ -168,10 +173,3 @@ pub async fn get_anthropic_models(api_key: Option<String>) -> Result<Vec<Anthrop
     Ok(models)
 }
 
-/// Clear the models cache (useful when API key changes)
-pub fn clear_cache() {
-    if let Ok(mut cache) = MODELS_CACHE.write() {
-        *cache = None;
-        log::info!("Anthropic models cache cleared");
-    }
-}

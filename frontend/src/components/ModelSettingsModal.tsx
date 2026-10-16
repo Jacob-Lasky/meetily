@@ -505,22 +505,26 @@ export function ModelSettingsModal({
     const provider = modelConfig.provider;
     if (!isCloudModelProvider(provider)) return;
 
-    // A slower response for an older key must not overwrite a newer one.
+    // A slower response for an older key must not overwrite a newer one, and
+    // the debounce keeps typing a key from firing one request per keystroke.
     let stale = false;
     setIsLoadingCloudModels(true);
-    invoke<CloudModel[]>(CLOUD_MODEL_COMMANDS[provider], { apiKey: apiKey?.trim() || null })
-      .then((data) => {
-        if (!stale) setCloudModels((prev) => ({ ...prev, [provider]: data.map((m) => m.id) }));
-      })
-      .catch((err) => {
-        console.error(`Error loading ${provider} models:`, err);
-        if (!stale) setCloudModels((prev) => ({ ...prev, [provider]: [] }));
-      })
-      .finally(() => {
-        if (!stale) setIsLoadingCloudModels(false);
-      });
+    const timer = setTimeout(() => {
+      invoke<CloudModel[]>(CLOUD_MODEL_COMMANDS[provider], { apiKey: apiKey?.trim() || null })
+        .then((data) => {
+          if (!stale) setCloudModels((prev) => ({ ...prev, [provider]: data.map((m) => m.id) }));
+        })
+        .catch((err) => {
+          console.error(`Error loading ${provider} models:`, err);
+          if (!stale) setCloudModels((prev) => ({ ...prev, [provider]: [] }));
+        })
+        .finally(() => {
+          if (!stale) setIsLoadingCloudModels(false);
+        });
+    }, 400);
     return () => {
       stale = true;
+      clearTimeout(timer);
     };
   }, [modelConfig.provider, apiKey]);
 

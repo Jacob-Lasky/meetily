@@ -30,6 +30,8 @@ struct GroqApiResponse {
 
 /// Cache entry for models
 struct CacheEntry {
+    /// The key the list was fetched with: another account sees other models.
+    api_key: String,
     models: Vec<GroqModel>,
     fetched_at: Instant,
 }
@@ -109,7 +111,9 @@ pub async fn get_groq_models(api_key: Option<String>) -> Result<Vec<GroqModel>, 
     {
         let cache = MODELS_CACHE.read().map_err(|e| e.to_string())?;
         if let Some(entry) = cache.as_ref() {
-            if entry.fetched_at.elapsed() < Duration::from_secs(CACHE_TTL_SECS) {
+            if entry.api_key == api_key
+                && entry.fetched_at.elapsed() < Duration::from_secs(CACHE_TTL_SECS)
+            {
                 log::info!("Returning cached Groq models ({} models)", entry.models.len());
                 return Ok(entry.models.clone());
             }
@@ -165,6 +169,7 @@ pub async fn get_groq_models(api_key: Option<String>) -> Result<Vec<GroqModel>, 
     {
         let mut cache = MODELS_CACHE.write().map_err(|e| e.to_string())?;
         *cache = Some(CacheEntry {
+            api_key,
             models: models.clone(),
             fetched_at: Instant::now(),
         });
@@ -173,13 +178,6 @@ pub async fn get_groq_models(api_key: Option<String>) -> Result<Vec<GroqModel>, 
     Ok(models)
 }
 
-/// Clear the models cache (useful when API key changes)
-pub fn clear_cache() {
-    if let Ok(mut cache) = MODELS_CACHE.write() {
-        *cache = None;
-        log::info!("Groq models cache cleared");
-    }
-}
 
 #[cfg(test)]
 mod tests {

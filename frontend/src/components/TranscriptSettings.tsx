@@ -10,10 +10,11 @@ import { ParakeetModelManager } from './ParakeetModelManager';
 import { Textarea } from './ui/textarea';
 import { Switch } from './ui/switch';
 import { LanguageSelection } from './LanguageSelection';
+import { toUiTranscriptProvider, type TranscriptProvider } from '@/lib/transcript-providers';
 
 
 export interface TranscriptModelProps {
-    provider: 'localWhisper' | 'parakeet' | 'deepgram';
+    provider: TranscriptProvider;
     model: string;
     apiKey?: string | null;
 }
@@ -29,7 +30,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     const [showApiKey, setShowApiKey] = useState<boolean>(false);
     const [isApiKeyLocked, setIsApiKeyLocked] = useState<boolean>(true);
     const [isLockButtonVibrating, setIsLockButtonVibrating] = useState<boolean>(false);
-    const [uiProvider, setUiProvider] = useState<TranscriptModelProps['provider']>(transcriptModelConfig.provider);
+    const [uiProvider, setUiProvider] = useState<TranscriptProvider>(toUiTranscriptProvider(transcriptModelConfig.provider));
     const [deepgramKeyterm, setDeepgramKeyterm] = useState<string>('');
     // Placeholders until api_get_deepgram_options answers; the backend owns the defaults.
     const [deepgramDiarize, setDeepgramDiarize] = useState<boolean>(false);
@@ -42,7 +43,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
 
     // Sync uiProvider when backend config changes (e.g., after model selection or initial load)
     useEffect(() => {
-        setUiProvider(transcriptModelConfig.provider);
+        setUiProvider(toUiTranscriptProvider(transcriptModelConfig.provider));
     }, [transcriptModelConfig.provider]);
 
     // Load Deepgram-specific knobs when the Deepgram provider is active.

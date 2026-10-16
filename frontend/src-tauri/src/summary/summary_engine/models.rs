@@ -355,9 +355,14 @@ pub fn format_prompt(
 
     let escaped_user_prompt = escape_user_prompt_control_markers(user_prompt);
 
+    // Substitute in one pass over the template. Chained replace() calls would
+    // rescan inserted text: a custom system prompt containing the literal
+    // "{user_prompt}" would pull the transcript into the system turn.
     let formatted = template
-        .replace("{system_prompt}", system_prompt)
-        .replace("{user_prompt}", &escaped_user_prompt);
+        .split("{system_prompt}")
+        .map(|part| part.replace("{user_prompt}", &escaped_user_prompt))
+        .collect::<Vec<_>>()
+        .join(system_prompt);
 
     Ok(formatted)
 }
@@ -530,6 +535,20 @@ mod tests {
         assert_eq!(formatted.matches("<turn|>").count(), 2);
         assert!(!formatted.contains("<|think|>"));
         assert!(!formatted.contains("<|channel>"));
+    }
+
+    #[test]
+    fn placeholders_inside_supplied_text_are_not_substituted() {
+        for template in ["gemma3", "gemma4", "qwen3.5_nonthinking"] {
+            let formatted =
+                format_prompt(template, "rules mention {user_prompt}", "notes mention {system_prompt}")
+                    .unwrap();
+
+            assert!(formatted.contains("rules mention {user_prompt}"), "{template}");
+            assert!(formatted.contains("notes mention {system_prompt}"), "{template}");
+            assert_eq!(formatted.matches("rules mention").count(), 1, "{template}");
+            assert_eq!(formatted.matches("notes mention").count(), 1, "{template}");
+        }
     }
 
     #[test]

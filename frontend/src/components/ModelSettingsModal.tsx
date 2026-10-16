@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import { modelToApply, withModelIfProvider } from '@/lib/summary-model-pick';
 import { useSidebar } from './Sidebar/SidebarProvider';
 import { invoke } from '@tauri-apps/api/core';
 import { Button } from '@/components/ui/button';
@@ -141,6 +142,9 @@ export function ModelSettingsModal({
     groq: [],
   });
   const [isLoadingCloudModels, setIsLoadingCloudModels] = useState<boolean>(false);
+  // The model the restore effect chose on its own, so a later, better list
+  // may replace it without overriding a choice the user made.
+  const autoPickedModel = useRef<string | null>(null);
 
   // Use global download context instead of local state
   const { isDownloading, getProgress, downloadingModels } = useOllamaDownload();
@@ -227,6 +231,8 @@ export function ModelSettingsModal({
 
   const isDoneDisabled =
     (requiresApiKey && (!apiKey || (typeof apiKey === 'string' && !apiKey.trim()))) ||
+    // A cloud provider whose list failed to load would otherwise save model ''.
+    (requiresApiKey && !modelConfig.model?.trim()) ||
     (modelConfig.provider === 'ollama' && ollamaEndpointChanged) ||
     isCustomOpenAIInvalid;
 
@@ -528,25 +534,23 @@ export function ModelSettingsModal({
     };
   }, [modelConfig.provider, apiKey]);
 
-  // Restore cached model when async model lists become available
+  // Pick a model when a provider's list arrives or changes (see modelToApply)
   useEffect(() => {
     const providerModels = modelOptions[modelConfig.provider];
     if (!providerModels || providerModels.length === 0) return;
 
-    // If current model is already valid, nothing to do
-    if (modelConfig.model && providerModels.includes(modelConfig.model)) return;
-
-    // Try to restore from localStorage cache
     const map = JSON.parse(localStorage.getItem('providerModelMap') || '{}');
-    const cachedModel = map[modelConfig.provider];
-    if (cachedModel && providerModels.includes(cachedModel)) {
-      setModelConfig((prev: ModelConfig) => ({ ...prev, model: cachedModel }));
-    } else if (!modelConfig.model) {
-      // Switched to a provider before its list arrived: take the newest model
-      // rather than leaving the picker blank. A saved model that is missing
-      // from the list is left alone so the user sees what they picked.
-      setModelConfig((prev: ModelConfig) => ({ ...prev, model: providerModels[0] }));
-    }
+    const choice = modelToApply(
+      modelConfig.model,
+      providerModels,
+      map[modelConfig.provider],
+      autoPickedModel.current,
+    );
+    if (!choice) return;
+
+    autoPickedModel.current = choice.auto ? choice.model : null;
+    const provider = modelConfig.provider;
+    setModelConfig((prev: ModelConfig) => withModelIfProvider(prev, provider, choice.model));
   }, [models, openRouterModels, builtinAiModels, cloudModels, modelConfig.provider]);
 
   const handleSave = async () => {
@@ -853,6 +857,7 @@ export function ModelSettingsModal({
                                 key={model}
                                 value={model}
                                 onSelect={(currentValue) => {
+                                  autoPickedModel.current = null;
                                   setModelConfig((prev: ModelConfig) => ({ ...prev, model: currentValue }));
                                   setModelComboboxOpen(false);
                                 }}
@@ -1298,7 +1303,10 @@ export function ModelSettingsModal({
               selectedModel={modelConfig.model}
               layout={layout}
               onModelSelect={(model) =>
-                setModelConfig((prev: ModelConfig) => ({ ...prev, model }))
+                // The catalog fetch behind an auto-select can resolve after the
+                // saved config has loaded with another provider; never put a
+                // local model on a cloud provider.
+                setModelConfig((prev: ModelConfig) => withModelIfProvider(prev, 'builtin-ai', model))
               }
             />
           </div>

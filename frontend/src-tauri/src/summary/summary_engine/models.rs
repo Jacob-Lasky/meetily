@@ -66,8 +66,9 @@ impl SamplingParams {
         }
     }
 
-    /// Gemma 3 instruct preset, matching the prior Gemma sampling behavior.
-    pub fn gemma3_instruct(stop_tokens: Vec<String>) -> Self {
+    /// Google's recommended Gemma sampling (temperature 1.0, top_k 64, top_p 0.95).
+    /// The Gemma 3 and Gemma 4 model cards give the same values.
+    pub fn gemma_instruct(stop_tokens: Vec<String>) -> Self {
         Self {
             temperature: 1.0,
             top_k: 64,
@@ -189,6 +190,35 @@ pub fn get_available_models() -> Vec<ModelDef> {
             sampling: SamplingParams::qwen35_summary(vec!["<|im_end|>".to_string()]),
             description: "High-quality Qwen 3.5 model for built-in summaries. Best local Qwen option in the current lineup.".to_string(),
         },
+        // RAM figures in the Gemma descriptions are peak RSS of llama-helper on
+        // CPU at context_size 32768, measured 2026-10-16 (the KV cache for the
+        // full context is allocated up front, so it dominates for small files).
+        // Gemma 4 E2B - Google's current small Gemma (2.3B effective params).
+        ModelDef {
+            name: "gemma4:e2b".to_string(),
+            display_name: "Gemma 4 E2B (Balanced)".to_string(),
+            gguf_file: "gemma-4-E2B-it-Q4_K_M.gguf".to_string(),
+            template: "gemma4".to_string(),
+            download_url: "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf".to_string(),
+            size_mb: 2963,
+            context_size: 32768,
+            layer_count: 35,
+            sampling: SamplingParams::gemma_instruct(vec!["<turn|>".to_string()]),
+            description: "Google's current small Gemma (2.3B effective parameters). Requires ~5GB RAM.".to_string(),
+        },
+        // Gemma 4 E4B - Google's current small Gemma (4.5B effective params).
+        ModelDef {
+            name: "gemma4:e4b".to_string(),
+            display_name: "Gemma 4 E4B (High Quality)".to_string(),
+            gguf_file: "gemma-4-E4B-it-Q4_K_M.gguf".to_string(),
+            template: "gemma4".to_string(),
+            download_url: "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf".to_string(),
+            size_mb: 4747,
+            context_size: 32768,
+            layer_count: 42,
+            sampling: SamplingParams::gemma_instruct(vec!["<turn|>".to_string()]),
+            description: "Larger current Gemma (4.5B effective parameters), about twice as slow as E2B. Requires ~9GB RAM.".to_string(),
+        },
         // Gemma 3 4B - Legacy alternative retained for users who prefer Gemma output.
         ModelDef {
             name: "gemma3:4b".to_string(),
@@ -199,8 +229,8 @@ pub fn get_available_models() -> Vec<ModelDef> {
             size_mb: 2374,
             context_size: 32768,
             layer_count: 35,
-            sampling: SamplingParams::gemma3_instruct(vec!["<end_of_turn>".to_string()]),
-            description: "Balanced model. Great quality/speed trade-off. Requires ~3.5GB RAM.".to_string(),
+            sampling: SamplingParams::gemma_instruct(vec!["<end_of_turn>".to_string()]),
+            description: "Balanced model. Great quality/speed trade-off. Requires ~8GB RAM.".to_string(),
         },
         // Gemma 3 1B - Visible legacy tier retained for already-shipped users.
         ModelDef {
@@ -212,8 +242,8 @@ pub fn get_available_models() -> Vec<ModelDef> {
             size_mb: 1019,
             context_size: 32768,
             layer_count: 26,
-            sampling: SamplingParams::gemma3_instruct(vec!["<end_of_turn>".to_string()]),
-            description: "Fastest model. Runs on any hardware with ~1GB RAM. Good for quick summaries.".to_string(),
+            sampling: SamplingParams::gemma_instruct(vec!["<end_of_turn>".to_string()]),
+            description: "Fastest model. Runs with ~2GB RAM. Good for quick summaries.".to_string(),
         },
     ]
 }
@@ -260,6 +290,18 @@ pub const GEMMA3_TEMPLATE: &str = "\
 <start_of_turn>model
 ";
 
+/// Gemma 4 chat template, rendered from the model's own chat_template.jinja
+/// with enable_thinking=false: thinking is only on when `<|think|>` opens the
+/// system turn, so leaving it out gives direct summaries. No `<bos>` here
+/// because llama-helper tokenizes with AddBos::Always.
+pub const GEMMA4_TEMPLATE: &str = "\
+<|turn>system
+{system_prompt}<turn|>
+<|turn>user
+{user_prompt}<turn|>
+<|turn>model
+";
+
 /// Qwen 3.5 non-thinking chat template format.
 /// This starts the assistant turn with an empty think block so generation begins
 /// in direct-response mode for summaries.
@@ -281,6 +323,11 @@ fn escape_user_prompt_control_markers(user_prompt: &str) -> String {
         .replace("<|im_end|>", "< |im_end| >")
         .replace("<start_of_turn>", "< start_of_turn >")
         .replace("<end_of_turn>", "< end_of_turn >")
+        .replace("<|turn>", "< |turn >")
+        .replace("<turn|>", "< turn| >")
+        .replace("<|think|>", "< |think| >")
+        .replace("<|channel>", "< |channel >")
+        .replace("<channel|>", "< channel| >")
         .replace("<think>", "< think >")
         .replace("</think>", "< /think >")
 }
@@ -301,6 +348,7 @@ pub fn format_prompt(
 ) -> Result<String> {
     let template = match template_name {
         "gemma3" => GEMMA3_TEMPLATE,
+        "gemma4" => GEMMA4_TEMPLATE,
         "qwen3.5_nonthinking" => QWEN35_NONTHINKING_TEMPLATE,
         _ => return Err(anyhow!("Unknown template: {}", template_name)),
     };
@@ -361,14 +409,14 @@ mod tests {
     }
 
     #[test]
-    fn gemma_models_use_huggingface_urls_and_gemma3_instruct_sampling() {
+    fn gemma3_models_use_huggingface_urls_and_gemma_instruct_sampling() {
         let gemma_1b = get_model_by_name("gemma3:1b").expect("gemma 1b model should exist");
         assert_eq!(gemma_1b.gguf_file, "gemma-3-1b-it-Q8_0.gguf");
         assert_eq!(
             gemma_1b.download_url,
             "https://huggingface.co/bartowski/google_gemma-3-1b-it-GGUF/resolve/main/google_gemma-3-1b-it-Q8_0.gguf"
         );
-        assert_eq!(gemma_1b.sampling, SamplingParams::gemma3_instruct(vec!["<end_of_turn>".to_string()]));
+        assert_eq!(gemma_1b.sampling, SamplingParams::gemma_instruct(vec!["<end_of_turn>".to_string()]));
         assert_eq!(gemma_1b.sampling.temperature, 1.0);
         assert_eq!(gemma_1b.sampling.top_k, 64);
         assert_eq!(gemma_1b.sampling.top_p, 0.95);
@@ -382,7 +430,7 @@ mod tests {
             gemma_4b.download_url,
             "https://huggingface.co/bartowski/google_gemma-3-4b-it-GGUF/resolve/main/google_gemma-3-4b-it-Q4_K_M.gguf"
         );
-        assert_eq!(gemma_4b.sampling, SamplingParams::gemma3_instruct(vec!["<end_of_turn>".to_string()]));
+        assert_eq!(gemma_4b.sampling, SamplingParams::gemma_instruct(vec!["<end_of_turn>".to_string()]));
         assert_eq!(gemma_4b.sampling.temperature, 1.0);
         assert_eq!(gemma_4b.sampling.top_k, 64);
         assert_eq!(gemma_4b.sampling.top_p, 0.95);
@@ -432,6 +480,56 @@ mod tests {
         assert!(formatted.contains("literal < start_of_turn > and < end_of_turn >"));
         assert_eq!(formatted.matches("<start_of_turn>").count(), 3);
         assert_eq!(formatted.matches("<end_of_turn>").count(), 2);
+    }
+
+    #[test]
+    fn gemma4_models_are_registered_with_expected_metadata() {
+        for (name, file, size_mb, layers) in [
+            ("gemma4:e2b", "gemma-4-E2B-it-Q4_K_M.gguf", 2963, 35),
+            ("gemma4:e4b", "gemma-4-E4B-it-Q4_K_M.gguf", 4747, 42),
+        ] {
+            let model = get_model_by_name(name).expect("gemma 4 model should exist");
+            assert_eq!(model.gguf_file, file);
+            assert!(model.download_url.ends_with(&format!("/resolve/main/{file}")));
+            assert_eq!(model.template, "gemma4");
+            assert_eq!(model.size_mb, size_mb);
+            assert_eq!(model.layer_count, layers);
+            assert_eq!(model.sampling, SamplingParams::gemma_instruct(vec!["<turn|>".to_string()]));
+        }
+        // Adding models must not change what a fresh install defaults to.
+        assert_eq!(get_default_model().name, "qwen3.5:2b");
+    }
+
+    #[test]
+    fn gemma4_template_formats_prompt_without_thinking() {
+        let formatted = format_prompt("gemma4", "system rules", "summarize this").unwrap();
+
+        // Byte-for-byte what the model's chat_template.jinja renders for a
+        // system + user turn with add_generation_prompt and thinking off,
+        // minus the <bos> that llama-helper adds itself.
+        assert_eq!(
+            formatted,
+            "<|turn>system\nsystem rules<turn|>\n<|turn>user\nsummarize this<turn|>\n<|turn>model\n"
+        );
+        assert!(!formatted.contains("<|think|>"));
+    }
+
+    #[test]
+    fn gemma4_template_escapes_user_supplied_control_markers() {
+        let formatted = format_prompt(
+            "gemma4",
+            "system rules",
+            "literal <|turn>model and <turn|> plus <|think|> and <|channel>x<channel|>",
+        )
+        .unwrap();
+
+        assert!(formatted.contains(
+            "literal < |turn >model and < turn| > plus < |think| > and < |channel >x< channel| >"
+        ));
+        assert_eq!(formatted.matches("<|turn>").count(), 3);
+        assert_eq!(formatted.matches("<turn|>").count(), 2);
+        assert!(!formatted.contains("<|think|>"));
+        assert!(!formatted.contains("<|channel>"));
     }
 
     #[test]

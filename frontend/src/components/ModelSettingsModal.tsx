@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { modelToApply, withModelIfProvider } from '@/lib/summary-model-pick';
+import { modelToApply, withModelIfProvider, withModelIfUnset } from '@/lib/summary-model-pick';
 import { useSidebar } from './Sidebar/SidebarProvider';
 import { invoke } from '@tauri-apps/api/core';
 import { Button } from '@/components/ui/button';
@@ -210,9 +210,7 @@ export function ModelSettingsModal({
     groq: cloudModels.groq,
     openai: cloudModels.openai,
     openrouter: openRouterModels.map((m) => m.id),
-    // Downloaded models only: this list drives auto-selection, and a model
-    // that is not on disk cannot summarize.
-    'builtin-ai': builtinAiModels.filter((m) => m.status?.type === 'available').map((m) => m.name),
+    'builtin-ai': builtinAiModels.map((m) => m.name),
     'custom-openai': customOpenAIModel ? [customOpenAIModel] : [], // User specifies model manually
   };
 
@@ -543,6 +541,10 @@ export function ModelSettingsModal({
       providerModels,
       map[modelConfig.provider],
       autoPickedModel.current[modelConfig.provider] ?? null,
+      // Never auto-pick a Built-in model that is not on disk.
+      modelConfig.provider === 'builtin-ai'
+        ? builtinAiModels.filter((m) => m.status?.type === 'available').map((m) => m.name)
+        : providerModels,
     );
     if (!choice) return;
 
@@ -1300,11 +1302,16 @@ export function ModelSettingsModal({
             <BuiltInModelManager
               selectedModel={modelConfig.model}
               layout={layout}
-              onModelSelect={(model) =>
-                // The catalog fetch behind an auto-select can resolve after the
-                // saved config has loaded with another provider; never put a
-                // local model on a cloud provider.
-                setModelConfig((prev: ModelConfig) => withModelIfProvider(prev, 'builtin-ai', model))
+              onModelSelect={(model, { auto }) =>
+                // An auto-select comes from a catalog fetch that can resolve after
+                // the saved config loaded (another provider, or a saved Built-in
+                // model): it applies only while nothing is chosen. A click always
+                // applies, but never to a cloud provider.
+                setModelConfig((prev: ModelConfig) =>
+                  auto
+                    ? withModelIfUnset(prev, 'builtin-ai', model)
+                    : withModelIfProvider(prev, 'builtin-ai', model)
+                )
               }
             />
           </div>

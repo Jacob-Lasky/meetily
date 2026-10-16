@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Button } from '@/components/ui/button';
@@ -31,7 +31,8 @@ interface DownloadProgressInfo {
 
 interface BuiltInModelManagerProps {
   selectedModel: string;
-  onModelSelect: (model: string) => void;
+  /** `auto` marks the fetch-time auto-select, which must not replace a choice. */
+  onModelSelect: (model: string, opts: { auto: boolean }) => void;
   layout?: 'inline' | 'dialog';
 }
 
@@ -40,8 +41,6 @@ export function BuiltInModelManager({
   onModelSelect,
   layout = 'inline',
 }: BuiltInModelManagerProps) {
-  const selectedModelRef = useRef(selectedModel);
-  selectedModelRef.current = selectedModel;
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [hasFetched, setHasFetched] = useState<boolean>(false);
@@ -55,13 +54,12 @@ export function BuiltInModelManager({
       const data = (await invoke('builtin_ai_list_models')) as ModelInfo[];
       setModels(data);
 
-      // Auto-select first available model if none selected. Read the latest
-      // selection, not the one captured when the fetch started: the saved
-      // config may have loaded while it was in flight.
-      if (data.length > 0 && !selectedModelRef.current) {
+      // Auto-select first available model if none selected. `selectedModel` is
+      // from when the fetch started, so the parent re-checks at update time.
+      if (data.length > 0 && !selectedModel) {
         const firstAvailable = data.find((m) => m.status.type === 'available');
         if (firstAvailable) {
-          onModelSelect(firstAvailable.name);
+          onModelSelect(firstAvailable.name, { auto: true });
         }
       }
     } catch (error) {
@@ -315,7 +313,7 @@ export function BuiltInModelManager({
               )}
               onClick={() => {
                 if (isAvailable && !modelIsDownloading) {
-                  onModelSelect(model.name);
+                  onModelSelect(model.name, { auto: false });
                 }
               }}
             >

@@ -27,6 +27,8 @@ struct AnthropicApiResponse {
 
 /// Cache entry for models
 struct CacheEntry {
+    /// The key the list was fetched with: another account sees other models.
+    api_key: String,
     models: Vec<AnthropicModel>,
     fetched_at: Instant,
 }
@@ -37,12 +39,16 @@ static MODELS_CACHE: RwLock<Option<CacheEntry>> = RwLock::new(None);
 /// Cache TTL in seconds
 const CACHE_TTL_SECS: u64 = 300;
 
-/// Fallback models when API fetch fails (matches frontend hardcoded values)
+/// Shown when no API key is set or the fetch fails. With a key, the live
+/// `/v1/models` list (newest first) replaces this, so it only needs the
+/// current lineup. The frontend has no copy of this list: it always asks this
+/// command. Claude Fable 5.1 is deliberately absent: it returns 400 unless the
+/// organization has data retention enabled (measured 2026-10-16), and the
+/// live list already includes it for accounts that can use it.
 const FALLBACK_MODELS: &[(&str, &str)] = &[
-    ("claude-sonnet-4-5-20250929", "Claude 4.5 Sonnet"),
-    ("claude-haiku-4-5-20251001", "Claude 4.5 Haiku"),
-    ("claude-opus-4-1-20250805", "Claude 4.1 Opus"),
-    ("claude-sonnet-4-20250514", "Claude 4 Sonnet"),
+    ("claude-opus-5-5", "Claude Opus 5.5"),
+    ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+    ("claude-haiku-5-5", "Claude Haiku 5.5"),
 ];
 
 /// Get fallback models as AnthropicModel vec
@@ -85,7 +91,9 @@ pub async fn get_anthropic_models(api_key: Option<String>) -> Result<Vec<Anthrop
     {
         let cache = MODELS_CACHE.read().map_err(|e| e.to_string())?;
         if let Some(entry) = cache.as_ref() {
-            if entry.fetched_at.elapsed() < Duration::from_secs(CACHE_TTL_SECS) {
+            if entry.api_key == api_key
+                && entry.fetched_at.elapsed() < Duration::from_secs(CACHE_TTL_SECS)
+            {
                 log::info!(
                     "Returning cached Anthropic models ({} models)",
                     entry.models.len()
@@ -100,7 +108,9 @@ pub async fn get_anthropic_models(api_key: Option<String>) -> Result<Vec<Anthrop
     let client = reqwest::Client::new();
 
     let response = match client
-        .get("https://api.anthropic.com/v1/models")
+        // The default page is 20 models; ask for the maximum so a growing
+        // lineup is never silently truncated.
+        .get("https://api.anthropic.com/v1/models?limit=1000")
         .header("x-api-key", &api_key)
         .header("anthropic-version", "2023-06-01")
         .timeout(Duration::from_secs(5))
@@ -154,6 +164,7 @@ pub async fn get_anthropic_models(api_key: Option<String>) -> Result<Vec<Anthrop
     {
         let mut cache = MODELS_CACHE.write().map_err(|e| e.to_string())?;
         *cache = Some(CacheEntry {
+            api_key,
             models: models.clone(),
             fetched_at: Instant::now(),
         });
@@ -162,10 +173,3 @@ pub async fn get_anthropic_models(api_key: Option<String>) -> Result<Vec<Anthrop
     Ok(models)
 }
 
-/// Clear the models cache (useful when API key changes)
-pub fn clear_cache() {
-    if let Ok(mut cache) = MODELS_CACHE.write() {
-        *cache = None;
-        log::info!("Anthropic models cache cleared");
-    }
-}

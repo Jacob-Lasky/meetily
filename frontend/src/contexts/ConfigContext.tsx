@@ -70,7 +70,6 @@ interface ConfigContextType {
 
   // Ollama models
   models: OllamaModel[];
-  modelOptions: Record<ModelConfig['provider'], string[]>;
   error: string;
 
   // Summary configuration
@@ -100,8 +99,10 @@ const ConfigContext = createContext<ConfigContextType | undefined>(undefined);
 export function ConfigProvider({ children }: { children: ReactNode }) {
   // Model configuration state
   const [modelConfig, setModelConfig] = useState<ModelConfig>({
-    provider: 'ollama',
-    model: 'llama3.2:latest',
+    // Placeholder until the saved config loads. Fresh installs are seeded
+    // with Built-in AI by Rust; the model is filled from the loaded config.
+    provider: 'builtin-ai',
+    model: '',
     whisperModel: 'large-v3',
     ollamaEndpoint: null
   });
@@ -366,17 +367,6 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     loadDevicePreferences();
   }, []);
 
-  // Calculate model options based on available models
-  const modelOptions: Record<ModelConfig['provider'], string[]> = {
-    ollama: models.map(model => model.name),
-    claude: ['claude-3-5-sonnet-latest'],
-    groq: ['llama-3.3-70b-versatile'],
-    openrouter: [],
-    openai: ['gpt-4', 'gpt-4-turbo', 'gpt-3.5-turbo'],
-    'builtin-ai': [],
-    'custom-openai': [],
-  };
-
   // Toggle confidence indicator with localStorage persistence
   const toggleConfidenceIndicator = useCallback((checked: boolean) => {
     setShowConfidenceIndicator(checked);
@@ -506,7 +496,6 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     betaFeatures,
     toggleBetaFeature,
     models,
-    modelOptions,
     error,
     notificationSettings,
     storageLocations,
@@ -529,7 +518,6 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     betaFeatures,
     toggleBetaFeature,
     models,
-    modelOptions,
     error,
     notificationSettings,
     storageLocations,

@@ -297,13 +297,14 @@ impl ModelManager {
         Ok(())
     }
 
-    /// Get list of all models with their status
+    /// Get list of all models with their status, in catalog order. The map's
+    /// own iteration order changes on every launch, and the UI auto-selects the
+    /// first available entry, so it must not leak through.
     pub async fn list_models(&self) -> Vec<ModelInfo> {
-        self.available_models
-            .read()
-            .await
-            .values()
-            .cloned()
+        let models = self.available_models.read().await;
+        get_available_models()
+            .iter()
+            .filter_map(|def| models.get(&def.name).cloned())
             .collect()
     }
 
@@ -847,5 +848,21 @@ impl ModelManager {
     /// Get models directory path
     pub fn get_models_directory(&self) -> PathBuf {
         self.models_dir.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn list_models_follows_catalog_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ModelManager::new_with_models_dir(Some(dir.path().to_path_buf())).unwrap();
+        manager.scan_models().await.unwrap();
+
+        let listed: Vec<String> = manager.list_models().await.into_iter().map(|m| m.name).collect();
+        let catalog: Vec<String> = get_available_models().into_iter().map(|m| m.name).collect();
+        assert_eq!(listed, catalog);
     }
 }

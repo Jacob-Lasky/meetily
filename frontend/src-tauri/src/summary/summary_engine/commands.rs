@@ -10,10 +10,15 @@ use super::model_manager::{DownloadProgress, ModelInfo, ModelManager};
 
 const QWEN35_4B_RECOMMENDED_RAM_GB: u64 = 14;
 
+/// Which downloaded model to use when several are present. Qwen 3.5 stays on
+/// top (it is what the RAM-based recommendation picks), then the current Gemma
+/// generation, then the legacy Gemma 3 tiers.
 pub(crate) fn summary_model_priority(model_name: &str) -> u8 {
     match model_name {
-        "qwen3.5:4b" => 4,
-        "qwen3.5:2b" => 3,
+        "qwen3.5:4b" => 6,
+        "qwen3.5:2b" => 5,
+        "gemma4:e4b" => 4,
+        "gemma4:e2b" => 3,
         "gemma3:4b" => 2,
         "gemma3:1b" => 1,
         _ => 0,
@@ -426,7 +431,47 @@ mod tests {
     #[test]
     fn available_summary_model_priority_prefers_qwen_over_gemma() {
         assert!(summary_model_priority("qwen3.5:4b") > summary_model_priority("qwen3.5:2b"));
-        assert!(summary_model_priority("qwen3.5:2b") > summary_model_priority("gemma3:4b"));
+        assert!(summary_model_priority("qwen3.5:2b") > summary_model_priority("gemma4:e4b"));
+        assert!(summary_model_priority("gemma4:e4b") > summary_model_priority("gemma4:e2b"));
+        assert!(summary_model_priority("gemma4:e2b") > summary_model_priority("gemma3:4b"));
         assert!(summary_model_priority("gemma3:4b") > summary_model_priority("gemma3:1b"));
+    }
+
+    #[test]
+    fn every_catalog_model_has_a_priority() {
+        for model in super::super::models::get_available_models() {
+            assert!(
+                summary_model_priority(&model.name) > 0,
+                "{} is missing from summary_model_priority",
+                model.name
+            );
+        }
+    }
+
+    #[test]
+    fn ts_onboarding_sizes_match_the_catalog() {
+        // Onboarding labels downloads from a TS copy of the sizes before Rust
+        // reports progress; keep it equal to the catalog.
+        let ts = include_str!("../../../../src/lib/onboarding-summary-model.ts");
+        let body = ts
+            .split_once("const SUMMARY_MODEL_SIZES_MB: Record<string, number> = {")
+            .expect("SUMMARY_MODEL_SIZES_MB not found in onboarding-summary-model.ts")
+            .1
+            .split_once("};")
+            .unwrap()
+            .0;
+        let mut ts_sizes: Vec<(String, u64)> = body
+            .lines()
+            // Lines look like `  'qwen3.5:2b': 1221,`
+            .filter_map(|l| l.trim().trim_end_matches(',').split_once("': "))
+            .map(|(name, size)| (name.trim_start_matches('\'').to_string(), size.parse().unwrap()))
+            .collect();
+        let mut catalog: Vec<(String, u64)> = super::super::models::get_available_models()
+            .into_iter()
+            .map(|m| (m.name, m.size_mb))
+            .collect();
+        ts_sizes.sort();
+        catalog.sort();
+        assert_eq!(ts_sizes, catalog);
     }
 }

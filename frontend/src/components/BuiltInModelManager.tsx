@@ -31,7 +31,8 @@ interface DownloadProgressInfo {
 
 interface BuiltInModelManagerProps {
   selectedModel: string;
-  onModelSelect: (model: string) => void;
+  /** `auto` marks the fetch-time auto-select, which must not replace a choice. */
+  onModelSelect: (model: string, opts: { auto: boolean }) => void;
   layout?: 'inline' | 'dialog';
 }
 
@@ -53,11 +54,12 @@ export function BuiltInModelManager({
       const data = (await invoke('builtin_ai_list_models')) as ModelInfo[];
       setModels(data);
 
-      // Auto-select first available model if none selected
+      // Auto-select first available model if none selected. `selectedModel` is
+      // from when the fetch started, so the parent re-checks at update time.
       if (data.length > 0 && !selectedModel) {
         const firstAvailable = data.find((m) => m.status.type === 'available');
         if (firstAvailable) {
-          onModelSelect(firstAvailable.name);
+          onModelSelect(firstAvailable.name, { auto: true });
         }
       }
     } catch (error) {
@@ -311,7 +313,7 @@ export function BuiltInModelManager({
               )}
               onClick={() => {
                 if (isAvailable && !modelIsDownloading) {
-                  onModelSelect(model.name);
+                  onModelSelect(model.name, { auto: false });
                 }
               }}
             >

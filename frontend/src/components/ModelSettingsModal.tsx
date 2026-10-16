@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import { modelToApply, withModelIfProvider, withModelIfUnset } from '@/lib/summary-model-pick';
 import { useSidebar } from './Sidebar/SidebarProvider';
 import { invoke } from '@tauri-apps/api/core';
 import { Button } from '@/components/ui/button';
@@ -60,46 +61,22 @@ interface OpenRouterModel {
   completion_price?: string;
 }
 
-interface OpenAIModel {
+interface CloudModel {
   id: string;
 }
 
-interface AnthropicModel {
-  id: string;
-  display_name?: string;
-}
+// Rust owns these model lists, including the no-key fallback, so the UI never
+// carries its own copy to go stale. Each command returns the provider's live
+// list (newest first) when given a key, and the current lineup otherwise.
+const CLOUD_MODEL_COMMANDS = {
+  openai: 'get_openai_models',
+  claude: 'get_anthropic_models',
+  groq: 'get_groq_models',
+} as const;
+type CloudModelProvider = keyof typeof CLOUD_MODEL_COMMANDS;
 
-interface GroqModel {
-  id: string;
-  owned_by?: string;
-}
-
-// Fallback models for when API fetch fails or no API key provided
-const OPENAI_FALLBACK_MODELS = [
-  'gpt-4o',
-  'gpt-4o-mini',
-  'gpt-4-turbo',
-  'gpt-4',
-  'gpt-3.5-turbo',
-  'o1',
-  'o1-mini',
-  'o3',
-  'o3-mini',
-];
-
-const CLAUDE_FALLBACK_MODELS = [
-  'claude-sonnet-4-5-20250929',
-  'claude-haiku-4-5-20251001',
-  'claude-opus-4-5-20251101',
-  'claude-3-5-sonnet-latest',
-];
-
-const GROQ_FALLBACK_MODELS = [
-  'llama-3.3-70b-versatile',
-  'llama-3.1-70b-versatile',
-  'mixtral-8x7b-32768',
-  'gemma2-9b-it',
-];
+const isCloudModelProvider = (provider: string): provider is CloudModelProvider =>
+  provider in CLOUD_MODEL_COMMANDS;
 
 interface ModelSettingsModalProps {
   modelConfig: ModelConfig;
@@ -158,13 +135,17 @@ export function ModelSettingsModal({
   // Combobox state
   const [modelComboboxOpen, setModelComboboxOpen] = useState<boolean>(false);
 
-  // Dynamic model fetching state for OpenAI, Claude, and Groq
-  const [openaiModels, setOpenaiModels] = useState<string[]>([]);
-  const [claudeModels, setClaudeModels] = useState<string[]>([]);
-  const [groqModels, setGroqModels] = useState<string[]>([]);
-  const [isLoadingOpenAI, setIsLoadingOpenAI] = useState<boolean>(false);
-  const [isLoadingClaude, setIsLoadingClaude] = useState<boolean>(false);
-  const [isLoadingGroq, setIsLoadingGroq] = useState<boolean>(false);
+  // Model lists for OpenAI, Claude, and Groq, fetched from Rust
+  const [cloudModels, setCloudModels] = useState<Record<CloudModelProvider, string[]>>({
+    openai: [],
+    claude: [],
+    groq: [],
+  });
+  const [isLoadingCloudModels, setIsLoadingCloudModels] = useState<boolean>(false);
+  // The model the restore effect chose on its own, so a later, better list
+  // may replace it without overriding a choice the user made.
+  // Per provider: switching providers must not forget what was auto-picked.
+  const autoPickedModel = useRef<Record<string, string | null>>({});
 
   // Use global download context instead of local state
   const { isDownloading, getProgress, downloadingModels } = useOllamaDownload();
@@ -225,9 +206,9 @@ export function ModelSettingsModal({
 
   const modelOptions: Record<string, string[]> = {
     ollama: models.map((model) => model.name),
-    claude: claudeModels.length > 0 ? claudeModels : CLAUDE_FALLBACK_MODELS,
-    groq: groqModels.length > 0 ? groqModels : GROQ_FALLBACK_MODELS,
-    openai: openaiModels.length > 0 ? openaiModels : OPENAI_FALLBACK_MODELS,
+    claude: cloudModels.claude,
+    groq: cloudModels.groq,
+    openai: cloudModels.openai,
     openrouter: openRouterModels.map((m) => m.id),
     'builtin-ai': builtinAiModels.map((m) => m.name),
     'custom-openai': customOpenAIModel ? [customOpenAIModel] : [], // User specifies model manually
@@ -251,6 +232,8 @@ export function ModelSettingsModal({
 
   const isDoneDisabled =
     (requiresApiKey && (!apiKey || (typeof apiKey === 'string' && !apiKey.trim()))) ||
+    // A cloud provider whose list failed to load would otherwise save model ''.
+    (requiresApiKey && !modelConfig.model?.trim()) ||
     (modelConfig.provider === 'ollama' && ollamaEndpointChanged) ||
     isCustomOpenAIInvalid;
 
@@ -508,111 +491,67 @@ export function ModelSettingsModal({
 
     try {
       const data = (await invoke('builtin_ai_list_models')) as any[];
+      // Selection happens in the list-arrival effect (modelToApply), which reads
+      // current state and checks the provider; selecting here used the model
+      // from when the fetch started and could land on another provider.
       setBuiltinAiModels(data);
-
-      // Auto-select first available model if none selected
-      if (data.length > 0 && !modelConfig.model) {
-        const firstAvailable = data.find((m: any) => m.status?.type === 'available');
-        if (firstAvailable) {
-          setModelConfig((prev: ModelConfig) => ({ ...prev, model: firstAvailable.name }));
-        }
-      }
     } catch (err) {
       console.error('Error loading Built-in AI models:', err);
       toast.error('Failed to load Built-in AI models');
     }
   };
 
-  // Fetch OpenAI models from API
-  const loadOpenAIModels = async (key: string | null) => {
-    if (!key?.trim()) {
-      setOpenaiModels([]); // Will use fallback via modelOptions
-      return;
-    }
-    setIsLoadingOpenAI(true);
-    try {
-      const data = (await invoke('get_openai_models', { apiKey: key })) as OpenAIModel[];
-      setOpenaiModels(data.map((m) => m.id));
-    } catch (err) {
-      console.error('Error loading OpenAI models:', err);
-      setOpenaiModels([]); // Will use fallback via modelOptions
-    } finally {
-      setIsLoadingOpenAI(false);
-    }
-  };
-
-  // Fetch Anthropic (Claude) models from API
-  const loadClaudeModels = async (key: string | null) => {
-    if (!key?.trim()) {
-      setClaudeModels([]); // Will use fallback via modelOptions
-      return;
-    }
-    setIsLoadingClaude(true);
-    try {
-      const data = (await invoke('get_anthropic_models', { apiKey: key })) as AnthropicModel[];
-      setClaudeModels(data.map((m) => m.id));
-    } catch (err) {
-      console.error('Error loading Claude models:', err);
-      setClaudeModels([]); // Will use fallback via modelOptions
-    } finally {
-      setIsLoadingClaude(false);
-    }
-  };
-
-  // Fetch Groq models from API
-  const loadGroqModels = async (key: string | null) => {
-    if (!key?.trim()) {
-      setGroqModels([]); // Will use fallback via modelOptions
-      return;
-    }
-    setIsLoadingGroq(true);
-    try {
-      const data = (await invoke('get_groq_models', { apiKey: key })) as GroqModel[];
-      setGroqModels(data.map((m) => m.id));
-    } catch (err) {
-      console.error('Error loading Groq models:', err);
-      setGroqModels([]); // Will use fallback via modelOptions
-    } finally {
-      setIsLoadingGroq(false);
-    }
-  };
-
-  // Auto-fetch OpenAI models when provider is openai and we have an API key
+  // Fetch the OpenAI, Claude, or Groq model list. Runs without a key too:
+  // Rust then returns the current lineup instead of the live list.
   useEffect(() => {
-    if (modelConfig.provider === 'openai' && apiKey?.trim()) {
-      loadOpenAIModels(apiKey);
-    }
+    const provider = modelConfig.provider;
+    if (!isCloudModelProvider(provider)) return;
+
+    // A slower response for an older key must not overwrite a newer one, and
+    // the debounce keeps typing a key from firing one request per keystroke.
+    let stale = false;
+    setIsLoadingCloudModels(true);
+    const timer = setTimeout(() => {
+      invoke<CloudModel[]>(CLOUD_MODEL_COMMANDS[provider], { apiKey: apiKey?.trim() || null })
+        .then((data) => {
+          if (!stale) setCloudModels((prev) => ({ ...prev, [provider]: data.map((m) => m.id) }));
+        })
+        .catch((err) => {
+          console.error(`Error loading ${provider} models:`, err);
+          if (!stale) setCloudModels((prev) => ({ ...prev, [provider]: [] }));
+        })
+        .finally(() => {
+          if (!stale) setIsLoadingCloudModels(false);
+        });
+    }, 400);
+    return () => {
+      stale = true;
+      clearTimeout(timer);
+    };
   }, [modelConfig.provider, apiKey]);
 
-  // Auto-fetch Claude models when provider is claude and we have an API key
-  useEffect(() => {
-    if (modelConfig.provider === 'claude' && apiKey?.trim()) {
-      loadClaudeModels(apiKey);
-    }
-  }, [modelConfig.provider, apiKey]);
-
-  // Auto-fetch Groq models when provider is groq and we have an API key
-  useEffect(() => {
-    if (modelConfig.provider === 'groq' && apiKey?.trim()) {
-      loadGroqModels(apiKey);
-    }
-  }, [modelConfig.provider, apiKey]);
-
-  // Restore cached model when async model lists become available
+  // Pick a model when a provider's list arrives or changes (see modelToApply)
   useEffect(() => {
     const providerModels = modelOptions[modelConfig.provider];
     if (!providerModels || providerModels.length === 0) return;
 
-    // If current model is already valid, nothing to do
-    if (modelConfig.model && providerModels.includes(modelConfig.model)) return;
-
-    // Try to restore from localStorage cache
     const map = JSON.parse(localStorage.getItem('providerModelMap') || '{}');
-    const cachedModel = map[modelConfig.provider];
-    if (cachedModel && providerModels.includes(cachedModel)) {
-      setModelConfig((prev: ModelConfig) => ({ ...prev, model: cachedModel }));
-    }
-  }, [models, openRouterModels, builtinAiModels, openaiModels, claudeModels, groqModels, modelConfig.provider]);
+    const choice = modelToApply(
+      modelConfig.model,
+      providerModels,
+      map[modelConfig.provider],
+      autoPickedModel.current[modelConfig.provider] ?? null,
+      // Never auto-pick a Built-in model that is not on disk.
+      modelConfig.provider === 'builtin-ai'
+        ? builtinAiModels.filter((m) => m.status?.type === 'available').map((m) => m.name)
+        : providerModels,
+    );
+    if (!choice) return;
+
+    const provider = modelConfig.provider;
+    autoPickedModel.current[provider] = choice.auto ? choice.model : null;
+    setModelConfig((prev: ModelConfig) => withModelIfProvider(prev, provider, choice.model));
+  }, [models, openRouterModels, builtinAiModels, cloudModels, modelConfig.provider]);
 
   const handleSave = async () => {
     // For custom-openai provider, save the custom config first
@@ -826,15 +765,14 @@ export function ModelSettingsModal({
                   localStorage.setItem('providerModelMap', JSON.stringify(map));
                 }
 
-                // Try to restore cached model for the new provider
+                // Restore the model last used with this provider. Otherwise leave
+                // it empty: the list-arrival effect (modelToApply) picks the
+                // default, and only it knows which Built-in models are on disk.
                 const savedModel = map[provider];
                 const providerModels = modelOptions[provider];
-                const defaultModel = providerModels && providerModels.length > 0
-                  ? providerModels[0]
-                  : '';
                 const model = (savedModel && providerModels?.includes(savedModel))
                   ? savedModel
-                  : defaultModel;
+                  : '';
 
                 setModelConfig({
                   ...modelConfig,
@@ -904,9 +842,7 @@ export function ModelSettingsModal({
                     <CommandInput placeholder="Search models..." />
                     <CommandList className="max-h-[300px]">
                       {(modelConfig.provider === 'openrouter' && isLoadingOpenRouter) ||
-                       (modelConfig.provider === 'openai' && isLoadingOpenAI) ||
-                       (modelConfig.provider === 'claude' && isLoadingClaude) ||
-                       (modelConfig.provider === 'groq' && isLoadingGroq) ? (
+                       (isCloudModelProvider(modelConfig.provider) && isLoadingCloudModels) ? (
                         <div className="py-6 text-center text-sm text-muted-foreground">
                           <RefreshCw className="mx-auto h-4 w-4 animate-spin mb-2" />
                           Loading models...
@@ -920,6 +856,7 @@ export function ModelSettingsModal({
                                 key={model}
                                 value={model}
                                 onSelect={(currentValue) => {
+                                  autoPickedModel.current[modelConfig.provider] = null;
                                   setModelConfig((prev: ModelConfig) => ({ ...prev, model: currentValue }));
                                   setModelComboboxOpen(false);
                                 }}
@@ -967,7 +904,7 @@ export function ModelSettingsModal({
                 id="custom-model"
                 value={customOpenAIModel}
                 onChange={(e) => setCustomOpenAIModel(e.target.value)}
-                placeholder="gpt-4, llama-3-70b, etc."
+                placeholder="e.g. gpt-oss-120b, llama-3.3-70b"
                 className="mt-1"
               />
               <p className="text-xs text-muted-foreground mt-1">
@@ -1364,8 +1301,16 @@ export function ModelSettingsModal({
             <BuiltInModelManager
               selectedModel={modelConfig.model}
               layout={layout}
-              onModelSelect={(model) =>
-                setModelConfig((prev: ModelConfig) => ({ ...prev, model }))
+              onModelSelect={(model, { auto }) =>
+                // An auto-select comes from a catalog fetch that can resolve after
+                // the saved config loaded (another provider, or a saved Built-in
+                // model): it applies only while nothing is chosen. A click always
+                // applies, but never to a cloud provider.
+                setModelConfig((prev: ModelConfig) =>
+                  auto
+                    ? withModelIfUnset(prev, 'builtin-ai', model)
+                    : withModelIfProvider(prev, 'builtin-ai', model)
+                )
               }
             />
           </div>

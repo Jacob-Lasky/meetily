@@ -10,10 +10,11 @@ import { ParakeetModelManager } from './ParakeetModelManager';
 import { Textarea } from './ui/textarea';
 import { Switch } from './ui/switch';
 import { LanguageSelection } from './LanguageSelection';
+import { toUiTranscriptProvider, type TranscriptProvider } from '@/lib/transcript-providers';
 
 
 export interface TranscriptModelProps {
-    provider: 'localWhisper' | 'parakeet' | 'deepgram' | 'elevenLabs' | 'groq' | 'openai';
+    provider: TranscriptProvider;
     model: string;
     apiKey?: string | null;
 }
@@ -29,7 +30,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     const [showApiKey, setShowApiKey] = useState<boolean>(false);
     const [isApiKeyLocked, setIsApiKeyLocked] = useState<boolean>(true);
     const [isLockButtonVibrating, setIsLockButtonVibrating] = useState<boolean>(false);
-    const [uiProvider, setUiProvider] = useState<TranscriptModelProps['provider']>(transcriptModelConfig.provider);
+    const [uiProvider, setUiProvider] = useState<TranscriptProvider>(toUiTranscriptProvider(transcriptModelConfig.provider));
     const [deepgramKeyterm, setDeepgramKeyterm] = useState<string>('');
     // Placeholders until api_get_deepgram_options answers; the backend owns the defaults.
     const [deepgramDiarize, setDeepgramDiarize] = useState<boolean>(false);
@@ -42,7 +43,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
 
     // Sync uiProvider when backend config changes (e.g., after model selection or initial load)
     useEffect(() => {
-        setUiProvider(transcriptModelConfig.provider);
+        setUiProvider(toUiTranscriptProvider(transcriptModelConfig.provider));
     }, [transcriptModelConfig.provider]);
 
     // Load Deepgram-specific knobs when the Deepgram provider is active.
@@ -83,11 +84,8 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
         localWhisper: [], // Model selection handled by ModelManager component
         parakeet: [], // Model selection handled by ParakeetModelManager component
         deepgram: ['nova-3', 'flux-general-en', 'flux-general-multi'],
-        elevenLabs: ['eleven_multilingual_v2'],
-        groq: ['llama-3.3-70b-versatile'],
-        openai: ['gpt-4o'],
     };
-    const requiresApiKey = uiProvider === 'deepgram' || uiProvider === 'elevenLabs' || uiProvider === 'openai' || uiProvider === 'groq';
+    const requiresApiKey = uiProvider === 'deepgram';
     // Flux models pick their language via the model itself and ignore nova-only knobs
     // (language selection, diarization), so those controls are hidden for Flux.
     const isFluxModel = transcriptModelConfig.model?.startsWith('flux') ?? false;
@@ -184,9 +182,6 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                     <SelectItem value="parakeet">⚡ Parakeet (Recommended - Real-time / Accurate)</SelectItem>
                                     <SelectItem value="localWhisper">🏠 Local Whisper (High Accuracy)</SelectItem>
                                     <SelectItem value="deepgram">☁️ Deepgram (Realtime)</SelectItem>
-                                    {/* <SelectItem value="elevenLabs">☁️ ElevenLabs</SelectItem>
-                                    <SelectItem value="groq">☁️ Groq</SelectItem>
-                                    <SelectItem value="openai">☁️ OpenAI</SelectItem> */}
                                 </SelectContent>
                             </Select>
 

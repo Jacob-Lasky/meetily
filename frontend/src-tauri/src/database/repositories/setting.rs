@@ -107,13 +107,20 @@ impl SettingsRepository {
         let query = format!(
             r#"
             INSERT INTO settings (id, provider, model, whisperModel, "{}")
-            VALUES ('1', 'openai', 'gpt-4o-2024-11-20', 'large-v3', $1)
+            VALUES ('1', 'builtin-ai', $2, 'large-v3', $1)
             ON CONFLICT(id) DO UPDATE SET
                 "{}" = $1
             "#,
             api_key_column, api_key_column
         );
-        sqlx::query(&query).bind(api_key).execute(pool).await?;
+        // The INSERT branch only runs when no settings row exists yet: seed the
+        // same Built-in AI default a fresh install gets, not a cloud model that ages.
+        let default_model = crate::summary::summary_engine::models::get_default_model().name;
+        sqlx::query(&query)
+            .bind(api_key)
+            .bind(default_model)
+            .execute(pool)
+            .await?;
 
         Ok(())
     }
@@ -400,5 +407,89 @@ impl SettingsRepository {
         .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn migrated_pool() -> SqlitePool {
+        // One connection: every `sqlite::memory:` connection is its own database.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query("DELETE FROM settings").execute(&pool).await.unwrap();
+        pool
+    }
+
+    async fn provider_and_model(pool: &SqlitePool) -> (String, String) {
+        sqlx::query_as("SELECT provider, model FROM settings WHERE id = '1'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn saving_a_key_first_seeds_the_builtin_default_not_a_cloud_model() {
+        let pool = migrated_pool().await;
+        SettingsRepository::save_api_key(&pool, "claude", "sk-test").await.unwrap();
+
+        assert_eq!(
+            provider_and_model(&pool).await,
+            ("builtin-ai".to_string(), "qwen3.5:2b".to_string())
+        );
+        assert_eq!(
+            SettingsRepository::get_api_key(&pool, "claude").await.unwrap().as_deref(),
+            Some("sk-test")
+        );
+    }
+
+    #[tokio::test]
+    async fn saving_a_key_keeps_an_existing_model_choice() {
+        let pool = migrated_pool().await;
+        SettingsRepository::save_model_config(&pool, "openai", "gpt-6-astra", "large-v3", None)
+            .await
+            .unwrap();
+        SettingsRepository::save_api_key(&pool, "openai", "sk-test").await.unwrap();
+
+        assert_eq!(
+            provider_and_model(&pool).await,
+            ("openai".to_string(), "gpt-6-astra".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_moves_unsupported_transcript_providers_to_the_default() {
+        let pool = migrated_pool().await;
+        for provider in ["groq", "deepgram"] {
+            sqlx::query("DELETE FROM transcript_settings").execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO transcript_settings (id, provider, model) VALUES ('1', ?, 'm')")
+                .bind(provider)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/20261016000000_reset_unsupported_transcript_provider.sql"
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
+            let row: (String, String) =
+                sqlx::query_as("SELECT provider, model FROM transcript_settings WHERE id = '1'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            if provider == "groq" {
+                // The SQL hardcodes the model id; it must match the Rust default.
+                assert_eq!(row, ("parakeet".to_string(), crate::config::DEFAULT_PARAKEET_MODEL.to_string()));
+            } else {
+                assert_eq!(row, ("deepgram".to_string(), "m".to_string()));
+            }
+        }
     }
 }

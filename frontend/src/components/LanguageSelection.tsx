@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Globe } from 'lucide-react';
 import Analytics from '@/lib/analytics';
 import { toast } from 'sonner';
+import type { TranscriptModelProps } from '@/components/TranscriptSettings';
 
 export interface Language {
   code: string;
@@ -117,7 +118,7 @@ interface LanguageSelectionProps {
   selectedLanguage: string;
   onLanguageChange: (language: string) => void;
   disabled?: boolean;
-  provider?: 'localWhisper' | 'parakeet' | 'deepgram' | 'elevenLabs' | 'groq' | 'openai';
+  provider?: TranscriptModelProps['provider'];
 }
 
 export function LanguageSelection({

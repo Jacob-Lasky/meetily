@@ -14,8 +14,10 @@ interface SummaryModelSettingsProps {
 
 export function SummaryModelSettings({ refetchTrigger }: SummaryModelSettingsProps) {
   const [modelConfig, setModelConfig] = useState<ModelConfig>({
-    provider: 'ollama',
-    model: 'llama3.2:latest',
+    // Placeholder until the saved config loads. Fresh installs are seeded
+    // with Built-in AI by Rust; the model is filled from the loaded config.
+    provider: 'builtin-ai',
+    model: '',
     whisperModel: 'large-v3',
     apiKey: null,
     ollamaEndpoint: null

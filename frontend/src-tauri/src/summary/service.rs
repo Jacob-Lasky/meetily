@@ -328,7 +328,7 @@ impl SummaryService {
     /// * `meeting_id` - Unique identifier for the meeting
     /// * `text` - Full transcript text
     /// * `model_provider` - LLM provider name (e.g., "ollama", "openai")
-    /// * `model_name` - Specific model (e.g., "gpt-4", "llama3.2:latest")
+    /// * `model_name` - Specific model (e.g., "gpt-6-luna", "qwen3.5:4b")
     /// * `custom_prompt` - Optional user-provided context
     /// * `template_id` - Template identifier (e.g., "daily_standup", "standard_meeting")
     pub async fn process_transcript_background<R: tauri::Runtime>(

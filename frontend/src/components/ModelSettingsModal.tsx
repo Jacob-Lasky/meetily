@@ -900,7 +900,7 @@ export function ModelSettingsModal({
                 id="custom-model"
                 value={customOpenAIModel}
                 onChange={(e) => setCustomOpenAIModel(e.target.value)}
-                placeholder="gpt-4, llama-3-70b, etc."
+                placeholder="e.g. gpt-oss-120b, llama-3.3-70b"
                 className="mt-1"
               />
               <p className="text-xs text-muted-foreground mt-1">

@@ -13,7 +13,7 @@ import { LanguageSelection } from './LanguageSelection';
 
 
 export interface TranscriptModelProps {
-    provider: 'localWhisper' | 'parakeet' | 'deepgram' | 'elevenLabs' | 'groq' | 'openai';
+    provider: 'localWhisper' | 'parakeet' | 'deepgram';
     model: string;
     apiKey?: string | null;
 }
@@ -83,11 +83,8 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
         localWhisper: [], // Model selection handled by ModelManager component
         parakeet: [], // Model selection handled by ParakeetModelManager component
         deepgram: ['nova-3', 'flux-general-en', 'flux-general-multi'],
-        elevenLabs: ['eleven_multilingual_v2'],
-        groq: ['llama-3.3-70b-versatile'],
-        openai: ['gpt-4o'],
     };
-    const requiresApiKey = uiProvider === 'deepgram' || uiProvider === 'elevenLabs' || uiProvider === 'openai' || uiProvider === 'groq';
+    const requiresApiKey = uiProvider === 'deepgram';
     // Flux models pick their language via the model itself and ignore nova-only knobs
     // (language selection, diarization), so those controls are hidden for Flux.
     const isFluxModel = transcriptModelConfig.model?.startsWith('flux') ?? false;
@@ -184,9 +181,6 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                     <SelectItem value="parakeet">⚡ Parakeet (Recommended - Real-time / Accurate)</SelectItem>
                                     <SelectItem value="localWhisper">🏠 Local Whisper (High Accuracy)</SelectItem>
                                     <SelectItem value="deepgram">☁️ Deepgram (Realtime)</SelectItem>
-                                    {/* <SelectItem value="elevenLabs">☁️ ElevenLabs</SelectItem>
-                                    <SelectItem value="groq">☁️ Groq</SelectItem>
-                                    <SelectItem value="openai">☁️ OpenAI</SelectItem> */}
                                 </SelectContent>
                             </Select>
 

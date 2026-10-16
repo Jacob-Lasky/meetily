@@ -243,7 +243,7 @@ impl LLMProvider {
 /// # Arguments
 /// * `client` - Reqwest HTTP client (reused for performance)
 /// * `provider` - The LLM provider to use
-/// * `model_name` - The specific model to use (e.g., "gpt-4", "claude-3-opus")
+/// * `model_name` - The specific model to use (e.g., "gpt-6-luna", "claude-sonnet-5-5")
 /// * `api_key` - API key for the provider (not needed for Ollama)
 /// * `system_prompt` - System instructions for the LLM
 /// * `user_prompt` - User query/content to process

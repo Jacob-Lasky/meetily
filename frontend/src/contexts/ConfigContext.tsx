@@ -99,8 +99,10 @@ const ConfigContext = createContext<ConfigContextType | undefined>(undefined);
 export function ConfigProvider({ children }: { children: ReactNode }) {
   // Model configuration state
   const [modelConfig, setModelConfig] = useState<ModelConfig>({
-    provider: 'ollama',
-    model: 'llama3.2:latest',
+    // Placeholder until the saved config loads. Fresh installs are seeded
+    // with Built-in AI by Rust; the model is filled from the loaded config.
+    provider: 'builtin-ai',
+    model: '',
     whisperModel: 'large-v3',
     ollamaEndpoint: null
   });

@@ -8,9 +8,9 @@ describe('toUiTranscriptProvider', () => {
     expect(toUiTranscriptProvider('localWhisper')).toBe('localWhisper');
   });
 
-  test('shows retired or unknown saved providers as Local Whisper, like the engine', () => {
+  test('shows retired or unknown saved providers as Parakeet, like the migration', () => {
     for (const saved of ['groq', 'openai', 'elevenLabs', '', null, undefined]) {
-      expect(toUiTranscriptProvider(saved)).toBe('localWhisper');
+      expect(toUiTranscriptProvider(saved)).toBe('parakeet');
     }
   });
 });

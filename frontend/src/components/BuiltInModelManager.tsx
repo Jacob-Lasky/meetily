@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Button } from '@/components/ui/button';
@@ -40,6 +40,8 @@ export function BuiltInModelManager({
   onModelSelect,
   layout = 'inline',
 }: BuiltInModelManagerProps) {
+  const selectedModelRef = useRef(selectedModel);
+  selectedModelRef.current = selectedModel;
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [hasFetched, setHasFetched] = useState<boolean>(false);
@@ -53,8 +55,10 @@ export function BuiltInModelManager({
       const data = (await invoke('builtin_ai_list_models')) as ModelInfo[];
       setModels(data);
 
-      // Auto-select first available model if none selected
-      if (data.length > 0 && !selectedModel) {
+      // Auto-select first available model if none selected. Read the latest
+      // selection, not the one captured when the fetch started: the saved
+      // config may have loaded while it was in flight.
+      if (data.length > 0 && !selectedModelRef.current) {
         const firstAvailable = data.find((m) => m.status.type === 'available');
         if (firstAvailable) {
           onModelSelect(firstAvailable.name);

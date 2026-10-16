@@ -144,7 +144,8 @@ export function ModelSettingsModal({
   const [isLoadingCloudModels, setIsLoadingCloudModels] = useState<boolean>(false);
   // The model the restore effect chose on its own, so a later, better list
   // may replace it without overriding a choice the user made.
-  const autoPickedModel = useRef<string | null>(null);
+  // Per provider: switching providers must not forget what was auto-picked.
+  const autoPickedModel = useRef<Record<string, string | null>>({});
 
   // Use global download context instead of local state
   const { isDownloading, getProgress, downloadingModels } = useOllamaDownload();
@@ -209,7 +210,9 @@ export function ModelSettingsModal({
     groq: cloudModels.groq,
     openai: cloudModels.openai,
     openrouter: openRouterModels.map((m) => m.id),
-    'builtin-ai': builtinAiModels.map((m) => m.name),
+    // Downloaded models only: this list drives auto-selection, and a model
+    // that is not on disk cannot summarize.
+    'builtin-ai': builtinAiModels.filter((m) => m.status?.type === 'available').map((m) => m.name),
     'custom-openai': customOpenAIModel ? [customOpenAIModel] : [], // User specifies model manually
   };
 
@@ -490,15 +493,10 @@ export function ModelSettingsModal({
 
     try {
       const data = (await invoke('builtin_ai_list_models')) as any[];
+      // Selection happens in the list-arrival effect (modelToApply), which reads
+      // current state and checks the provider; selecting here used the model
+      // from when the fetch started and could land on another provider.
       setBuiltinAiModels(data);
-
-      // Auto-select first available model if none selected
-      if (data.length > 0 && !modelConfig.model) {
-        const firstAvailable = data.find((m: any) => m.status?.type === 'available');
-        if (firstAvailable) {
-          setModelConfig((prev: ModelConfig) => ({ ...prev, model: firstAvailable.name }));
-        }
-      }
     } catch (err) {
       console.error('Error loading Built-in AI models:', err);
       toast.error('Failed to load Built-in AI models');
@@ -544,12 +542,12 @@ export function ModelSettingsModal({
       modelConfig.model,
       providerModels,
       map[modelConfig.provider],
-      autoPickedModel.current,
+      autoPickedModel.current[modelConfig.provider] ?? null,
     );
     if (!choice) return;
 
-    autoPickedModel.current = choice.auto ? choice.model : null;
     const provider = modelConfig.provider;
+    autoPickedModel.current[provider] = choice.auto ? choice.model : null;
     setModelConfig((prev: ModelConfig) => withModelIfProvider(prev, provider, choice.model));
   }, [models, openRouterModels, builtinAiModels, cloudModels, modelConfig.provider]);
 
@@ -857,7 +855,7 @@ export function ModelSettingsModal({
                                 key={model}
                                 value={model}
                                 onSelect={(currentValue) => {
-                                  autoPickedModel.current = null;
+                                  autoPickedModel.current[modelConfig.provider] = null;
                                   setModelConfig((prev: ModelConfig) => ({ ...prev, model: currentValue }));
                                   setModelComboboxOpen(false);
                                 }}

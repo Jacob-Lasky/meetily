@@ -462,4 +462,34 @@ mod tests {
             ("openai".to_string(), "gpt-6-astra".to_string())
         );
     }
+
+    #[tokio::test]
+    async fn migration_moves_unsupported_transcript_providers_to_the_default() {
+        let pool = migrated_pool().await;
+        for provider in ["groq", "deepgram"] {
+            sqlx::query("DELETE FROM transcript_settings").execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO transcript_settings (id, provider, model) VALUES ('1', ?, 'm')")
+                .bind(provider)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/20261016000000_reset_unsupported_transcript_provider.sql"
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
+            let row: (String, String) =
+                sqlx::query_as("SELECT provider, model FROM transcript_settings WHERE id = '1'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            if provider == "groq" {
+                // The SQL hardcodes the model id; it must match the Rust default.
+                assert_eq!(row, ("parakeet".to_string(), crate::config::DEFAULT_PARAKEET_MODEL.to_string()));
+            } else {
+                assert_eq!(row, ("deepgram".to_string(), "m".to_string()));
+            }
+        }
+    }
 }

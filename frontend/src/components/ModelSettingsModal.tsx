@@ -765,15 +765,14 @@ export function ModelSettingsModal({
                   localStorage.setItem('providerModelMap', JSON.stringify(map));
                 }
 
-                // Try to restore cached model for the new provider
+                // Restore the model last used with this provider. Otherwise leave
+                // it empty: the list-arrival effect (modelToApply) picks the
+                // default, and only it knows which Built-in models are on disk.
                 const savedModel = map[provider];
                 const providerModels = modelOptions[provider];
-                const defaultModel = providerModels && providerModels.length > 0
-                  ? providerModels[0]
-                  : '';
                 const model = (savedModel && providerModels?.includes(savedModel))
                   ? savedModel
-                  : defaultModel;
+                  : '';
 
                 setModelConfig({
                   ...modelConfig,

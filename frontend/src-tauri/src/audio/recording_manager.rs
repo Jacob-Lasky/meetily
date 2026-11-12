@@ -632,11 +632,6 @@ impl RecordingManager {
         self.stream_manager.recovery_install(kind, epoch, stream)
     }
 
-    /// Watchdog sweep (see `StreamErrorGate::poll_stalled`).
-    pub fn poll_stalled_streams(&mut self) {
-        self.stream_manager.poll_stalled();
-    }
-
     /// Current epoch of `kind`'s stream slot.
     pub fn slot_epoch(&self, kind: super::recording_state::DeviceType) -> u64 {
         self.stream_manager.slot_epoch(kind)

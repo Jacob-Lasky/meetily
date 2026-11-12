@@ -16,6 +16,16 @@ use log::{info, warn};
 
 use super::recording_state::DeviceType;
 
+/// Narrowed contract (W93 cycle 2 fallback, supervisor decision): production
+/// stops the flood and does NOT auto-reopen. A dead stream is torn down (its
+/// error loop ends), the log is rate-limited, and the user gets ONE
+/// announcement; they restart the recording. The reopen machinery below
+/// (backoff, epochs in `stream_slots`, `create_blocking`) is implemented,
+/// unit-tested and live-verified, but the final review cycle did not come back
+/// clean on it, so it stays off. Flip this only after a clean review of the
+/// reopen path: swap-vs-recovery slot ownership and the open timeout.
+pub const AUTO_REOPEN: bool = false;
+
 /// Retry schedule for one recovery run.
 #[derive(Debug, Clone, Copy)]
 pub struct RecoveryPolicy {
@@ -44,6 +54,20 @@ impl Default for RecoveryPolicy {
 }
 
 impl RecoveryPolicy {
+    /// Tear the dead stream down, never reopen it.
+    pub fn flood_stop_only() -> Self {
+        Self { max_attempts: 0, ..Self::default() }
+    }
+
+    /// What production runs: see `AUTO_REOPEN`.
+    pub fn production() -> Self {
+        if AUTO_REOPEN {
+            Self::default()
+        } else {
+            Self::flood_stop_only()
+        }
+    }
+
     /// Delay slept before 1-based `attempt`: base, 2*base, 4*base ... capped.
     pub fn delay_before(&self, attempt: u32) -> Duration {
         let shift = attempt.saturating_sub(1).min(16);
@@ -239,6 +263,29 @@ mod tests {
         let p = RecoveryPolicy::default();
         let d: Vec<u64> = (1..=7).map(|a| p.delay_before(a).as_secs()).collect();
         assert_eq!(d, vec![1, 2, 4, 8, 16, 16, 16]);
+    }
+
+    /// The shipped contract: tear the dead stream down, never open another,
+    /// report exhaustion immediately (one announcement by the caller).
+    #[tokio::test]
+    async fn flood_stop_only_tears_down_and_never_reopens() {
+        assert!(!AUTO_REOPEN, "narrowed contract: production must not auto-reopen");
+        let torn = RefCell::new(Vec::new());
+        let opens = Cell::new(0u32);
+        let out = recover_stream(
+            DeviceType::System,
+            RecoveryPolicy::production(),
+            || Some("dead"),
+            |s| { torn.borrow_mut().push(s); async {} },
+            || { opens.set(opens.get() + 1); async { Ok("never") } },
+            |s: &str| Some(s),
+            || true,
+            |_| async {},
+        )
+        .await;
+        assert_eq!(out, RecoveryOutcome::Exhausted { attempts: 0 });
+        assert_eq!(&*torn.borrow(), &["dead"]);
+        assert_eq!(opens.get(), 0);
     }
 
     #[tokio::test]

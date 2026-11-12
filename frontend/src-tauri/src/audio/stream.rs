@@ -393,10 +393,6 @@ impl Supervised for AudioStream {
     fn is_dead(&self) -> bool {
         self.capture.is_dead()
     }
-
-    fn poll_stalled(&self) -> bool {
-        self.capture.poll_stalled()
-    }
 }
 
 /// Audio stream manager for handling multiple streams. The stream slots live
@@ -551,13 +547,6 @@ impl AudioStreamManager {
         }
     }
 
-    /// Watchdog sweep: report streams that errored and then went silent.
-    pub fn poll_stalled(&mut self) {
-        for failure in self.slots.poll_stalled() {
-            self.state.report_stream_failure(failure);
-        }
-    }
-
     /// Current epoch of `kind`'s slot (recovery stays valid only while unchanged).
     pub fn slot_epoch(&self, kind: DeviceType) -> u64 {
         self.slots.epoch(kind)
@@ -608,6 +597,10 @@ mod live_tests {
             .unwrap_or(30);
         // MEETILY_W93_RECOVER=0 reproduces the pre-fix shape (no recovery task).
         let recover = std::env::var("MEETILY_W93_RECOVER").map_or(true, |v| v != "0");
+        // `flood-stop` = what production ships (AUTO_REOPEN off); `recover` and
+        // `exhaust` drive the full reopen machinery, which production keeps off.
+        let expect = std::env::var("MEETILY_W93_EXPECT").unwrap_or_default();
+        let policy = if expect == "flood-stop" { RecoveryPolicy::production() } else { RecoveryPolicy::default() };
 
         let state = RecordingState::new();
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -657,7 +650,7 @@ mod live_tests {
                     };
                     let out = recover_stream(
                         kind,
-                        RecoveryPolicy::default(),
+                        policy,
                         move || Some(dead),
                         |s: AudioStream| async move {
                             let _ = tokio::task::spawn_blocking(move || {
@@ -703,8 +696,15 @@ mod live_tests {
         // MEETILY_W93_EXPECT: what the run must demonstrate. Unset or `prefix`
         // (no recovery task) makes no claim; it is the baseline shape.
         let outcomes = outcomes.lock().unwrap().clone();
-        match std::env::var("MEETILY_W93_EXPECT").as_deref() {
-            Ok("recover") => {
+        match expect.as_str() {
+            "flood-stop" => {
+                assert!(failure_seen.load(Ordering::SeqCst), "the kill must produce a dead-stream event");
+                assert!(outcomes.iter().any(|o| o.starts_with("Exhausted { attempts: 0")), "flood-stop tears down without reopening: {outcomes:?}");
+                assert_eq!(callbacks.load(Ordering::SeqCst), 1, "exactly one announcement");
+                assert_eq!(end_streams, 0, "the dead stream is gone; nothing keeps looping");
+                assert!(state.is_recording(), "the session is not stopped by the stream loss");
+            }
+            "recover" => {
                 assert!(failure_seen.load(Ordering::SeqCst), "the kill must produce a dead-stream event");
                 assert!(outcomes.iter().any(|o| o.starts_with("Recovered")), "recovery must succeed: {outcomes:?}");
                 assert_eq!(callbacks.load(Ordering::SeqCst), 0, "a recovered stream must not announce an error");
@@ -718,7 +718,7 @@ mod live_tests {
                     &chunk_history[n - 4..]
                 );
             }
-            Ok("exhaust") => {
+            "exhaust" => {
                 assert!(failure_seen.load(Ordering::SeqCst), "the kill must produce a dead-stream event");
                 assert!(outcomes.iter().any(|o| o.starts_with("Exhausted")), "recovery must give up: {outcomes:?}");
                 assert!(callbacks.load(Ordering::SeqCst) >= 1, "giving up must announce once");

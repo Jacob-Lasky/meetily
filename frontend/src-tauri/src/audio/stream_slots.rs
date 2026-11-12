@@ -26,8 +26,6 @@ pub trait Supervised {
     fn stream_id(&self) -> u64;
     /// The stream's error gate already escalated: it is dead.
     fn is_dead(&self) -> bool;
-    /// Watchdog: true once if the stream errored and then fell silent.
-    fn poll_stalled(&self) -> bool;
 }
 
 struct Slot<S> {
@@ -79,21 +77,6 @@ impl<S: Supervised> StreamSlots<S> {
 
     pub fn count(&self) -> usize {
         usize::from(self.mic.stream.is_some()) + usize::from(self.system.stream.is_some())
-    }
-
-    /// Watchdog sweep over both slots: the failures of streams that errored
-    /// and then went silent. Each stream is reported at most once.
-    pub fn poll_stalled(&self) -> Vec<StreamFailure> {
-        [DeviceType::Microphone, DeviceType::System]
-            .into_iter()
-            .filter_map(|kind| {
-                self.slot(kind)
-                    .stream
-                    .as_ref()
-                    .filter(|s| s.poll_stalled())
-                    .map(|s| StreamFailure { kind, stream_id: s.stream_id() })
-            })
-            .collect()
     }
 
     /// Start path: place a stream in an (expected empty) slot. Returns what it
@@ -165,14 +148,13 @@ mod tests {
     struct Fake {
         id: u64,
         dead: Cell<bool>,
-        stalled: Cell<bool>,
     }
     impl Fake {
         fn new(id: u64) -> Self {
-            Fake { id, dead: Cell::new(false), stalled: Cell::new(false) }
+            Fake { id, dead: Cell::new(false) }
         }
         fn dead(id: u64) -> Self {
-            Fake { id, dead: Cell::new(true), stalled: Cell::new(false) }
+            Fake { id, dead: Cell::new(true) }
         }
     }
     impl Supervised for Fake {
@@ -181,9 +163,6 @@ mod tests {
         }
         fn is_dead(&self) -> bool {
             self.dead.get()
-        }
-        fn poll_stalled(&self) -> bool {
-            self.stalled.replace(false)
         }
     }
 
@@ -306,16 +285,6 @@ mod tests {
         s.install(MIC, Fake::new(5));
         assert!(s.recovery_take(MIC, 4).is_none(), "id 4 is not in the slot");
         assert!(s.has_stream(MIC));
-    }
-
-    #[test]
-    fn the_watchdog_sweep_reports_only_stalled_streams_once() {
-        let mut s = StreamSlots::new();
-        s.install(MIC, Fake::new(1));
-        s.install(SYS, Fake::new(2));
-        s.slot(SYS).stream.as_ref().unwrap().stalled.set(true);
-        assert_eq!(s.poll_stalled(), vec![StreamFailure { kind: SYS, stream_id: 2 }]);
-        assert!(s.poll_stalled().is_empty(), "reported once");
     }
 
     #[test]

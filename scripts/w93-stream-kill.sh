@@ -7,7 +7,11 @@
 # drops audio for every other app on the desktop (Discord, Slack, calls).
 #
 # Usage: scripts/w93-stream-kill.sh <test-binary> [observe-secs] [mode]
-#   mode recover (default): the sound server is "back" immediately, so the
+#   mode flood-stop (default): what production ships (AUTO_REOPEN off): the
+#                           dead stream is torn down, ONE announcement, no
+#                           reopen, bounded log lines.
+#   mode recover:           the reopen machinery, which production keeps off:
+#                           the sound server is "back" immediately, so the
 #                           stream must reopen and resume capture.
 #   mode exhaust:           the PCM vanishes too, so reopen can never work;
 #                           recovery must give up after its bounded attempts.
@@ -15,7 +19,7 @@
 # Prints per-second W93_TICK lines and a summary of log lines per minute.
 set -u
 BIN=${1:?path to the app_lib test binary (cargo test --lib --no-run)}
-MODE=${3:-recover}
+MODE=${3:-flood-stop}
 # Exhaust: 1+2+4+8+16 s of backoff plus quick failed opens is ~35 s. A reopen
 # that STALLS adds up to 15 s per attempt (5 x 15 + 31 = 106 s worst case); pass
 # a larger observe-secs to test that.

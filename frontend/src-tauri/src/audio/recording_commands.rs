@@ -1462,29 +1462,7 @@ fn spawn_stream_recovery(session: &Arc<super::RecordingState>) {
         let mic_ledger = Arc::new(Mutex::new(RecoveryLedger::default()));
         let sys_ledger = Arc::new(Mutex::new(RecoveryLedger::default()));
 
-        let mut watchdog = tokio::time::interval(tokio::time::Duration::from_secs(2));
-        watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        loop {
-            let failure = tokio::select! {
-                failure = failures.recv() => match failure {
-                    Some(failure) => failure,
-                    None => break,
-                },
-                _ = watchdog.tick() => {
-                    // A stream that errored once or twice and then fell silent
-                    // never reaches the consecutive-error threshold: sweep for
-                    // it. Reports land back on the failure channel.
-                    let Some(session) = weak.upgrade() else { break };
-                    if let Some(m) = RECORDING_MANAGER.lock().unwrap().as_mut() {
-                        if Arc::ptr_eq(m.get_state(), &session) {
-                            m.poll_stalled_streams();
-                        }
-                    }
-                    continue;
-                }
-            };
-            let StreamFailure { kind, stream_id } = failure;
+        while let Some(StreamFailure { kind, stream_id }) = failures.recv().await {
             let Some(session) = weak.upgrade() else { break };
 
             // Act only if the slot still holds the stream that failed. A stale

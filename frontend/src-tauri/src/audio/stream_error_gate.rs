@@ -9,17 +9,18 @@
 //! and hid every other service. DO NOT log per error callback: log through
 //! `record_error` and obey its verdict.
 
+//! Known limit (W93 cycle 2): a stream that reports one or two errors and then
+//! falls silent never reaches `ESCALATE_AFTER_CONSECUTIVE` and is not detected.
+//! A no-audio watchdog was tried and removed: it tore down healthy-but-quiet
+//! streams and read half-updated state (two review defects). Add one only with
+//! a data-timestamp design that is checked for both.
+
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Consecutive errors, with no audio delivered in between, before a stream is
 /// declared dead. A lone xrun-style error on a healthy stream never gets here.
 pub const ESCALATE_AFTER_CONSECUTIVE: u32 = 3;
-
-/// A stream that errored and then delivered no audio for this long is dead
-/// even if it never reached `ESCALATE_AFTER_CONSECUTIVE` errors (a backend
-/// that reports one disconnect and then falls silent).
-pub const STALL_AFTER: Duration = Duration::from_secs(3);
 
 /// At most one detailed log line per this interval, per stream.
 pub const LOG_INTERVAL: Duration = Duration::from_secs(5);
@@ -68,7 +69,6 @@ pub struct StreamErrorGate {
     escalated: AtomicBool,
     suppressed: AtomicU64,
     last_log_ms: AtomicU64,
-    last_error_ms: AtomicU64,
 }
 
 impl StreamErrorGate {
@@ -79,7 +79,6 @@ impl StreamErrorGate {
             escalated: AtomicBool::new(false),
             suppressed: AtomicU64::new(0),
             last_log_ms: AtomicU64::new(NEVER),
-            last_error_ms: AtomicU64::new(0),
         }
     }
 
@@ -94,24 +93,6 @@ impl StreamErrorGate {
         self.escalated.load(Ordering::SeqCst)
     }
 
-    /// Watchdog poll: true exactly once if the stream errored, has delivered
-    /// no audio since, and the last error is at least `after` old. Covers the
-    /// stream that reports one or two errors and then goes silent, which
-    /// never reaches the consecutive-error threshold. Marks the stream
-    /// escalated (terminal), like the error path does.
-    pub fn poll_stalled_at(&self, now: Instant, after: Duration) -> bool {
-        if self.consecutive.load(Ordering::Relaxed) == 0 {
-            return false;
-        }
-        let now_ms = now.saturating_duration_since(self.epoch).as_millis() as u64;
-        let since_error = now_ms.saturating_sub(self.last_error_ms.load(Ordering::Relaxed));
-        since_error >= after.as_millis() as u64 && !self.escalated.swap(true, Ordering::SeqCst)
-    }
-
-    pub fn poll_stalled(&self) -> bool {
-        self.poll_stalled_at(Instant::now(), STALL_AFTER)
-    }
-
     pub fn record_error(&self) -> ErrorVerdict {
         self.record_error_at(Instant::now())
     }
@@ -123,7 +104,6 @@ impl StreamErrorGate {
             && !self.escalated.swap(true, Ordering::SeqCst);
 
         let now_ms = now.saturating_duration_since(self.epoch).as_millis() as u64;
-        self.last_error_ms.store(now_ms, Ordering::Relaxed);
         let last = self.last_log_ms.load(Ordering::Relaxed);
         let due = last == NEVER || now_ms.saturating_sub(last) >= LOG_INTERVAL.as_millis() as u64;
         let log = if due
@@ -246,36 +226,6 @@ mod tests {
         let v = gate.record_error_at(Instant::now());
         assert!(v.log.is_some());
         assert!(!v.reports_to_session(false));
-    }
-
-    /// Review finding: one or two errors then silence never reached the
-    /// consecutive threshold, so the dead stream was neither recovered nor
-    /// announced.
-    #[test]
-    fn a_stream_that_errors_twice_and_goes_silent_is_declared_dead_by_the_watchdog() {
-        let gate = StreamErrorGate::new();
-        let t0 = Instant::now();
-        assert!(!gate.record_error_at(t0).escalate);
-        assert!(!gate.record_error_at(t0 + Duration::from_millis(10)).escalate);
-        assert!(!gate.poll_stalled_at(t0 + Duration::from_secs(1), STALL_AFTER), "too early");
-        assert!(gate.poll_stalled_at(t0 + Duration::from_secs(4), STALL_AFTER), "silent past the stall window");
-        assert!(!gate.poll_stalled_at(t0 + Duration::from_secs(9), STALL_AFTER), "reported once");
-        assert!(gate.record_error_at(t0 + Duration::from_secs(10)).terminal, "terminal afterwards");
-    }
-
-    #[test]
-    fn audio_after_an_error_means_the_watchdog_stays_quiet() {
-        let gate = StreamErrorGate::new();
-        let t0 = Instant::now();
-        gate.record_error_at(t0);
-        gate.note_data();
-        assert!(!gate.poll_stalled_at(t0 + Duration::from_secs(60), STALL_AFTER));
-    }
-
-    #[test]
-    fn a_stream_that_never_errored_is_never_stalled() {
-        let gate = StreamErrorGate::new();
-        assert!(!gate.poll_stalled_at(Instant::now() + Duration::from_secs(600), STALL_AFTER));
     }
 
     #[test]

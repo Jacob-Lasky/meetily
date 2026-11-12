@@ -1432,13 +1432,14 @@ async fn teardown_stream_bounded(stream: super::stream::AudioStream) {
     }
 }
 
-/// Recovery supervisor for dead capture streams (W93).
+/// Supervisor for dead capture streams (W93).
 ///
 /// A capture stream whose backend keeps failing reports once through
 /// `RecordingState::report_stream_failure`. This task tears the dead stream
-/// down (ending its error loop), reopens the same device with bounded
-/// exponential backoff, and gives up with one user-visible error if the device
-/// never returns. DO NOT replace this with a retry inside the cpal error
+/// down (ending its error loop) and gives the user ONE error. The shipped
+/// contract is flood-stop only (`stream_recovery::AUTO_REOPEN` = false, see
+/// `RecoveryPolicy::production()`); with it on, the task would also reopen the
+/// same device with bounded exponential backoff. DO NOT replace this with a retry inside the cpal error
 /// callback: that callback IS the loop. It holds only a `Weak` session so it
 /// ends when the recording's state is dropped. Each failed stream is recovered
 /// in its own task: a PipeWire restart kills mic and system together, and the
@@ -1569,10 +1570,17 @@ async fn run_stream_recovery(
             ledger.lock().unwrap().recovered(std::time::Instant::now());
         }
         RecoveryOutcome::Exhausted { attempts } => {
-            error!(
-                "[STREAM_RECOVERY] {:?} stream could not be reopened after {} attempt(s); giving up",
-                kind, attempts
-            );
+            if attempts == 0 {
+                error!(
+                    "[STREAM_RECOVERY] {:?} stream is dead and was torn down; auto-reopen is disabled (flood-stop only), restart the recording",
+                    kind
+                );
+            } else {
+                error!(
+                    "[STREAM_RECOVERY] {:?} stream could not be reopened after {} attempt(s); giving up",
+                    kind, attempts
+                );
+            }
             // One user-visible message through the normal error callback. DO
             // NOT stop the session from here: the other stream may be fine,
             // and a mic hot-swap can have the mic slot momentarily empty, so

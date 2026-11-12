@@ -591,8 +591,8 @@ impl RecordingManager {
         stream: super::stream::AudioStream,
         device: Arc<AudioDevice>,
         system_name: Option<String>,
-    ) {
-        self.stream_manager.set_mic_stream(stream);
+    ) -> Option<super::stream::AudioStream> {
+        let replaced = self.stream_manager.set_mic_stream(stream);
         // Notify the device monitor so it tracks the new mic (and updated
         // system output) instead of the dead ones (M8 fix). BT devices like
         // AirPods are often both mic AND speaker — when they disconnect, both
@@ -607,6 +607,32 @@ impl RecordingManager {
             monitor.notify_mic_swapped(device.name.clone(), system_name);
         }
         self.state.set_microphone_device(device);
+        replaced
+    }
+
+    /// Take a dead stream out for recovery. See `stream_recovery`.
+    pub fn take_stream_for_recovery(&mut self, kind: super::recording_state::DeviceType, stream_id: u64) -> Option<super::stream::AudioStream> {
+        self.stream_manager.take_stream_if_current(kind, stream_id)
+    }
+
+    /// Whether `kind`'s stream slot currently holds a stream.
+    pub fn has_stream(&self, kind: super::recording_state::DeviceType) -> bool {
+        self.stream_manager.has_stream(kind)
+    }
+
+    /// Id of the stream in `kind`'s slot if it was already declared dead.
+    pub fn dead_stream_id(&self, kind: super::recording_state::DeviceType) -> Option<u64> {
+        self.stream_manager.dead_stream_id(kind)
+    }
+
+    /// Install a recovered stream if its slot is still empty; returns it back
+    /// otherwise. Keeps the per-session device reference in step.
+    pub fn install_recovered_stream(
+        &mut self,
+        kind: super::recording_state::DeviceType,
+        stream: super::stream::AudioStream,
+    ) -> Option<super::stream::AudioStream> {
+        self.stream_manager.install_stream_if_empty(kind, stream)
     }
 
     /// Get reference to recording state for external access

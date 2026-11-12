@@ -462,12 +462,18 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
 
     // Spawn background device event processor (mic-disconnect fallback).
     if let Some(receiver) = device_event_receiver {
-        spawn_device_event_processor(app.clone(), receiver, session);
+        spawn_device_event_processor(app.clone(), receiver, session.clone());
     }
 
     // Flip recording live + reset per-session flags (speech-detected latch,
     // mic-recovery budget). Shared with the other start path — see helper.
     finalize_recording_start();
+
+    // Start the dead-stream recovery supervisor only after the manager is
+    // published AND the recording is flagged live: it looks the failed stream
+    // up in the manager and abandons a run whose session is not live. A
+    // failure queued during start-up is buffered by the channel until now.
+    spawn_stream_recovery(&session);
     drop(engine_lifecycle_guard);
 
     // Start optimized parallel transcription task and store handle
@@ -627,12 +633,18 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
 
     // Spawn background device event processor (mic-disconnect fallback).
     if let Some(receiver) = device_event_receiver {
-        spawn_device_event_processor(app.clone(), receiver, session);
+        spawn_device_event_processor(app.clone(), receiver, session.clone());
     }
 
     // Flip recording live + reset per-session flags (speech-detected latch,
     // mic-recovery budget). Shared with the other start path — see helper.
     finalize_recording_start();
+
+    // Start the dead-stream recovery supervisor only after the manager is
+    // published AND the recording is flagged live: it looks the failed stream
+    // up in the manager and abandons a run whose session is not live. A
+    // failure queued during start-up is buffered by the channel until now.
+    spawn_stream_recovery(&session);
     drop(engine_lifecycle_guard);
 
     // Start optimized parallel transcription task and store handle
@@ -1348,9 +1360,7 @@ async fn do_mic_swap(device_name: &str, session: &Arc<super::RecordingState>) ->
     // Non-fatal: the replacement stream is created next regardless, so a
     // teardown error/stall on the already-dead device must not abort the swap.
     if let Some(s) = old_mic {
-        if let Err(e) = s.stop() {
-            warn!("[HOT_SWAP] Failed to stop old mic stream (proceeding): {}", e);
-        }
+        teardown_stream_bounded(s).await;
     }
 
     // Phase 2: Async I/O WITHOUT lock — may be slow, that's OK
@@ -1381,11 +1391,12 @@ async fn do_mic_swap(device_name: &str, session: &Arc<super::RecordingState>) ->
     let system_name = default_output_device().ok().map(|d| d.name);
 
     // Phase 3: Lock briefly — install ONLY if still the same session
+    let mut replaced: Option<super::stream::AudioStream> = None;
     {
         let mut guard = RECORDING_MANAGER.lock().unwrap();
         match guard.as_mut() {
             Some(manager) if Arc::ptr_eq(manager.get_state(), session) => {
-                manager.set_mic_stream_after_swap(new_stream, device_arc, system_name);
+                replaced = manager.set_mic_stream_after_swap(new_stream, device_arc, system_name);
                 info!("[HOT_SWAP] Mic hot-swap to '{}' completed", device_name);
             }
             Some(_) => {
@@ -1397,7 +1408,182 @@ async fn do_mic_swap(device_name: &str, session: &Arc<super::RecordingState>) ->
         }
     } // lock released
 
+    // The new mic may have died before it reached the slot.
+    rereport_if_dead_after_install(session, super::recording_state::DeviceType::Microphone);
+
+    // A dead-stream recovery may have installed a mic stream while this swap
+    // was building its own; tear that one down outside the lock.
+    if let Some(old) = replaced {
+        teardown_stream_bounded(old).await;
+    }
+
     Ok(())
+}
+
+/// A freshly installed stream can already be dead: its failure event fired
+/// while its slot was still empty and was discarded as stale. Re-report it
+/// now that it is in the slot. Used after every install (recovery, mic swap).
+fn rereport_if_dead_after_install(session: &Arc<super::RecordingState>, kind: super::recording_state::DeviceType) {
+    let dead_id = RECORDING_MANAGER
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|m| Arc::ptr_eq(m.get_state(), session))
+        .and_then(|m| m.dead_stream_id(kind));
+    if let Some(stream_id) = dead_id {
+        session.report_stream_failure(super::recording_state::StreamFailure { kind, stream_id });
+    }
+}
+
+/// Stop a cpal stream off the async workers and wait at most 5 s. A cpal drop
+/// joins its worker thread and can stall on a dead device, so neither the
+/// recovery task nor a mic hot-swap may wait on it unbounded (the stalled
+/// blocking thread keeps only that stream alive; Rust cannot cancel it).
+async fn teardown_stream_bounded(stream: super::stream::AudioStream) {
+    let done = tokio::task::spawn_blocking(move || {
+        let _ = stream.stop();
+    });
+    if tokio::time::timeout(tokio::time::Duration::from_secs(5), done).await.is_err() {
+        warn!("[STREAM_TEARDOWN] stream teardown still running after 5s; continuing");
+    }
+}
+
+/// Recovery supervisor for dead capture streams (W93).
+///
+/// A capture stream whose backend keeps failing reports once through
+/// `RecordingState::report_stream_failure`. This task tears the dead stream
+/// down (ending its error loop), reopens the same device with bounded
+/// exponential backoff, and gives up with one user-visible error if the device
+/// never returns. DO NOT replace this with a retry inside the cpal error
+/// callback: that callback IS the loop. It holds only a `Weak` session so it
+/// ends when the recording's state is dropped. Each failed stream is recovered
+/// in its own task: a PipeWire restart kills mic and system together, and the
+/// second dead stream must not wait out the first one's 31 s of backoff while
+/// its worker keeps spinning.
+///
+/// Known limit: if `AudioStream::stop` stalls forever inside cpal (a dead
+/// device), the blocking thread keeps that one stream, and so the session
+/// state, alive. Rust cannot cancel it; the same hazard already exists in the
+/// normal stop path. The 5 s timeout only keeps recovery itself from waiting.
+fn spawn_stream_recovery(session: &Arc<super::RecordingState>) {
+    use super::recording_state::StreamFailure;
+    use super::stream_recovery::RecoveryLedger;
+
+    let Some(mut failures) = session.take_stream_failure_receiver() else {
+        return;
+    };
+    let weak = Arc::downgrade(session);
+
+    tokio::spawn(async move {
+        let mic_ledger = Arc::new(Mutex::new(RecoveryLedger::default()));
+        let sys_ledger = Arc::new(Mutex::new(RecoveryLedger::default()));
+
+        while let Some(StreamFailure { kind, stream_id }) = failures.recv().await {
+            let Some(session) = weak.upgrade() else { break };
+
+            // Act only if the slot still holds the stream that failed. A stale
+            // event (stream already replaced by a mic hot-swap, or torn down by
+            // stop) must never tear down a healthy successor.
+            let dead = {
+                let mut guard = RECORDING_MANAGER.lock().unwrap();
+                match guard.as_mut() {
+                    Some(m) if Arc::ptr_eq(m.get_state(), &session) => m.take_stream_for_recovery(kind, stream_id),
+                    _ => None,
+                }
+            };
+            let Some(dead) = dead else {
+                info!("[STREAM_RECOVERY] {:?}: stale failure for stream {} - already replaced or stopped", kind, stream_id);
+                continue;
+            };
+
+            let ledger = match kind {
+                super::recording_state::DeviceType::Microphone => mic_ledger.clone(),
+                super::recording_state::DeviceType::System => sys_ledger.clone(),
+            };
+            tokio::spawn(run_stream_recovery(session, kind, dead, ledger));
+        }
+    });
+}
+
+/// One dead stream's recovery run. See `spawn_stream_recovery`.
+async fn run_stream_recovery(
+    session: Arc<super::RecordingState>,
+    kind: super::recording_state::DeviceType,
+    dead: super::stream::AudioStream,
+    ledger: Arc<Mutex<super::stream_recovery::RecoveryLedger>>,
+) {
+    use super::recording_state::DeviceType as StreamKind;
+    use super::stream_recovery::{recover_stream, RecoveryOutcome, RecoveryPolicy};
+
+    // A replacement that dies again right away must not be reopened forever:
+    // with the budget spent, only tear the dead stream down.
+    let mut policy = RecoveryPolicy::default();
+    {
+        let mut ledger = ledger.lock().unwrap();
+        if ledger.allow(std::time::Instant::now()) {
+            ledger.started();
+        } else {
+            warn!("[STREAM_RECOVERY] {:?}: replacement keeps failing - tearing down without retry", kind);
+            policy.max_attempts = 0;
+        }
+    }
+
+    let outcome = recover_stream(
+        kind,
+        policy,
+        move || Some(dead),
+        // Tear down OUTSIDE any lock and off the async workers: a cpal stop on
+        // a dead device can stall (see do_mic_swap).
+        teardown_stream_bounded,
+        || {
+            let session = session.clone();
+            async move {
+                let device = match kind {
+                    StreamKind::Microphone => session.get_microphone_device(),
+                    StreamKind::System => session.get_system_device(),
+                }
+                .ok_or_else(|| anyhow::anyhow!("no {:?} device recorded for this session", kind))?;
+                super::stream::AudioStream::create(device, session, kind, None).await
+            }
+        },
+        |stream| {
+            let mut guard = RECORDING_MANAGER.lock().unwrap();
+            match guard.as_mut() {
+                Some(m) if Arc::ptr_eq(m.get_state(), &session) => m.install_recovered_stream(kind, stream),
+                _ => Some(stream),
+            }
+        },
+        || {
+            session_live(&session)
+                && !RECORDING_MANAGER
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map_or(false, |m| Arc::ptr_eq(m.get_state(), &session) && m.has_stream(kind))
+        },
+        tokio::time::sleep,
+    )
+    .await;
+
+    match outcome {
+        RecoveryOutcome::Recovered { attempts } => {
+            info!("[STREAM_RECOVERY] {:?} stream recovered after {} attempt(s)", kind, attempts);
+            ledger.lock().unwrap().recovered(std::time::Instant::now());
+            rereport_if_dead_after_install(&session, kind);
+        }
+        RecoveryOutcome::Exhausted { attempts } => {
+            error!(
+                "[STREAM_RECOVERY] {:?} stream could not be reopened after {} attempt(s); giving up",
+                kind, attempts
+            );
+            // One user-visible message through the normal error callback. DO
+            // NOT stop the session from here: the other stream may be fine,
+            // and a mic hot-swap can have the mic slot momentarily empty, so
+            // "no streams left" is not knowable here. The user stops it.
+            session.announce_error(super::AudioError::DeviceDisconnected);
+        }
+        RecoveryOutcome::Abandoned => {}
+    }
 }
 
 /// Background processor for device monitor events during a recording session.

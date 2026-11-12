@@ -20,6 +20,8 @@ pub mod ffmpeg_mixer;  // NEW: FFmpeg-style adaptive audio mixer
 pub mod recording_state;
 pub mod pipeline;
 pub mod stream;
+pub mod stream_error_gate; // W93: rate-limit + dead-stream detection for backend error callbacks
+pub mod stream_recovery;   // W93: bounded-backoff reopen of a dead capture stream
 pub mod recording_manager;
 pub mod recording_commands;
 pub mod recording_preferences;

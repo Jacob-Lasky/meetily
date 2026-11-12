@@ -9,7 +9,8 @@ use super::batch_processor::AudioMetricsBatcher;
 use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 
 use super::devices::AudioDevice;
-use super::recording_state::{AudioChunk, AudioError, AudioLayout, RecordingState, DeviceType};
+use super::recording_state::{AudioChunk, AudioError, AudioLayout, RecordingState, DeviceType, StreamFailure};
+use super::stream_error_gate::{StreamErrorGate, ESCALATE_AFTER_CONSECUTIVE};
 use super::audio_processing::{audio_to_mono, interleave_stereo, LoudnessNormalizer, NoiseSuppressionProcessor, HighPassFilter};
 use super::vad::{ContinuousVadProcessor};
 
@@ -229,6 +230,9 @@ impl ProfessionalAudioMixer {
     }
 }
 
+/// Source of `AudioCapture::stream_id`.
+static NEXT_STREAM_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Simplified audio capture without broadcast channels
 #[derive(Clone)]
 pub struct AudioCapture {
@@ -250,6 +254,10 @@ pub struct AudioCapture {
     high_pass_filter: Arc<std::sync::Mutex<Option<HighPassFilter>>>,
     // EBU R128 normalizer for microphone audio (per-device, stateful)
     normalizer: Arc<std::sync::Mutex<Option<LoudnessNormalizer>>>,
+    // Rate-limits stream error logging and detects a dead stream (W93)
+    error_gate: Arc<StreamErrorGate>,
+    // Unique per capture (= per opened stream); failure events name it
+    stream_id: u64,
     // Note: Using global recording timestamp for synchronization
 }
 
@@ -418,12 +426,28 @@ impl AudioCapture {
             noise_suppressor: Arc::new(std::sync::Mutex::new(noise_suppressor)),
             high_pass_filter: Arc::new(std::sync::Mutex::new(high_pass_filter)),
             normalizer: Arc::new(std::sync::Mutex::new(normalizer)),
+            error_gate: Arc::new(StreamErrorGate::new()),
+            stream_id: NEXT_STREAM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             // Using global recording time for sync
         }
     }
 
     /// Process audio data directly from callback
+    /// Identity of the stream this capture feeds; carried by failure events.
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+
+    /// True once this capture's stream was declared dead (its failure event
+    /// has been, or is about to be, delivered).
+    pub fn is_dead(&self) -> bool {
+        self.error_gate.escalated()
+    }
+
     pub fn process_audio_data(&self, data: &[f32]) {
+        // Audio is flowing, so any earlier stream error was transient.
+        self.error_gate.note_data();
+
         // Check if still recording
         if !self.state.is_recording() {
             return;
@@ -685,34 +709,84 @@ impl AudioCapture {
         }
     }
 
-    /// Handle stream errors with enhanced disconnect detection
+    /// Handle stream errors with enhanced disconnect detection.
+    ///
+    /// A dead backend stream (PipeWire restarted under a live recording)
+    /// re-invokes this callback thousands of times a second, so it must be
+    /// cheap and quiet: `error_gate` keeps one detailed log line per interval,
+    /// forwards the error to `RecordingState` only when it logs, and reports a
+    /// dead stream exactly once so the recovery task can reopen it (W93).
     pub fn handle_stream_error(&self, error: cpal::StreamError) {
-        error!("Audio stream error for {}: {}", self.device.name, error);
+        let verdict = self.error_gate.record_error();
 
-        let error_str = error.to_string().to_lowercase();
+        if verdict.escalate {
+            warn!(
+                "Audio stream for {} ({:?}) is failing with no audio in between ({} consecutive errors); requesting a stream reopen",
+                self.device.name, self.device_type, verdict.consecutive
+            );
+            self.state.report_stream_failure(StreamFailure {
+                kind: self.device_type,
+                stream_id: self.stream_id,
+            });
+        }
 
-        // Enhanced error detection for device disconnection
-        let audio_error = if error_str.contains("device is no longer available")
-            || error_str.contains("device not found")
-            || error_str.contains("device disconnected")
-            || error_str.contains("no such device")
-            || error_str.contains("device unavailable")
-            || error_str.contains("device removed")
-        {
-            warn!("🔌 Device disconnect detected for: {}", self.device.name);
-            AudioError::DeviceDisconnected
-        } else if error_str.contains("permission") || error_str.contains("access denied") {
-            AudioError::PermissionDenied
-        } else if error_str.contains("channel closed") {
-            AudioError::ChannelClosed
-        } else if error_str.contains("stream") && error_str.contains("failed") {
-            AudioError::StreamFailed
-        } else {
-            warn!("Unknown audio error: {}", error);
-            AudioError::StreamFailed
+        let audio_error = classify_stream_error(&error.to_string());
+
+        // Rate limiting must never swallow a fatal error: a permission or
+        // channel-closed error arriving inside the quiet window of an earlier
+        // recoverable one still has to stop the session and tell the user.
+        // `report_error` is idempotent once stopped, so this cannot flood.
+        let must_report = !audio_error.is_recoverable();
+
+        let Some(suppressed) = verdict.log else {
+            if must_report && self.state.is_recording() {
+                error!("Audio stream error for {}: {}", self.device.name, error);
+                self.state.report_error(audio_error);
+            }
+            return;
         };
 
+        if suppressed > 0 {
+            error!(
+                "Audio stream error for {}: {} ({} identical errors suppressed since the last report)",
+                self.device.name, error, suppressed
+            );
+        } else {
+            error!("Audio stream error for {}: {}", self.device.name, error);
+        }
+        if matches!(audio_error, AudioError::DeviceDisconnected) {
+            warn!("🔌 Device disconnect detected for: {}", self.device.name);
+        }
+
+        // Past escalation the recovery task owns a recoverable error: it is
+        // tearing the stream down or reopening it, and its own exhaustion
+        // path tells the user. Feeding these to the stop counters would stop
+        // the whole session after ten reports (50 s) if teardown stalls.
+        if audio_error.is_recoverable() && verdict.consecutive > ESCALATE_AFTER_CONSECUTIVE {
+            return;
+        }
+
         self.state.report_error(audio_error);
+    }
+}
+
+/// Map a backend stream error message to an `AudioError` class.
+fn classify_stream_error(message: &str) -> AudioError {
+    let error_str = message.to_lowercase();
+    if error_str.contains("device is no longer available")
+        || error_str.contains("device not found")
+        || error_str.contains("device disconnected")
+        || error_str.contains("no such device")
+        || error_str.contains("device unavailable")
+        || error_str.contains("device removed")
+    {
+        AudioError::DeviceDisconnected
+    } else if error_str.contains("permission") || error_str.contains("access denied") {
+        AudioError::PermissionDenied
+    } else if error_str.contains("channel closed") {
+        AudioError::ChannelClosed
+    } else {
+        AudioError::StreamFailed
     }
 }
 
@@ -1183,6 +1257,19 @@ impl Default for AudioPipelineManager {
 }
 #[cfg(test)]
 mod tests {
+    /// W93 review: the stream-error rate limit may only swallow recoverable
+    /// errors. These are the classes `handle_stream_error` always reports.
+    #[test]
+    fn classify_stream_error_separates_fatal_from_recoverable() {
+        let alsa_poll = "A backend-specific error has occurred: ALSA function 'snd_pcm_poll_descriptors_revents' failed with error 'Unknown errno (-5)'";
+        assert!(classify_stream_error(alsa_poll).is_recoverable());
+        assert!(classify_stream_error("The requested device is no longer available").is_recoverable());
+        assert!(matches!(classify_stream_error("The requested device is no longer available"), AudioError::DeviceDisconnected));
+        assert!(!classify_stream_error("Permission denied opening device").is_recoverable());
+        assert!(!classify_stream_error("access denied").is_recoverable());
+        assert!(!classify_stream_error("channel closed").is_recoverable());
+    }
+
     use super::*;
 
     #[test]

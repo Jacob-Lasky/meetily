@@ -8,10 +8,19 @@ use super::devices::AudioDevice;
 use super::buffer_pool::AudioBufferPool;
 
 /// Device type for audio chunks
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceType {
     Microphone,
     System,
+}
+
+/// A capture stream reported dead. `stream_id` identifies WHICH stream (see
+/// `AudioCapture::stream_id`) so recovery never tears down a healthy
+/// replacement when a stale event from an already-replaced stream arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamFailure {
+    pub kind: DeviceType,
+    pub stream_id: u64,
 }
 
 /// Audio chunk with metadata for processing
@@ -138,6 +147,12 @@ pub struct RecordingState {
     last_error: Mutex<Option<AudioError>>,
     error_callback: Mutex<Option<Box<dyn Fn(&AudioError) + Send + Sync>>>,
 
+    // Dead-stream notifications. A capture whose backend keeps erroring reports
+    // here ONCE per stream (see `StreamErrorGate`); the recovery task owns the
+    // receiver and reopens the stream with bounded backoff.
+    stream_failure_tx: mpsc::UnboundedSender<StreamFailure>,
+    stream_failure_rx: Mutex<Option<mpsc::UnboundedReceiver<StreamFailure>>>,
+
     // Statistics
     stats: Mutex<RecordingStats>,
 
@@ -150,22 +165,7 @@ pub struct RecordingState {
 
 impl RecordingState {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            is_recording: AtomicBool::new(false),
-            is_paused: AtomicBool::new(false),
-            microphone_device: Mutex::new(None),
-            system_device: Mutex::new(None),
-            audio_sender: Mutex::new(None),
-            buffer_pool: AudioBufferPool::new(16, 48000), // Pool of 16 buffers with 48kHz samples capacity
-            error_count: AtomicU32::new(0),
-            recoverable_error_count: AtomicU32::new(0),
-            last_error: Mutex::new(None),
-            error_callback: Mutex::new(None),
-            stats: Mutex::new(RecordingStats::default()),
-            recording_start: Mutex::new(None),
-            pause_start: Mutex::new(None),
-            total_pause_duration: Mutex::new(std::time::Duration::ZERO),
-        })
+        Arc::new(Self::default())
     }
 
     // Recording control
@@ -291,6 +291,16 @@ impl RecordingState {
     pub fn report_error(&self, error: AudioError) {
         let count = self.error_count.fetch_add(1, Ordering::SeqCst) + 1;
 
+        // Once recording has stopped there is nothing left to stop or announce.
+        // A dead backend stream used to call this thousands of times a second,
+        // and each call re-logged and re-ran `stop_recording` (W93: the journal
+        // flood after a PipeWire restart). Count it, keep the first error for
+        // diagnostics, and stay quiet.
+        if !self.is_recording() {
+            log::debug!("Audio error after recording stopped (#{}): {:?}", count, error);
+            return;
+        }
+
         // Track recoverable vs non-recoverable errors separately
         if error.is_recoverable() {
             let recoverable_count = self.recoverable_error_count.fetch_add(1, Ordering::SeqCst) + 1;
@@ -315,10 +325,33 @@ impl RecordingState {
         }
 
         // Fallback: stop recording after too many total errors
-        if count >= 15 {
+        if count >= 15 && self.is_recording() {
             log::error!("Too many total audio errors ({}), stopping recording", count);
             self.stop_recording();
         }
+    }
+
+    /// Tell the user about an error WITHOUT touching the stop counters: used
+    /// when recovery gives up on one stream, which must not stop a session
+    /// whose other stream is fine (and must not be counted toward the
+    /// "10 recoverable errors" stop either).
+    pub fn announce_error(&self, error: AudioError) {
+        *self.last_error.lock().unwrap() = Some(error.clone());
+        if let Some(callback) = self.error_callback.lock().unwrap().as_ref() {
+            callback(&error);
+        }
+    }
+
+    /// A capture stream is dead: its backend keeps erroring with no audio in
+    /// between. Fired at most once per stream (`StreamErrorGate`); the recovery
+    /// task reopens the stream. No-op once the receiver is gone.
+    pub fn report_stream_failure(&self, failure: StreamFailure) {
+        let _ = self.stream_failure_tx.send(failure);
+    }
+
+    /// Hand the failure receiver to the recovery task. `None` after the first call.
+    pub fn take_stream_failure_receiver(&self) -> Option<mpsc::UnboundedReceiver<StreamFailure>> {
+        self.stream_failure_rx.lock().unwrap().take()
     }
 
     pub fn get_error_count(&self) -> u32 {
@@ -412,6 +445,7 @@ impl RecordingState {
 
 impl Default for RecordingState {
     fn default() -> Self {
+        let (stream_failure_tx, stream_failure_rx) = mpsc::unbounded_channel();
         Self {
             is_recording: AtomicBool::new(false),
             is_paused: AtomicBool::new(false),
@@ -423,6 +457,8 @@ impl Default for RecordingState {
             recoverable_error_count: AtomicU32::new(0),
             last_error: Mutex::new(None),
             error_callback: Mutex::new(None),
+            stream_failure_tx,
+            stream_failure_rx: Mutex::new(Some(stream_failure_rx)),
             stats: Mutex::new(RecordingStats::default()),
             recording_start: Mutex::new(None),
             pause_start: Mutex::new(None),
@@ -439,5 +475,61 @@ impl Clone for RecordingStats {
             total_duration: self.total_duration,
             last_activity: self.last_activity,
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn counting_state() -> (Arc<RecordingState>, Arc<AtomicUsize>) {
+        let state = RecordingState::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        state.set_error_callback(move |_| {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+        state.start_recording().unwrap();
+        (state, calls)
+    }
+
+    /// W93: a dead backend stream reported thousands of errors a second and each
+    /// one re-ran stop_recording and the user callback. After the session has
+    /// stopped, further errors are counted but must be inert.
+    #[test]
+    fn errors_after_stop_are_counted_but_inert() {
+        let (state, calls) = counting_state();
+        for _ in 0..10 {
+            state.report_error(AudioError::StreamFailed);
+        }
+        assert!(!state.is_recording(), "10 recoverable errors stop the session");
+        let callbacks_at_stop = calls.load(Ordering::SeqCst);
+        assert_eq!(callbacks_at_stop, 10);
+
+        for _ in 0..50_000 {
+            state.report_error(AudioError::StreamFailed);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), callbacks_at_stop, "no callback after stop");
+        assert_eq!(state.get_error_count(), 50_010, "still counted");
+        assert_eq!(state.get_recoverable_error_count(), 10, "recoverable budget not inflated");
+    }
+
+    #[test]
+    fn non_recoverable_error_stops_once() {
+        let (state, calls) = counting_state();
+        state.report_error(AudioError::InitializationFailed);
+        state.report_error(AudioError::InitializationFailed);
+        assert!(!state.is_recording());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stream_failure_receiver_is_handed_out_once() {
+        let state = RecordingState::new();
+        let mut rx = state.take_stream_failure_receiver().expect("first take");
+        assert!(state.take_stream_failure_receiver().is_none());
+        let f = StreamFailure { kind: DeviceType::System, stream_id: 7 };
+        state.report_stream_failure(f);
+        assert_eq!(rx.try_recv().unwrap(), f);
     }
 }

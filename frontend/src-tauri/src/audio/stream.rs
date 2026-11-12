@@ -55,6 +55,25 @@ impl AudioStream {
         Self::create_with_backend(device, state, device_type, recording_sender, backend_type).await
     }
 
+    /// `create` on a blocking thread. Opening a device runs synchronous cpal
+    /// calls (enumeration, stream build, play) that can stall on a half-dead
+    /// backend; on an async worker that would block the runtime and make any
+    /// `tokio::time::timeout` around it unable to fire. The reopen path and
+    /// the live harness both use this one entry point. A stalled attempt's
+    /// stream is dropped when it finally returns.
+    pub async fn create_blocking(
+        device: Arc<AudioDevice>,
+        state: Arc<RecordingState>,
+        device_type: DeviceType,
+    ) -> Result<Self> {
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            runtime.block_on(Self::create(device, state, device_type, None))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("stream open task failed: {}", e))?
+    }
+
     /// Create a new audio stream with explicit backend selection
     pub async fn create_with_backend(
         device: Arc<AudioDevice>,
@@ -374,6 +393,10 @@ impl Supervised for AudioStream {
     fn is_dead(&self) -> bool {
         self.capture.is_dead()
     }
+
+    fn poll_stalled(&self) -> bool {
+        self.capture.poll_stalled()
+    }
 }
 
 /// Audio stream manager for handling multiple streams. The stream slots live
@@ -528,6 +551,13 @@ impl AudioStreamManager {
         }
     }
 
+    /// Watchdog sweep: report streams that errored and then went silent.
+    pub fn poll_stalled(&mut self) {
+        for failure in self.slots.poll_stalled() {
+            self.state.report_stream_failure(failure);
+        }
+    }
+
     /// Current epoch of `kind`'s slot (recovery stays valid only while unchanged).
     pub fn slot_epoch(&self, kind: DeviceType) -> u64 {
         self.slots.epoch(kind)
@@ -637,7 +667,7 @@ mod live_tests {
                         },
                         || {
                             let (st, d) = (state2.clone(), dev2.clone());
-                            async move { AudioStream::create(d, st, kind, None).await }
+                            async move { AudioStream::create_blocking(d, st, kind).await }
                         },
                         |s| mgr2.lock().unwrap().recovery_install(kind, epoch, s),
                         || state2.is_recording() && mgr2.lock().unwrap().slot_epoch(kind) == epoch,

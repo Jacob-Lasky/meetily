@@ -1462,7 +1462,29 @@ fn spawn_stream_recovery(session: &Arc<super::RecordingState>) {
         let mic_ledger = Arc::new(Mutex::new(RecoveryLedger::default()));
         let sys_ledger = Arc::new(Mutex::new(RecoveryLedger::default()));
 
-        while let Some(StreamFailure { kind, stream_id }) = failures.recv().await {
+        let mut watchdog = tokio::time::interval(tokio::time::Duration::from_secs(2));
+        watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            let failure = tokio::select! {
+                failure = failures.recv() => match failure {
+                    Some(failure) => failure,
+                    None => break,
+                },
+                _ = watchdog.tick() => {
+                    // A stream that errored once or twice and then fell silent
+                    // never reaches the consecutive-error threshold: sweep for
+                    // it. Reports land back on the failure channel.
+                    let Some(session) = weak.upgrade() else { break };
+                    if let Some(m) = RECORDING_MANAGER.lock().unwrap().as_mut() {
+                        if Arc::ptr_eq(m.get_state(), &session) {
+                            m.poll_stalled_streams();
+                        }
+                    }
+                    continue;
+                }
+            };
+            let StreamFailure { kind, stream_id } = failure;
             let Some(session) = weak.upgrade() else { break };
 
             // Act only if the slot still holds the stream that failed. A stale
@@ -1520,10 +1542,8 @@ async fn run_stream_recovery(
         // Tear down OUTSIDE any lock and off the async workers: a cpal stop on
         // a dead device can stall (see do_mic_swap).
         teardown_stream_bounded,
-        // AudioStream::create runs synchronous cpal calls (enumeration, build,
-        // play) that can stall on a half-dead backend. Run it on a blocking
-        // thread so recover_stream's open timeout can actually fire; a stalled
-        // attempt's stream is dropped when it finally returns.
+        // `create_blocking` runs the synchronous cpal open on a blocking thread
+        // so recover_stream's open timeout can actually fire.
         || {
             let session = session.clone();
             async move {
@@ -1532,18 +1552,15 @@ async fn run_stream_recovery(
                     StreamKind::System => session.get_system_device(),
                 }
                 .ok_or_else(|| anyhow::anyhow!("no {:?} device recorded for this session", kind))?;
-                let runtime = tokio::runtime::Handle::current();
-                tokio::task::spawn_blocking(move || {
-                    runtime.block_on(super::stream::AudioStream::create(device, session, kind, None))
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("reopen task failed: {}", e))?
+                super::stream::AudioStream::create_blocking(device, session, kind).await
             }
         },
         |stream| {
             let mut guard = RECORDING_MANAGER.lock().unwrap();
             match guard.as_mut() {
-                Some(m) if Arc::ptr_eq(m.get_state(), &session) => m.install_recovered_stream(kind, epoch, stream),
+                Some(m) if Arc::ptr_eq(m.get_state(), &session) && m.get_state().is_recording() => {
+                    m.install_recovered_stream(kind, epoch, stream)
+                }
                 _ => Some(stream),
             }
         },

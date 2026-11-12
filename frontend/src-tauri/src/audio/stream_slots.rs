@@ -5,7 +5,7 @@
 //! producing a new race, so all mutations now go through this type, which
 //! gives every slot an **epoch**:
 //!
-//! * start, stop and the swap (`take` of a stream, `install`) bump the epoch.
+//! * start, stop and the swap (`take`, `install`) bump the epoch.
 //! * recovery captures the epoch when it takes the dead stream
 //!   (`recovery_take`) and may only install while the epoch is unchanged
 //!   (`recovery_install`). Anything else having touched the slot makes the run
@@ -26,6 +26,8 @@ pub trait Supervised {
     fn stream_id(&self) -> u64;
     /// The stream's error gate already escalated: it is dead.
     fn is_dead(&self) -> bool;
+    /// Watchdog: true once if the stream errored and then fell silent.
+    fn poll_stalled(&self) -> bool;
 }
 
 struct Slot<S> {
@@ -79,6 +81,21 @@ impl<S: Supervised> StreamSlots<S> {
         usize::from(self.mic.stream.is_some()) + usize::from(self.system.stream.is_some())
     }
 
+    /// Watchdog sweep over both slots: the failures of streams that errored
+    /// and then went silent. Each stream is reported at most once.
+    pub fn poll_stalled(&self) -> Vec<StreamFailure> {
+        [DeviceType::Microphone, DeviceType::System]
+            .into_iter()
+            .filter_map(|kind| {
+                self.slot(kind)
+                    .stream
+                    .as_ref()
+                    .filter(|s| s.poll_stalled())
+                    .map(|s| StreamFailure { kind, stream_id: s.stream_id() })
+            })
+            .collect()
+    }
+
     /// Start path: place a stream in an (expected empty) slot. Returns what it
     /// replaced, if anything, and the stream's failure if it arrived dead.
     pub fn install(&mut self, kind: DeviceType, stream: S) -> (Option<S>, Option<StreamFailure>) {
@@ -88,19 +105,21 @@ impl<S: Supervised> StreamSlots<S> {
         (slot.stream.replace(stream), failure)
     }
 
-    /// Stop / swap path: empty the slot. Removing a stream bumps the epoch,
-    /// which makes any recovery run that captured the old one obsolete.
-    /// Taking from an ALREADY EMPTY slot changes nothing and does not bump: a
-    /// swap whose phase 1 finds recovery's dead-stream hole must not cancel
-    /// that recovery, or a swap that then fails twice leaves the slot empty
-    /// forever with nobody left to reopen it.
+    /// Stop / swap path: empty the slot. ALWAYS bumps the epoch, even over an
+    /// already empty slot: a swap in flight reserves the slot, and any
+    /// dead-stream recovery that captured the old epoch stands down silently.
+    /// Two actors must never both refill one slot. DO NOT "optimise" an empty
+    /// take into a no-op: then recovery installs a healthy mic that the swap's
+    /// retry tears down, or both capture at once.
+    ///
+    /// Contract (accepted limit): if the swap then fails, the slot stays empty
+    /// and the swap path reports it itself (`mic-swap-failed`, then
+    /// `mic-recovery-exhausted` after its attempt budget); recovery does not
+    /// compete with a swap.
     pub fn take(&mut self, kind: DeviceType) -> Option<S> {
         let slot = self.slot_mut(kind);
-        let taken = slot.stream.take();
-        if taken.is_some() {
-            slot.epoch += 1;
-        }
-        taken
+        slot.epoch += 1;
+        slot.stream.take()
     }
 
     /// Recovery path: take the stream out ONLY if it is still the one that
@@ -146,13 +165,14 @@ mod tests {
     struct Fake {
         id: u64,
         dead: Cell<bool>,
+        stalled: Cell<bool>,
     }
     impl Fake {
         fn new(id: u64) -> Self {
-            Fake { id, dead: Cell::new(false) }
+            Fake { id, dead: Cell::new(false), stalled: Cell::new(false) }
         }
         fn dead(id: u64) -> Self {
-            Fake { id, dead: Cell::new(true) }
+            Fake { id, dead: Cell::new(true), stalled: Cell::new(false) }
         }
     }
     impl Supervised for Fake {
@@ -161,6 +181,9 @@ mod tests {
         }
         fn is_dead(&self) -> bool {
             self.dead.get()
+        }
+        fn poll_stalled(&self) -> bool {
+            self.stalled.replace(false)
         }
     }
 
@@ -227,19 +250,33 @@ mod tests {
         assert_ne!(s.epoch(MIC), before);
     }
 
-    /// Cycle-2 finding: recovery already took the dead stream (hole in the
-    /// slot); a swap's phase 1 finds it empty. If that bumped the epoch and the
-    /// swap then failed twice, recovery would abandon and the slot would stay
-    /// empty forever. An empty take must change nothing.
+    /// A swap's phase 1 over recovery's dead-stream hole RESERVES the slot:
+    /// recovery stands down instead of installing a stream the swap's retry
+    /// would then tear down, or that would capture alongside the swap's own.
     #[test]
-    fn a_failed_swap_over_the_recovery_hole_does_not_cancel_recovery() {
+    fn a_swap_over_the_recovery_hole_reserves_the_slot() {
         let mut s = StreamSlots::new();
         s.install(MIC, Fake::new(1));
         let (_dead, epoch) = s.recovery_take(MIC, 1).unwrap();
         assert!(s.take(MIC).is_none(), "swap phase 1 finds the hole");
-        assert_eq!(s.epoch(MIC), epoch, "empty take must not bump");
-        // swap's creates both fail: nothing is installed. Recovery proceeds.
+        assert_ne!(s.epoch(MIC), epoch, "an empty take still reserves the slot");
+        assert!(s.recovery_install(MIC, epoch, Fake::new(2)).is_err());
+    }
+
+    /// Never two streams in one slot, whatever the order.
+    #[test]
+    fn recovery_and_swap_never_both_leave_a_stream_in_the_slot() {
+        let mut s = StreamSlots::new();
+        s.install(MIC, Fake::new(1));
+        let (_dead, epoch) = s.recovery_take(MIC, 1).unwrap();
+        // recovery wins the race: its stream is in the slot...
         assert!(s.recovery_install(MIC, epoch, Fake::new(2)).is_ok());
+        // ...then the swap runs: phase 1 takes it, phase 3 installs its own.
+        let taken = s.take(MIC).expect("swap takes recovery's stream");
+        assert_eq!(taken.id, 2);
+        let (replaced, _) = s.install(MIC, Fake::new(3));
+        assert!(replaced.is_none());
+        assert_eq!(s.count(), 1);
     }
 
     /// Any other actor filling the slot (e.g. a swap install that never saw
@@ -269,6 +306,16 @@ mod tests {
         s.install(MIC, Fake::new(5));
         assert!(s.recovery_take(MIC, 4).is_none(), "id 4 is not in the slot");
         assert!(s.has_stream(MIC));
+    }
+
+    #[test]
+    fn the_watchdog_sweep_reports_only_stalled_streams_once() {
+        let mut s = StreamSlots::new();
+        s.install(MIC, Fake::new(1));
+        s.install(SYS, Fake::new(2));
+        s.slot(SYS).stream.as_ref().unwrap().stalled.set(true);
+        assert_eq!(s.poll_stalled(), vec![StreamFailure { kind: SYS, stream_id: 2 }]);
+        assert!(s.poll_stalled().is_empty(), "reported once");
     }
 
     #[test]

@@ -444,6 +444,11 @@ impl AudioCapture {
         self.error_gate.escalated()
     }
 
+    /// Watchdog poll; see `StreamErrorGate::poll_stalled`.
+    pub fn poll_stalled(&self) -> bool {
+        self.error_gate.poll_stalled()
+    }
+
     pub fn process_audio_data(&self, data: &[f32]) {
         // Audio is flowing, so any earlier stream error was transient.
         self.error_gate.note_data();

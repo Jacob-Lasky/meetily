@@ -16,6 +16,9 @@
 set -u
 BIN=${1:?path to the app_lib test binary (cargo test --lib --no-run)}
 MODE=${3:-recover}
+# Exhaust: 1+2+4+8+16 s of backoff plus quick failed opens is ~35 s. A reopen
+# that STALLS adds up to 15 s per attempt (5 x 15 + 31 = 106 s worst case); pass
+# a larger observe-secs to test that.
 case "$MODE" in exhaust) DEFAULT_OBSERVE=50 ;; *) DEFAULT_OBSERVE=20 ;; esac
 OBSERVE=${2:-$DEFAULT_OBSERVE}
 TEST=audio::stream::live_tests::live_stream_kill_flood
@@ -76,14 +79,16 @@ for o in json.load(sys.stdin):
 ' "$PID")
 echo "test pid=$PID pipewire objects=${IDS:-none}"
 [ -n "$IDS" ] || { echo "no pipewire object found for the test process"; exit 3; }
-DESTROYED=0
-for id in $IDS; do pw-cli destroy "$id" >/dev/null 2>&1 && DESTROYED=$((DESTROYED+1)); done
-[ "$DESTROYED" -gt 0 ] || { echo "pw-cli destroy failed for every object"; exit 4; }
+# Exhaust mode: make the device unavailable BEFORE the stream dies, so the
+# first reopen attempt can never succeed.
 if [ "$MODE" = exhaust ]; then
   # pipewire-pulse silently falls back to the default source for an unknown
   # device, so "device gone" is modelled by removing the PCM from ALSA's view.
   printf '<confdir:alsa.conf>\n' > "$WORK/alsa.conf"
 fi
+DESTROYED=0
+for id in $IDS; do pw-cli destroy "$id" >/dev/null 2>&1 && DESTROYED=$((DESTROYED+1)); done
+[ "$DESTROYED" -gt 0 ] || { echo "pw-cli destroy failed for every object"; exit 4; }
 echo "destroyed objects at t0 (mode=$MODE); observing ${OBSERVE}s"
 wait "$TESTPID"; TEST_RC=$?; TESTPID=
 LINES_TOTAL=$(wc -l < "$WORK/out.log")

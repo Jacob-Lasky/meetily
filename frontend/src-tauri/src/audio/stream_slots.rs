@@ -219,6 +219,18 @@ mod tests {
         assert!(s.recovery_install(MIC, epoch, Fake::new(2)).is_err());
     }
 
+    /// Any other actor filling the slot (e.g. a swap install that never saw
+    /// phase 1) invalidates a recovery run on its own, without a prior `take`.
+    #[test]
+    fn any_install_by_another_actor_invalidates_recovery() {
+        let mut s = StreamSlots::new();
+        s.install(MIC, Fake::new(1));
+        let (_dead, epoch) = s.recovery_take(MIC, 1).unwrap();
+        s.install(MIC, Fake::new(9));
+        assert_ne!(s.epoch(MIC), epoch);
+        assert!(s.recovery_install(MIC, epoch, Fake::new(2)).is_err());
+    }
+
     #[test]
     fn recovery_own_install_keeps_the_epoch_stable() {
         let mut s = StreamSlots::new();

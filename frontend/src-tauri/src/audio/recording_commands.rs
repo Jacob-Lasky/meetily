@@ -1500,9 +1500,11 @@ async fn run_stream_recovery(
     use super::recording_state::DeviceType as StreamKind;
     use super::stream_recovery::{recover_stream, RecoveryOutcome, RecoveryPolicy};
 
-    // A replacement that dies again right away must not be reopened forever:
-    // with the budget spent, only tear the dead stream down.
-    let mut policy = RecoveryPolicy::default();
+    // `production()` is flood-stop only (max_attempts 0): the dead stream is
+    // torn down and nothing is reopened. The ledger below only matters once
+    // `AUTO_REOPEN` is on: a replacement that dies again right away must not
+    // be reopened forever, so with the budget spent only tear the stream down.
+    let mut policy = RecoveryPolicy::production();
     {
         let mut ledger = ledger.lock().unwrap();
         if ledger.allow(std::time::Instant::now()) {

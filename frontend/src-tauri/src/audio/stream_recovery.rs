@@ -42,8 +42,12 @@ pub struct RecoveryPolicy {
     pub open_timeout: Duration,
 }
 
-impl Default for RecoveryPolicy {
-    fn default() -> Self {
+impl RecoveryPolicy {
+    /// The full reopen schedule: 1/2/4/8/16 s backoff, 5 attempts, 15 s per
+    /// open. NOT what production runs (see `AUTO_REOPEN`); production code
+    /// must call `production()`. There is deliberately no `Default` impl, so a
+    /// bare `RecoveryPolicy::default()` cannot silently turn reopening on.
+    pub fn full_reopen() -> Self {
         Self {
             max_attempts: 5,
             base_delay: Duration::from_secs(1),
@@ -51,18 +55,16 @@ impl Default for RecoveryPolicy {
             open_timeout: Duration::from_secs(15),
         }
     }
-}
 
-impl RecoveryPolicy {
     /// Tear the dead stream down, never reopen it.
     pub fn flood_stop_only() -> Self {
-        Self { max_attempts: 0, ..Self::default() }
+        Self { max_attempts: 0, ..Self::full_reopen() }
     }
 
     /// What production runs: see `AUTO_REOPEN`.
     pub fn production() -> Self {
         if AUTO_REOPEN {
-            Self::default()
+            Self::full_reopen()
         } else {
             Self::flood_stop_only()
         }
@@ -260,9 +262,21 @@ mod tests {
 
     #[test]
     fn backoff_doubles_then_caps() {
-        let p = RecoveryPolicy::default();
+        let p = RecoveryPolicy::full_reopen();
         let d: Vec<u64> = (1..=7).map(|a| p.delay_before(a).as_secs()).collect();
         assert_eq!(d, vec![1, 2, 4, 8, 16, 16, 16]);
+    }
+
+    /// Review (final pass): the production supervisor shipped with the FULL
+    /// reopen policy because an edit silently did not apply, and no test
+    /// exercised the wiring. Pin the call site: the supervisor must ask for
+    /// `production()` and must never name the full-reopen schedule.
+    #[test]
+    fn the_production_supervisor_uses_the_production_policy() {
+        let src = include_str!("recording_commands.rs");
+        assert!(src.contains("RecoveryPolicy::production()"), "run_stream_recovery must use production()");
+        assert!(!src.contains("RecoveryPolicy::full_reopen()"), "production wiring must not name the full-reopen policy");
+        assert!(!src.contains("RecoveryPolicy::default()"));
     }
 
     /// The shipped contract: tear the dead stream down, never open another,

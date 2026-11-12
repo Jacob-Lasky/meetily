@@ -600,7 +600,7 @@ mod live_tests {
         // `flood-stop` = what production ships (AUTO_REOPEN off); `recover` and
         // `exhaust` drive the full reopen machinery, which production keeps off.
         let expect = std::env::var("MEETILY_W93_EXPECT").unwrap_or_default();
-        let policy = if expect == "flood-stop" { RecoveryPolicy::production() } else { RecoveryPolicy::default() };
+        let policy = if expect == "flood-stop" { RecoveryPolicy::production() } else { RecoveryPolicy::full_reopen() };
 
         let state = RecordingState::new();
         let (tx, mut rx) = mpsc::unbounded_channel();

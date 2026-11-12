@@ -5,7 +5,7 @@
 //! producing a new race, so all mutations now go through this type, which
 //! gives every slot an **epoch**:
 //!
-//! * start, stop and the swap (`swap_take`, `swap_install`) bump the epoch.
+//! * start, stop and the swap (`take` of a stream, `install`) bump the epoch.
 //! * recovery captures the epoch when it takes the dead stream
 //!   (`recovery_take`) and may only install while the epoch is unchanged
 //!   (`recovery_install`). Anything else having touched the slot makes the run
@@ -88,12 +88,19 @@ impl<S: Supervised> StreamSlots<S> {
         (slot.stream.replace(stream), failure)
     }
 
-    /// Stop / swap path: empty the slot. Bumps the epoch, which makes any
-    /// recovery run that captured the old one obsolete.
+    /// Stop / swap path: empty the slot. Removing a stream bumps the epoch,
+    /// which makes any recovery run that captured the old one obsolete.
+    /// Taking from an ALREADY EMPTY slot changes nothing and does not bump: a
+    /// swap whose phase 1 finds recovery's dead-stream hole must not cancel
+    /// that recovery, or a swap that then fails twice leaves the slot empty
+    /// forever with nobody left to reopen it.
     pub fn take(&mut self, kind: DeviceType) -> Option<S> {
         let slot = self.slot_mut(kind);
-        slot.epoch += 1;
-        slot.stream.take()
+        let taken = slot.stream.take();
+        if taken.is_some() {
+            slot.epoch += 1;
+        }
+        taken
     }
 
     /// Recovery path: take the stream out ONLY if it is still the one that
@@ -199,7 +206,7 @@ mod tests {
         let (_dead, epoch) = s.recovery_take(MIC, 1).unwrap();
         assert_eq!(s.epoch(MIC), epoch);
 
-        // hot-swap runs: phase 1 (slot already empty) then phase 3
+        // hot-swap runs: phase 1 finds the hole, phase 3 installs its stream
         assert!(s.take(MIC).is_none());
         s.install(MIC, Fake::new(9));
 
@@ -209,14 +216,30 @@ mod tests {
         assert_eq!(s.slot(MIC).stream.as_ref().unwrap().id, 9, "swapped-in mic untouched");
     }
 
-    /// Even a swap that only takes (phase 1) and has not installed yet owns the slot.
+    /// A swap taking the live stream (recovery has not taken it yet) makes
+    /// recovery obsolete: the stream it was about to take is gone.
     #[test]
-    fn a_swap_in_flight_blocks_recovery_install() {
+    fn a_swap_taking_the_live_stream_bumps_the_epoch() {
+        let mut s = StreamSlots::new();
+        s.install(MIC, Fake::new(1));
+        let before = s.epoch(MIC);
+        assert!(s.take(MIC).is_some());
+        assert_ne!(s.epoch(MIC), before);
+    }
+
+    /// Cycle-2 finding: recovery already took the dead stream (hole in the
+    /// slot); a swap's phase 1 finds it empty. If that bumped the epoch and the
+    /// swap then failed twice, recovery would abandon and the slot would stay
+    /// empty forever. An empty take must change nothing.
+    #[test]
+    fn a_failed_swap_over_the_recovery_hole_does_not_cancel_recovery() {
         let mut s = StreamSlots::new();
         s.install(MIC, Fake::new(1));
         let (_dead, epoch) = s.recovery_take(MIC, 1).unwrap();
-        s.take(MIC);
-        assert!(s.recovery_install(MIC, epoch, Fake::new(2)).is_err());
+        assert!(s.take(MIC).is_none(), "swap phase 1 finds the hole");
+        assert_eq!(s.epoch(MIC), epoch, "empty take must not bump");
+        // swap's creates both fail: nothing is installed. Recovery proceeds.
+        assert!(s.recovery_install(MIC, epoch, Fake::new(2)).is_ok());
     }
 
     /// Any other actor filling the slot (e.g. a swap install that never saw

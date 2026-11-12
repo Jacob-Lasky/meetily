@@ -31,25 +31,29 @@ pub struct ErrorVerdict {
     pub escalate: bool,
     /// Consecutive errors seen without audio in between.
     pub consecutive: u32,
-    /// This stream has been declared dead (escalation fired, now or earlier).
-    /// Terminal for the stream: recovery owns it from here on.
+    /// This stream had ALREADY been declared dead before this error
+    /// (escalation fired on an earlier call). Terminal for the stream:
+    /// recovery owns it from here on.
     pub terminal: bool,
 }
 
 impl ErrorVerdict {
-    /// Should this error be fed to `RecordingState::report_error` (user message
-    /// and the session-stop counters)?
+    /// Should this error be fed to `RecordingState::report_error` (the user
+    /// message and the session-stop counters)?
     ///
-    /// Before escalation: when the error was logged (one per interval), and
-    /// ALWAYS for a fatal class (permission, channel closed), so the rate limit
-    /// can never swallow a fatal error.
-    /// After escalation: never. Escalation is terminal for that stream: the
-    /// recovery task is tearing it down or reopening it and tells the user
-    /// itself if it gives up. Feeding a dying stream's tail errors to the stop
-    /// counters would stop the whole session after ten reports (50 s) if a
-    /// cpal teardown stalls.
+    /// Only a FATAL class (permission denied, channel closed) is, immediately,
+    /// regardless of the log rate limit, so the limiter can never swallow it.
+    /// A recoverable error is only logged: it either escalates to the recovery
+    /// task, which reopens the stream and tells the user itself if it gives
+    /// up, or it was transient. Announcing it first would toast an error for
+    /// a stream that is about to be silently reopened.
+    ///
+    /// Never after escalation (`terminal`): escalation is terminal for that
+    /// stream, so a dying stream's tail errors cannot stop the session. The
+    /// escalating call itself is not yet terminal, so a fatal error arriving
+    /// as the third consecutive one is still reported.
     pub fn reports_to_session(&self, fatal_class: bool) -> bool {
-        !self.terminal && (self.log.is_some() || fatal_class)
+        fatal_class && !self.terminal
     }
 }
 
@@ -88,6 +92,7 @@ impl StreamErrorGate {
     }
 
     pub fn record_error_at(&self, now: Instant) -> ErrorVerdict {
+        let terminal = self.escalated.load(Ordering::SeqCst);
         let consecutive = self.consecutive.fetch_add(1, Ordering::Relaxed).saturating_add(1);
         let escalate = consecutive >= ESCALATE_AFTER_CONSECUTIVE
             && !self.escalated.swap(true, Ordering::SeqCst);
@@ -111,7 +116,7 @@ impl StreamErrorGate {
             log,
             escalate,
             consecutive,
-            terminal: self.escalated.load(Ordering::SeqCst),
+            terminal,
         }
     }
 }
@@ -173,35 +178,48 @@ mod tests {
         assert_eq!(gate.record_error_at(t0 + Duration::from_secs(6)).log, Some(2));
     }
 
-    /// Finding 3: once a stream is declared dead its tail errors must not feed
-    /// the session-stop counters, however long its teardown takes.
+    /// Once a stream is declared dead its tail errors must not reach the
+    /// session-stop counters, however long its teardown takes; before that,
+    /// recoverable errors are only logged.
     #[test]
     fn escalation_is_terminal_for_session_reporting() {
         let gate = StreamErrorGate::new();
         let t0 = Instant::now();
-        let mut reported = 0;
-        // 15 s of a 7,000/s storm: logs at 0 s, 5 s, 10 s.
+        let (mut reported_recoverable, mut reported_fatal) = (0, 0);
+        // 15 s of a 7,000/s storm.
         for i in 0..(7_000u64 * 15) {
             let v = gate.record_error_at(t0 + Duration::from_micros(i * 1_000_000 / 7_000));
-            if v.reports_to_session(false) {
-                reported += 1;
-            }
+            reported_recoverable += usize::from(v.reports_to_session(false));
+            reported_fatal += usize::from(v.reports_to_session(true));
         }
-        assert_eq!(reported, 1, "only the first error, before escalation, reaches report_error");
+        assert_eq!(reported_recoverable, 0, "recoverable errors are never announced by the gate");
+        assert_eq!(reported_fatal, 3, "fatal reports stop at escalation: calls 1-3 only (call 3 escalates, not yet terminal)");
+    }
+
+    /// A fatal error is reported even inside the log quiet window, and also
+    /// when it is the very call that escalates.
+    #[test]
+    fn a_fatal_class_is_never_swallowed_before_the_stream_is_terminal() {
+        let gate = StreamErrorGate::new();
+        let t0 = Instant::now();
+        let first = gate.record_error_at(t0);
+        assert!(first.log.is_some());
+        let quiet = gate.record_error_at(t0 + Duration::from_secs(1));
+        assert!(quiet.log.is_none(), "inside the quiet window");
+        assert!(quiet.reports_to_session(true), "fatal bypasses the limiter");
+        let escalating = gate.record_error_at(t0 + Duration::from_secs(2));
+        assert!(escalating.escalate);
+        assert!(escalating.reports_to_session(true), "the escalating call is not terminal yet");
+        let tail = gate.record_error_at(t0 + Duration::from_secs(3));
+        assert!(!tail.reports_to_session(true), "terminal afterwards");
     }
 
     #[test]
-    fn a_fatal_class_bypasses_the_rate_limit_until_escalation() {
+    fn recoverable_errors_are_logged_not_announced() {
         let gate = StreamErrorGate::new();
-        let t0 = Instant::now();
-        assert!(gate.record_error_at(t0).reports_to_session(false)); // logged
-        let quiet = gate.record_error_at(t0 + Duration::from_secs(1)); // inside quiet window
-        assert!(quiet.log.is_none());
-        assert!(!quiet.reports_to_session(false), "recoverable error stays quiet");
-        gate.note_data();
-        let fatal = gate.record_error_at(t0 + Duration::from_secs(2));
-        assert!(fatal.log.is_none());
-        assert!(fatal.reports_to_session(true), "fatal error is never swallowed by the limiter");
+        let v = gate.record_error_at(Instant::now());
+        assert!(v.log.is_some());
+        assert!(!v.reports_to_session(false));
     }
 
     #[test]

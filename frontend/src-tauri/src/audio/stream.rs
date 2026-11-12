@@ -610,12 +610,17 @@ mod live_tests {
         });
 
         let outcomes = Arc::new(Mutex::new(Vec::<String>::new()));
+        let failure_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
         if recover {
             let mut failures = state.take_stream_failure_receiver().unwrap();
             let (state2, mgr2, outcomes2, dev2) = (state.clone(), mgr.clone(), outcomes.clone(), dev.clone());
+            let seen2 = failure_seen.clone();
             tokio::spawn(async move {
                 while let Some(crate::audio::recording_state::StreamFailure { kind, stream_id }) = failures.recv().await {
                     let dead = mgr2.lock().unwrap().recovery_take(kind, stream_id);
+                    if dead.is_some() {
+                        seen2.store(true, Ordering::SeqCst);
+                    }
                     let Some((dead, epoch)) = dead else {
                         eprintln!("W93_STALE failure for stream {stream_id}");
                         continue;
@@ -642,14 +647,16 @@ mod live_tests {
                     eprintln!("W93_OUTCOME {:?}", out);
                     outcomes2.lock().unwrap().push(format!("{:?}", out));
                     if let RecoveryOutcome::Exhausted { .. } = out {
-                        state2.report_error(crate::audio::recording_state::AudioError::DeviceDisconnected);
+                        state2.announce_error(crate::audio::recording_state::AudioError::DeviceDisconnected);
                     }
                 }
             });
         }
 
+        let mut chunk_history = Vec::new();
         for s in 0..observe_secs {
             tokio::time::sleep(Duration::from_secs(1)).await;
+            chunk_history.push(chunks.load(Ordering::SeqCst));
             eprintln!(
                 "W93_TICK t={}s chunks={} callbacks={} errors={} recording={} streams={}",
                 s + 1,
@@ -660,6 +667,35 @@ mod live_tests {
                 mgr.lock().unwrap().active_stream_count()
             );
         }
+        let end_streams = mgr.lock().unwrap().active_stream_count();
         let _ = mgr.lock().unwrap().stop_streams();
+
+        // MEETILY_W93_EXPECT: what the run must demonstrate. Unset or `prefix`
+        // (no recovery task) makes no claim; it is the baseline shape.
+        let outcomes = outcomes.lock().unwrap().clone();
+        match std::env::var("MEETILY_W93_EXPECT").as_deref() {
+            Ok("recover") => {
+                assert!(failure_seen.load(Ordering::SeqCst), "the kill must produce a dead-stream event");
+                assert!(outcomes.iter().any(|o| o.starts_with("Recovered")), "recovery must succeed: {outcomes:?}");
+                assert_eq!(callbacks.load(Ordering::SeqCst), 0, "a recovered stream must not announce an error");
+                assert!(state.is_recording(), "the session must keep recording");
+                assert_eq!(end_streams, 1, "the stream is back in its slot");
+                let n = chunk_history.len();
+                assert!(n >= 5, "observe at least 5 s");
+                assert!(
+                    chunk_history[n - 1] - chunk_history[n - 4] >= 20,
+                    "capture must be flowing again in the last 3 s: {:?}",
+                    &chunk_history[n - 4..]
+                );
+            }
+            Ok("exhaust") => {
+                assert!(failure_seen.load(Ordering::SeqCst), "the kill must produce a dead-stream event");
+                assert!(outcomes.iter().any(|o| o.starts_with("Exhausted")), "recovery must give up: {outcomes:?}");
+                assert!(callbacks.load(Ordering::SeqCst) >= 1, "giving up must announce once");
+                assert!(callbacks.load(Ordering::SeqCst) <= 2, "bounded announcements");
+                assert_eq!(end_streams, 0, "the dead stream is gone; nothing keeps looping");
+            }
+            _ => {}
+        }
     }
 }

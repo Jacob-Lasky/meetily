@@ -732,10 +732,10 @@ impl AudioCapture {
 
         let audio_error = classify_stream_error(&error.to_string());
 
-        // Rate limiting must never swallow a fatal error, and escalation is
-        // terminal for the stream: see `ErrorVerdict::reports_to_session`.
-        let fatal = !audio_error.is_recoverable();
-        let report = verdict.reports_to_session(fatal);
+        // Only a fatal class reaches the session, immediately and regardless of
+        // the log limiter; recoverable errors are logged and left to the
+        // recovery task. See `ErrorVerdict::reports_to_session`.
+        let report = verdict.reports_to_session(!audio_error.is_recoverable());
 
         match verdict.log {
             Some(suppressed) if suppressed > 0 => error!(
@@ -743,7 +743,7 @@ impl AudioCapture {
                 self.device.name, error, suppressed
             ),
             Some(_) => error!("Audio stream error for {}: {}", self.device.name, error),
-            // Quiet window: only a fatal error still being reported is worth a line.
+            // Quiet window: a fatal error still being reported is worth a line.
             None if report && self.state.is_recording() => {
                 error!("Audio stream error for {}: {}", self.device.name, error)
             }

@@ -1520,6 +1520,10 @@ async fn run_stream_recovery(
         // Tear down OUTSIDE any lock and off the async workers: a cpal stop on
         // a dead device can stall (see do_mic_swap).
         teardown_stream_bounded,
+        // AudioStream::create runs synchronous cpal calls (enumeration, build,
+        // play) that can stall on a half-dead backend. Run it on a blocking
+        // thread so recover_stream's open timeout can actually fire; a stalled
+        // attempt's stream is dropped when it finally returns.
         || {
             let session = session.clone();
             async move {
@@ -1528,7 +1532,12 @@ async fn run_stream_recovery(
                     StreamKind::System => session.get_system_device(),
                 }
                 .ok_or_else(|| anyhow::anyhow!("no {:?} device recorded for this session", kind))?;
-                super::stream::AudioStream::create(device, session, kind, None).await
+                let runtime = tokio::runtime::Handle::current();
+                tokio::task::spawn_blocking(move || {
+                    runtime.block_on(super::stream::AudioStream::create(device, session, kind, None))
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("reopen task failed: {}", e))?
             }
         },
         |stream| {
@@ -1542,7 +1551,11 @@ async fn run_stream_recovery(
         // mic hot-swap) has touched this slot since we took the dead stream.
         // An obsolete run ends silently; it must never announce.
         || {
-            session_live(&session)
+            // `session.is_recording()`: a fatal error stops the state (clearing
+            // its device references) while the command-level flag and the
+            // global manager stay set; recovery must not chase that session.
+            session.is_recording()
+                && session_live(&session)
                 && RECORDING_MANAGER
                     .lock()
                     .unwrap()
@@ -1567,7 +1580,20 @@ async fn run_stream_recovery(
             // NOT stop the session from here: the other stream may be fine,
             // and a mic hot-swap can have the mic slot momentarily empty, so
             // "no streams left" is not knowable here. The user stops it.
-            session.announce_error(super::AudioError::DeviceDisconnected);
+            // The epoch is re-checked UNDER the manager lock, together with the
+            // announcement, so a swap that installed a working mic since the
+            // last `live` check can never be followed by a false "disconnected"
+            // (the only listener of this callback's event is the frontend, so
+            // emitting under the lock cannot re-enter the manager).
+            let guard = RECORDING_MANAGER.lock().unwrap();
+            let still_ours = session.is_recording()
+                && guard
+                    .as_ref()
+                    .map_or(false, |m| Arc::ptr_eq(m.get_state(), &session) && m.slot_epoch(kind) == epoch);
+            if still_ours {
+                session.announce_error(super::AudioError::DeviceDisconnected);
+            }
+            drop(guard);
         }
         RecoveryOutcome::Abandoned => {}
     }

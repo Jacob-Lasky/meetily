@@ -15,8 +15,9 @@
 # Prints per-second W93_TICK lines and a summary of log lines per minute.
 set -u
 BIN=${1:?path to the app_lib test binary (cargo test --lib --no-run)}
-OBSERVE=${2:-30}
 MODE=${3:-recover}
+case "$MODE" in exhaust) DEFAULT_OBSERVE=50 ;; *) DEFAULT_OBSERVE=20 ;; esac
+OBSERVE=${2:-$DEFAULT_OBSERVE}
 TEST=audio::stream::live_tests::live_stream_kill_flood
 WORK=$(mktemp -d /tmp/w93-run.XXXXXX)
 SINK=w93_sink
@@ -24,6 +25,7 @@ PCM=w93_monitor
 MOD=
 
 cleanup() {
+  if [ -n "${STIM:-}" ]; then pkill -P "$STIM" 2>/dev/null; kill "$STIM" 2>/dev/null; fi
   [ -n "${TESTPID:-}" ] && kill "$TESTPID" 2>/dev/null
   [ -n "$MOD" ] && pactl unload-module "$MOD" 2>/dev/null
 }
@@ -46,10 +48,12 @@ ALSA
 export ALSA_CONFIG_PATH="$WORK/alsa.conf"
 
 # Keep the sink busy so the monitor has samples to deliver.
-( paplay --device=$SINK /usr/share/sounds/alsa/Front_Center.wav >/dev/null 2>&1 || true ) &
+# Continuous stimulus for the whole run (a single clip ends before the kill).
+( while :; do paplay --device=$SINK /usr/share/sounds/alsa/Front_Center.wav >/dev/null 2>&1 || sleep 1; done ) &
+STIM=$!
 
 RECOVER=1; [ "$MODE" = prefix ] && RECOVER=0
-MEETILY_W93_PCM=$PCM MEETILY_W93_OBSERVE_SECS=$OBSERVE MEETILY_W93_RECOVER=$RECOVER \
+MEETILY_W93_PCM=$PCM MEETILY_W93_OBSERVE_SECS=$OBSERVE MEETILY_W93_RECOVER=$RECOVER MEETILY_W93_EXPECT=$MODE \
   "$BIN" "$TEST" --ignored --nocapture --test-threads=1 >"$WORK/out.log" 2>&1 &
 TESTPID=$!
 
@@ -72,14 +76,16 @@ for o in json.load(sys.stdin):
 ' "$PID")
 echo "test pid=$PID pipewire objects=${IDS:-none}"
 [ -n "$IDS" ] || { echo "no pipewire object found for the test process"; exit 3; }
-for id in $IDS; do pw-cli destroy "$id" >/dev/null 2>&1; done
+DESTROYED=0
+for id in $IDS; do pw-cli destroy "$id" >/dev/null 2>&1 && DESTROYED=$((DESTROYED+1)); done
+[ "$DESTROYED" -gt 0 ] || { echo "pw-cli destroy failed for every object"; exit 4; }
 if [ "$MODE" = exhaust ]; then
   # pipewire-pulse silently falls back to the default source for an unknown
   # device, so "device gone" is modelled by removing the PCM from ALSA's view.
   printf '<confdir:alsa.conf>\n' > "$WORK/alsa.conf"
 fi
 echo "destroyed objects at t0 (mode=$MODE); observing ${OBSERVE}s"
-wait "$TESTPID"; TESTPID=
+wait "$TESTPID"; TEST_RC=$?; TESTPID=
 LINES_TOTAL=$(wc -l < "$WORK/out.log")
 echo "---- ticks (every 5th) ----"; grep W93_TICK "$WORK/out.log" | awk 'NR%5==0'
 echo "---- recovery lines ----"; grep -E "W93_OUTCOME|W93_STALE|STREAM_RECOVERY|requesting a stream reopen" "$WORK/out.log"
@@ -90,3 +96,4 @@ echo "ALSA noise lines: $(grep -c 'ALSA lib' "$WORK/out.log")"
 echo "'Too many' lines: $(grep -c 'Too many' "$WORK/out.log")"
 echo "log kept at $WORK/out.log (delete when done)"
 echo "observed seconds: $OBSERVE (lines/min ~= total * 60 / $((OBSERVE+4)))"
+if [ "$TEST_RC" -eq 0 ]; then echo "RESULT: PASS (mode=$MODE)"; else echo "RESULT: FAIL (mode=$MODE, test exit $TEST_RC; see $WORK/out.log)"; exit 1; fi

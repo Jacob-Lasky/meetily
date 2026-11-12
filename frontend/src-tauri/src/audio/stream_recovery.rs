@@ -25,6 +25,11 @@ pub struct RecoveryPolicy {
     pub base_delay: Duration,
     /// Cap on the doubled delay.
     pub max_delay: Duration,
+    /// Longest a single reopen attempt may take. Opening a device runs
+    /// synchronous cpal calls (device enumeration, stream build, play) that
+    /// can stall on a half-dead backend; without this one stalled attempt
+    /// would hold the recovery task past its retry cap.
+    pub open_timeout: Duration,
 }
 
 impl Default for RecoveryPolicy {
@@ -33,6 +38,7 @@ impl Default for RecoveryPolicy {
             max_attempts: 5,
             base_delay: Duration::from_secs(1),
             max_delay: Duration::from_secs(16),
+            open_timeout: Duration::from_secs(15),
         }
     }
 }
@@ -106,7 +112,11 @@ where
             return RecoveryOutcome::Abandoned;
         }
 
-        match open().await {
+        let opened = match tokio::time::timeout(policy.open_timeout, open()).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("reopen timed out after {:?}", policy.open_timeout)),
+        };
+        match opened {
             Ok(stream) => {
                 if !live() {
                     teardown(stream).await;
@@ -216,7 +226,12 @@ mod tests {
     use std::cell::{Cell, RefCell};
 
     fn policy() -> RecoveryPolicy {
-        RecoveryPolicy { max_attempts: 5, base_delay: Duration::from_millis(1), max_delay: Duration::from_millis(8) }
+        RecoveryPolicy {
+            max_attempts: 5,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(8),
+            open_timeout: Duration::from_secs(5),
+        }
     }
 
     #[test]
@@ -254,7 +269,7 @@ mod tests {
         let checks = Cell::new(0u32);
         let out = recover_stream(
             DeviceType::System,
-            RecoveryPolicy { max_attempts: 2, base_delay: Duration::from_millis(1), max_delay: Duration::from_millis(1) },
+            RecoveryPolicy { max_attempts: 2, base_delay: Duration::from_millis(1), max_delay: Duration::from_millis(1), open_timeout: Duration::from_secs(5) },
             || None::<&str>,
             |_| async {},
             || async { Err(anyhow::anyhow!("gone")) },
@@ -343,6 +358,35 @@ mod tests {
         }
         assert!(!flag.load(Ordering::SeqCst), "flag cleared after the timeout path");
         assert!(FlagGuard::try_acquire(&flag).is_some(), "next swap can run");
+    }
+
+    /// Cycle-2 finding: one stalled reopen must not hold the task past the cap.
+    #[tokio::test]
+    async fn a_reopen_that_never_returns_counts_as_a_failed_attempt() {
+        let p = RecoveryPolicy {
+            max_attempts: 2,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            open_timeout: Duration::from_millis(50),
+        };
+        let started = Instant::now();
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            recover_stream(
+                DeviceType::Microphone,
+                p,
+                || None::<&str>,
+                |_| async {},
+                || std::future::pending::<anyhow::Result<&str>>(),
+                |s| Some(s),
+                || true,
+                tokio::time::sleep,
+            ),
+        )
+        .await
+        .expect("recovery must finish, not hang on a stalled open");
+        assert_eq!(out, RecoveryOutcome::Exhausted { attempts: 2 });
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

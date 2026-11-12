@@ -10,7 +10,7 @@ use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolat
 
 use super::devices::AudioDevice;
 use super::recording_state::{AudioChunk, AudioError, AudioLayout, RecordingState, DeviceType, StreamFailure};
-use super::stream_error_gate::{StreamErrorGate, ESCALATE_AFTER_CONSECUTIVE};
+use super::stream_error_gate::StreamErrorGate;
 use super::audio_processing::{audio_to_mono, interleave_stereo, LoudnessNormalizer, NoiseSuppressionProcessor, HighPassFilter};
 use super::vad::{ContinuousVadProcessor};
 
@@ -732,41 +732,30 @@ impl AudioCapture {
 
         let audio_error = classify_stream_error(&error.to_string());
 
-        // Rate limiting must never swallow a fatal error: a permission or
-        // channel-closed error arriving inside the quiet window of an earlier
-        // recoverable one still has to stop the session and tell the user.
-        // `report_error` is idempotent once stopped, so this cannot flood.
-        let must_report = !audio_error.is_recoverable();
+        // Rate limiting must never swallow a fatal error, and escalation is
+        // terminal for the stream: see `ErrorVerdict::reports_to_session`.
+        let fatal = !audio_error.is_recoverable();
+        let report = verdict.reports_to_session(fatal);
 
-        let Some(suppressed) = verdict.log else {
-            if must_report && self.state.is_recording() {
-                error!("Audio stream error for {}: {}", self.device.name, error);
-                self.state.report_error(audio_error);
-            }
-            return;
-        };
-
-        if suppressed > 0 {
-            error!(
+        match verdict.log {
+            Some(suppressed) if suppressed > 0 => error!(
                 "Audio stream error for {}: {} ({} identical errors suppressed since the last report)",
                 self.device.name, error, suppressed
-            );
-        } else {
-            error!("Audio stream error for {}: {}", self.device.name, error);
+            ),
+            Some(_) => error!("Audio stream error for {}: {}", self.device.name, error),
+            // Quiet window: only a fatal error still being reported is worth a line.
+            None if report && self.state.is_recording() => {
+                error!("Audio stream error for {}: {}", self.device.name, error)
+            }
+            None => {}
         }
-        if matches!(audio_error, AudioError::DeviceDisconnected) {
+        if verdict.log.is_some() && matches!(audio_error, AudioError::DeviceDisconnected) {
             warn!("🔌 Device disconnect detected for: {}", self.device.name);
         }
 
-        // Past escalation the recovery task owns a recoverable error: it is
-        // tearing the stream down or reopening it, and its own exhaustion
-        // path tells the user. Feeding these to the stop counters would stop
-        // the whole session after ten reports (50 s) if teardown stalls.
-        if audio_error.is_recoverable() && verdict.consecutive > ESCALATE_AFTER_CONSECUTIVE {
-            return;
+        if report {
+            self.state.report_error(audio_error);
         }
-
-        self.state.report_error(audio_error);
     }
 }
 

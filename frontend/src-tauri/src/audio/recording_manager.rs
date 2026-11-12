@@ -610,29 +610,31 @@ impl RecordingManager {
         replaced
     }
 
-    /// Take a dead stream out for recovery. See `stream_recovery`.
-    pub fn take_stream_for_recovery(&mut self, kind: super::recording_state::DeviceType, stream_id: u64) -> Option<super::stream::AudioStream> {
-        self.stream_manager.take_stream_if_current(kind, stream_id)
+    /// Dead-stream recovery: take the failed stream out (only if it is still
+    /// the one in the slot) with the slot epoch the run must stay within.
+    pub fn take_stream_for_recovery(
+        &mut self,
+        kind: super::recording_state::DeviceType,
+        stream_id: u64,
+    ) -> Option<(super::stream::AudioStream, u64)> {
+        self.stream_manager.recovery_take(kind, stream_id)
     }
 
-    /// Whether `kind`'s stream slot currently holds a stream.
-    pub fn has_stream(&self, kind: super::recording_state::DeviceType) -> bool {
-        self.stream_manager.has_stream(kind)
-    }
-
-    /// Id of the stream in `kind`'s slot if it was already declared dead.
-    pub fn dead_stream_id(&self, kind: super::recording_state::DeviceType) -> Option<u64> {
-        self.stream_manager.dead_stream_id(kind)
-    }
-
-    /// Install a recovered stream if its slot is still empty; returns it back
-    /// otherwise. Keeps the per-session device reference in step.
+    /// Dead-stream recovery: install the replacement only if nothing else
+    /// touched the slot since `take_stream_for_recovery`; hands it back
+    /// otherwise.
     pub fn install_recovered_stream(
         &mut self,
         kind: super::recording_state::DeviceType,
+        epoch: u64,
         stream: super::stream::AudioStream,
     ) -> Option<super::stream::AudioStream> {
-        self.stream_manager.install_stream_if_empty(kind, stream)
+        self.stream_manager.recovery_install(kind, epoch, stream)
+    }
+
+    /// Current epoch of `kind`'s stream slot.
+    pub fn slot_epoch(&self, kind: super::recording_state::DeviceType) -> u64 {
+        self.stream_manager.slot_epoch(kind)
     }
 
     /// Get reference to recording state for external access

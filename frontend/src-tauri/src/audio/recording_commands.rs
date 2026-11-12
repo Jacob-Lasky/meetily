@@ -1408,9 +1408,6 @@ async fn do_mic_swap(device_name: &str, session: &Arc<super::RecordingState>) ->
         }
     } // lock released
 
-    // The new mic may have died before it reached the slot.
-    rereport_if_dead_after_install(session, super::recording_state::DeviceType::Microphone);
-
     // A dead-stream recovery may have installed a mic stream while this swap
     // was building its own; tear that one down outside the lock.
     if let Some(old) = replaced {
@@ -1420,30 +1417,17 @@ async fn do_mic_swap(device_name: &str, session: &Arc<super::RecordingState>) ->
     Ok(())
 }
 
-/// A freshly installed stream can already be dead: its failure event fired
-/// while its slot was still empty and was discarded as stale. Re-report it
-/// now that it is in the slot. Used after every install (recovery, mic swap).
-fn rereport_if_dead_after_install(session: &Arc<super::RecordingState>, kind: super::recording_state::DeviceType) {
-    let dead_id = RECORDING_MANAGER
-        .lock()
-        .unwrap()
-        .as_ref()
-        .filter(|m| Arc::ptr_eq(m.get_state(), session))
-        .and_then(|m| m.dead_stream_id(kind));
-    if let Some(stream_id) = dead_id {
-        session.report_stream_failure(super::recording_state::StreamFailure { kind, stream_id });
-    }
-}
-
-/// Stop a cpal stream off the async workers and wait at most 5 s. A cpal drop
-/// joins its worker thread and can stall on a dead device, so neither the
-/// recovery task nor a mic hot-swap may wait on it unbounded (the stalled
-/// blocking thread keeps only that stream alive; Rust cannot cancel it).
+/// Stop a cpal stream with `stream_recovery::teardown_bounded` (5 s bound).
+/// Used by recovery and by both ends of the mic hot-swap.
 async fn teardown_stream_bounded(stream: super::stream::AudioStream) {
-    let done = tokio::task::spawn_blocking(move || {
-        let _ = stream.stop();
-    });
-    if tokio::time::timeout(tokio::time::Duration::from_secs(5), done).await.is_err() {
+    let timed_out = super::stream_recovery::teardown_bounded(
+        move || {
+            let _ = stream.stop();
+        },
+        tokio::time::Duration::from_secs(5),
+    )
+    .await;
+    if timed_out {
         warn!("[STREAM_TEARDOWN] stream teardown still running after 5s; continuing");
     }
 }
@@ -1491,7 +1475,7 @@ fn spawn_stream_recovery(session: &Arc<super::RecordingState>) {
                     _ => None,
                 }
             };
-            let Some(dead) = dead else {
+            let Some((dead, epoch)) = dead else {
                 info!("[STREAM_RECOVERY] {:?}: stale failure for stream {} - already replaced or stopped", kind, stream_id);
                 continue;
             };
@@ -1500,7 +1484,7 @@ fn spawn_stream_recovery(session: &Arc<super::RecordingState>) {
                 super::recording_state::DeviceType::Microphone => mic_ledger.clone(),
                 super::recording_state::DeviceType::System => sys_ledger.clone(),
             };
-            tokio::spawn(run_stream_recovery(session, kind, dead, ledger));
+            tokio::spawn(run_stream_recovery(session, kind, dead, epoch, ledger));
         }
     });
 }
@@ -1510,6 +1494,7 @@ async fn run_stream_recovery(
     session: Arc<super::RecordingState>,
     kind: super::recording_state::DeviceType,
     dead: super::stream::AudioStream,
+    epoch: u64,
     ledger: Arc<Mutex<super::stream_recovery::RecoveryLedger>>,
 ) {
     use super::recording_state::DeviceType as StreamKind;
@@ -1549,17 +1534,20 @@ async fn run_stream_recovery(
         |stream| {
             let mut guard = RECORDING_MANAGER.lock().unwrap();
             match guard.as_mut() {
-                Some(m) if Arc::ptr_eq(m.get_state(), &session) => m.install_recovered_stream(kind, stream),
+                Some(m) if Arc::ptr_eq(m.get_state(), &session) => m.install_recovered_stream(kind, epoch, stream),
                 _ => Some(stream),
             }
         },
+        // Still wanted: the session is live AND nothing else (start/stop, a
+        // mic hot-swap) has touched this slot since we took the dead stream.
+        // An obsolete run ends silently; it must never announce.
         || {
             session_live(&session)
-                && !RECORDING_MANAGER
+                && RECORDING_MANAGER
                     .lock()
                     .unwrap()
                     .as_ref()
-                    .map_or(false, |m| Arc::ptr_eq(m.get_state(), &session) && m.has_stream(kind))
+                    .map_or(false, |m| Arc::ptr_eq(m.get_state(), &session) && m.slot_epoch(kind) == epoch)
         },
         tokio::time::sleep,
     )
@@ -1569,7 +1557,6 @@ async fn run_stream_recovery(
         RecoveryOutcome::Recovered { attempts } => {
             info!("[STREAM_RECOVERY] {:?} stream recovered after {} attempt(s)", kind, attempts);
             ledger.lock().unwrap().recovered(std::time::Instant::now());
-            rereport_if_dead_after_install(&session, kind);
         }
         RecoveryOutcome::Exhausted { attempts } => {
             error!(
@@ -1681,26 +1668,15 @@ async fn trigger_mic_fallback_to_default<R: Runtime>(
         return;
     }
 
-    if MIC_SWAP_IN_PROGRESS
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
+    // Cleared on every exit path (return, panic, abort, bounded-teardown
+    // timeout) by the guard's Drop; DO NOT clear the flag by hand.
+    let Some(_guard) = super::stream_recovery::FlagGuard::try_acquire(&MIC_SWAP_IN_PROGRESS) else {
         info!(
             "[MIC_FALLBACK] Swap already in progress — skipping fallback for '{}'",
             disconnected_name
         );
         return;
-    }
-
-    // Guard that clears MIC_SWAP_IN_PROGRESS on any return path below so a
-    // panic or early return can't leave the flag stuck.
-    struct SwapGuard;
-    impl Drop for SwapGuard {
-        fn drop(&mut self) {
-            MIC_SWAP_IN_PROGRESS.store(false, Ordering::SeqCst);
-        }
-    }
-    let _guard = SwapGuard;
+    };
 
     info!(
         "[MIC_FALLBACK] Starting fallback from disconnected device '{}'",

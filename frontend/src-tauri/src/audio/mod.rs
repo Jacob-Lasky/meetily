@@ -22,6 +22,7 @@ pub mod pipeline;
 pub mod stream;
 pub mod stream_error_gate; // W93: rate-limit + dead-stream detection for backend error callbacks
 pub mod stream_recovery;   // W93: bounded-backoff reopen of a dead capture stream
+pub mod stream_slots;      // W93 cycle 2: single owner (with epochs) of the mic and system stream slots
 pub mod recording_manager;
 pub mod recording_commands;
 pub mod recording_preferences;

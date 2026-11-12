@@ -31,6 +31,26 @@ pub struct ErrorVerdict {
     pub escalate: bool,
     /// Consecutive errors seen without audio in between.
     pub consecutive: u32,
+    /// This stream has been declared dead (escalation fired, now or earlier).
+    /// Terminal for the stream: recovery owns it from here on.
+    pub terminal: bool,
+}
+
+impl ErrorVerdict {
+    /// Should this error be fed to `RecordingState::report_error` (user message
+    /// and the session-stop counters)?
+    ///
+    /// Before escalation: when the error was logged (one per interval), and
+    /// ALWAYS for a fatal class (permission, channel closed), so the rate limit
+    /// can never swallow a fatal error.
+    /// After escalation: never. Escalation is terminal for that stream: the
+    /// recovery task is tearing it down or reopening it and tells the user
+    /// itself if it gives up. Feeding a dying stream's tail errors to the stop
+    /// counters would stop the whole session after ten reports (50 s) if a
+    /// cpal teardown stalls.
+    pub fn reports_to_session(&self, fatal_class: bool) -> bool {
+        !self.terminal && (self.log.is_some() || fatal_class)
+    }
 }
 
 pub struct StreamErrorGate {
@@ -87,7 +107,12 @@ impl StreamErrorGate {
             None
         };
 
-        ErrorVerdict { log, escalate, consecutive }
+        ErrorVerdict {
+            log,
+            escalate,
+            consecutive,
+            terminal: self.escalated.load(Ordering::SeqCst),
+        }
     }
 }
 
@@ -146,6 +171,37 @@ mod tests {
         assert_eq!(gate.record_error_at(t0 + Duration::from_secs(1)).log, None);
         assert_eq!(gate.record_error_at(t0 + Duration::from_secs(2)).log, None);
         assert_eq!(gate.record_error_at(t0 + Duration::from_secs(6)).log, Some(2));
+    }
+
+    /// Finding 3: once a stream is declared dead its tail errors must not feed
+    /// the session-stop counters, however long its teardown takes.
+    #[test]
+    fn escalation_is_terminal_for_session_reporting() {
+        let gate = StreamErrorGate::new();
+        let t0 = Instant::now();
+        let mut reported = 0;
+        // 15 s of a 7,000/s storm: logs at 0 s, 5 s, 10 s.
+        for i in 0..(7_000u64 * 15) {
+            let v = gate.record_error_at(t0 + Duration::from_micros(i * 1_000_000 / 7_000));
+            if v.reports_to_session(false) {
+                reported += 1;
+            }
+        }
+        assert_eq!(reported, 1, "only the first error, before escalation, reaches report_error");
+    }
+
+    #[test]
+    fn a_fatal_class_bypasses_the_rate_limit_until_escalation() {
+        let gate = StreamErrorGate::new();
+        let t0 = Instant::now();
+        assert!(gate.record_error_at(t0).reports_to_session(false)); // logged
+        let quiet = gate.record_error_at(t0 + Duration::from_secs(1)); // inside quiet window
+        assert!(quiet.log.is_none());
+        assert!(!quiet.reports_to_session(false), "recoverable error stays quiet");
+        gate.note_data();
+        let fatal = gate.record_error_at(t0 + Duration::from_secs(2));
+        assert!(fatal.log.is_none());
+        assert!(fatal.reports_to_session(true), "fatal error is never swallowed by the limiter");
     }
 
     #[test]

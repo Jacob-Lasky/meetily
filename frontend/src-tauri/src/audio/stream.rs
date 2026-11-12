@@ -9,6 +9,7 @@ use super::devices::{AudioDevice, get_device_and_config};
 use super::pipeline::AudioCapture;
 use super::recording_state::{RecordingState, DeviceType};
 use super::capture::{AudioCaptureBackend, get_current_backend};
+use super::stream_slots::{StreamSlots, Supervised};
 
 #[cfg(target_os = "macos")]
 use super::capture::CoreAudioCapture;
@@ -319,13 +320,6 @@ impl AudioStream {
         Ok(stream)
     }
 
-    /// True if this stream was already declared dead. A replacement can die
-    /// before it reaches its slot, when its failure event is discarded as
-    /// stale; the recovery run re-checks this after installing it.
-    pub fn is_dead(&self) -> bool {
-        self.capture.is_dead()
-    }
-
     /// Identity matched against `StreamFailure::stream_id`.
     pub fn capture_id(&self) -> u64 {
         self.capture_id
@@ -372,10 +366,21 @@ impl AudioStream {
     }
 }
 
-/// Audio stream manager for handling multiple streams
+impl Supervised for AudioStream {
+    fn stream_id(&self) -> u64 {
+        self.capture_id
+    }
+
+    fn is_dead(&self) -> bool {
+        self.capture.is_dead()
+    }
+}
+
+/// Audio stream manager for handling multiple streams. The stream slots live
+/// in `StreamSlots`, the single owner of every slot mutation (start, stop, mic
+/// swap, dead-stream recovery); see `stream_slots` for the epoch rules.
 pub struct AudioStreamManager {
-    microphone_stream: Option<AudioStream>,
-    system_stream: Option<AudioStream>,
+    slots: StreamSlots<AudioStream>,
     state: Arc<RecordingState>,
 }
 
@@ -385,9 +390,18 @@ unsafe impl Send for AudioStreamManager {}
 impl AudioStreamManager {
     pub fn new(state: Arc<RecordingState>) -> Self {
         Self {
-            microphone_stream: None,
-            system_stream: None,
+            slots: StreamSlots::new(),
             state,
+        }
+    }
+
+    /// Place a stream via the start path and supervise it from its first
+    /// moment: a stream that arrives already dead gets its failure reported.
+    fn install_started(&mut self, kind: DeviceType, stream: AudioStream) {
+        let (replaced, failure) = self.slots.install(kind, stream);
+        drop(replaced);
+        if let Some(failure) = failure {
+            self.state.report_stream_failure(failure);
         }
     }
 
@@ -408,7 +422,7 @@ impl AudioStreamManager {
             match AudioStream::create(mic_device.clone(), self.state.clone(), DeviceType::Microphone, recording_sender.clone()).await {
                 Ok(stream) => {
                     self.state.set_microphone_device(mic_device);
-                    self.microphone_stream = Some(stream);
+                    self.install_started(DeviceType::Microphone, stream);
                     info!("✅ Microphone stream created successfully");
                 }
                 Err(e) => {
@@ -426,7 +440,7 @@ impl AudioStreamManager {
             match AudioStream::create(sys_device.clone(), self.state.clone(), DeviceType::System, recording_sender.clone()).await {
                 Ok(stream) => {
                     self.state.set_system_device(sys_device);
-                    self.system_stream = Some(stream);
+                    self.install_started(DeviceType::System, stream);
                     info!("✅ System audio stream created with {:?} backend", backend);
                 }
                 Err(e) => {
@@ -439,7 +453,7 @@ impl AudioStreamManager {
         }
 
         // Ensure at least one stream was created
-        if self.microphone_stream.is_none() && self.system_stream.is_none() {
+        if self.slots.count() == 0 {
             return Err(anyhow::anyhow!("No audio streams could be created"));
         }
 
@@ -452,16 +466,14 @@ impl AudioStreamManager {
 
         let mut errors = Vec::new();
 
-        // Stop microphone stream
-        if let Some(mic_stream) = self.microphone_stream.take() {
+        if let Some(mic_stream) = self.slots.take(DeviceType::Microphone) {
             if let Err(e) = mic_stream.stop() {
                 error!("Failed to stop microphone stream: {}", e);
                 errors.push(e);
             }
         }
 
-        // Stop system stream
-        if let Some(sys_stream) = self.system_stream.take() {
+        if let Some(sys_stream) = self.slots.take(DeviceType::System) {
             if let Err(e) = sys_stream.stop() {
                 error!("Failed to stop system stream: {}", e);
                 errors.push(e);
@@ -476,84 +488,59 @@ impl AudioStreamManager {
         }
     }
 
-    /// Take the microphone stream OUT of the manager, keeping system audio
-    /// running. The caller stops/drops it OUTSIDE any lock — a cpal teardown
-    /// of a dead BT device can stall and must not block a held mutex.
+    /// Mic hot-swap phase 1: take the microphone stream OUT of the manager,
+    /// keeping system audio running. Bumps the slot epoch, so any dead-stream
+    /// recovery already in flight for the mic becomes obsolete. The caller
+    /// stops/drops it OUTSIDE any lock — a cpal teardown of a dead BT device
+    /// can stall and must not block a held mutex.
     pub fn take_mic_stream(&mut self) -> Option<AudioStream> {
-        self.microphone_stream.take()
+        self.slots.take(DeviceType::Microphone)
     }
 
-    /// Set a new microphone stream (used after hot-swap creation). Returns the
-    /// stream it replaced, if a dead-stream recovery had installed one
-    /// meanwhile: the caller must tear that one down OUTSIDE the manager lock
-    /// (a cpal drop joins its worker and can stall).
+    /// Mic hot-swap phase 3: install the new microphone stream. Returns the
+    /// stream it replaced, if any (the caller tears it down OUTSIDE the lock).
+    /// A stream that arrives already dead is reported like any other failure.
     pub fn set_mic_stream(&mut self, stream: AudioStream) -> Option<AudioStream> {
-        self.microphone_stream.replace(stream)
+        let (replaced, failure) = self.slots.install(DeviceType::Microphone, stream);
+        if let Some(failure) = failure {
+            self.state.report_stream_failure(failure);
+        }
+        replaced
     }
 
-    /// Take the stream for `kind` out of its slot (dead-stream recovery), but
-    /// only if it is still the stream that failed (`stream_id`). A stale event
-    /// from a stream that was already replaced (mic hot-swap) must not tear
-    /// down its healthy successor. The caller tears the result down OUTSIDE
-    /// any lock, like `take_mic_stream`.
-    pub fn take_stream_if_current(&mut self, kind: DeviceType, stream_id: u64) -> Option<AudioStream> {
-        let slot = match kind {
-            DeviceType::Microphone => &mut self.microphone_stream,
-            DeviceType::System => &mut self.system_stream,
-        };
-        if slot.as_ref().map(AudioStream::capture_id) == Some(stream_id) {
-            slot.take()
-        } else {
-            None
+    /// Recovery: take the stream out only if it is still the one that failed.
+    /// Returns it with the slot epoch the recovery run must stay within.
+    pub fn recovery_take(&mut self, kind: DeviceType, stream_id: u64) -> Option<(AudioStream, u64)> {
+        self.slots.recovery_take(kind, stream_id)
+    }
+
+    /// Recovery: install the replacement only if nothing else touched the slot
+    /// since `recovery_take`. Hands it back when the run is obsolete.
+    pub fn recovery_install(&mut self, kind: DeviceType, epoch: u64, stream: AudioStream) -> Option<AudioStream> {
+        match self.slots.recovery_install(kind, epoch, stream) {
+            Ok(failure) => {
+                if let Some(failure) = failure {
+                    self.state.report_stream_failure(failure);
+                }
+                None
+            }
+            Err(stream) => Some(stream),
         }
     }
 
-    /// Whether `kind`'s slot currently holds a stream.
-    pub fn has_stream(&self, kind: DeviceType) -> bool {
-        match kind {
-            DeviceType::Microphone => self.microphone_stream.is_some(),
-            DeviceType::System => self.system_stream.is_some(),
-        }
-    }
-
-    /// Id of the stream in `kind`'s slot if it has already been declared dead.
-    pub fn dead_stream_id(&self, kind: DeviceType) -> Option<u64> {
-        let slot = match kind {
-            DeviceType::Microphone => &self.microphone_stream,
-            DeviceType::System => &self.system_stream,
-        };
-        slot.as_ref().filter(|s| s.is_dead()).map(AudioStream::capture_id)
-    }
-
-    /// Install a recovered stream only if its slot is still empty. Returns the
-    /// stream back when something else (a mic hot-swap) refilled the slot.
-    pub fn install_stream_if_empty(&mut self, kind: DeviceType, stream: AudioStream) -> Option<AudioStream> {
-        let slot = match kind {
-            DeviceType::Microphone => &mut self.microphone_stream,
-            DeviceType::System => &mut self.system_stream,
-        };
-        if slot.is_some() {
-            return Some(stream);
-        }
-        *slot = Some(stream);
-        None
+    /// Current epoch of `kind`'s slot (recovery stays valid only while unchanged).
+    pub fn slot_epoch(&self, kind: DeviceType) -> u64 {
+        self.slots.epoch(kind)
     }
 
     /// Get stream count
     pub fn active_stream_count(&self) -> usize {
-        let mut count = 0;
-        if self.microphone_stream.is_some() {
-            count += 1;
-        }
-        if self.system_stream.is_some() {
-            count += 1;
-        }
-        count
+        self.slots.count()
     }
 
     /// Check if any streams are active
     pub fn has_active_streams(&self) -> bool {
-        self.microphone_stream.is_some() || self.system_stream.is_some()
+        self.slots.count() > 0
     }
 }
 
@@ -564,6 +551,7 @@ impl Drop for AudioStreamManager {
         }
     }
 }
+
 #[cfg(test)]
 mod live_tests {
     //! Live reproduction of the W93 error flood. `#[ignore]`d: it needs a real
@@ -627,15 +615,15 @@ mod live_tests {
             let (state2, mgr2, outcomes2, dev2) = (state.clone(), mgr.clone(), outcomes.clone(), dev.clone());
             tokio::spawn(async move {
                 while let Some(crate::audio::recording_state::StreamFailure { kind, stream_id }) = failures.recv().await {
-                    let dead = mgr2.lock().unwrap().take_stream_if_current(kind, stream_id);
-                    if dead.is_none() {
+                    let dead = mgr2.lock().unwrap().recovery_take(kind, stream_id);
+                    let Some((dead, epoch)) = dead else {
                         eprintln!("W93_STALE failure for stream {stream_id}");
                         continue;
-                    }
+                    };
                     let out = recover_stream(
                         kind,
                         RecoveryPolicy::default(),
-                        move || dead,
+                        move || Some(dead),
                         |s: AudioStream| async move {
                             let _ = tokio::task::spawn_blocking(move || {
                                 let _ = s.stop();
@@ -646,8 +634,8 @@ mod live_tests {
                             let (st, d) = (state2.clone(), dev2.clone());
                             async move { AudioStream::create(d, st, kind, None).await }
                         },
-                        |s| mgr2.lock().unwrap().install_stream_if_empty(kind, s),
-                        || state2.is_recording(),
+                        |s| mgr2.lock().unwrap().recovery_install(kind, epoch, s),
+                        || state2.is_recording() && mgr2.lock().unwrap().slot_epoch(kind) == epoch,
                         tokio::time::sleep,
                     )
                     .await;

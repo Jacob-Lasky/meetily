@@ -141,6 +141,42 @@ where
     RecoveryOutcome::Exhausted { attempts: policy.max_attempts }
 }
 
+/// Run `stop` (a cpal stream stop/drop, which joins the backend worker and can
+/// stall forever on a dead device) off the async workers and wait at most
+/// `bound`. Returns true if it timed out. The blocking thread cannot be
+/// cancelled and keeps only that one stream alive; waiting on it unbounded
+/// would instead hang the caller, and with it everything the caller holds
+/// (a mic hot-swap holds `MIC_SWAP_IN_PROGRESS`).
+pub async fn teardown_bounded<F>(stop: F, bound: Duration) -> bool
+where
+    F: FnOnce() + Send + 'static,
+{
+    let done = tokio::task::spawn_blocking(stop);
+    tokio::time::timeout(bound, done).await.is_err()
+}
+
+/// A flag held for the lifetime of the guard and cleared on EVERY exit path:
+/// return, `?`, panic unwind, task abort, teardown timeout. Used for
+/// `MIC_SWAP_IN_PROGRESS`, which must never be left stuck (a stuck flag
+/// silently disables every later mic fallback).
+pub struct FlagGuard<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl<'a> FlagGuard<'a> {
+    /// Take the flag; `None` if it is already held.
+    pub fn try_acquire(flag: &'a std::sync::atomic::AtomicBool) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| Self(flag))
+    }
+}
+
+impl Drop for FlagGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Caps how often a stream may be reopened when each replacement dies again
 /// soon after. A recovered stream that stays healthy for `STABLE_AFTER`
 /// resets the count.
@@ -288,6 +324,62 @@ mod tests {
         .await;
         assert_eq!(out, RecoveryOutcome::Abandoned);
         assert_eq!(&*torn.borrow(), &["fresh"]);
+    }
+
+    /// Finding 2: a stalled cpal stop must not hold its caller (the mic swap)
+    /// beyond the bound, and the swap flag must be free afterwards.
+    #[tokio::test]
+    async fn a_stalled_teardown_times_out_and_the_swap_flag_is_released() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = AtomicBool::new(false);
+        {
+            let guard = FlagGuard::try_acquire(&flag).expect("first acquire");
+            assert!(FlagGuard::try_acquire(&flag).is_none(), "overlapping swap refused");
+            let started = Instant::now();
+            let timed_out = teardown_bounded(|| std::thread::sleep(Duration::from_secs(5)), Duration::from_millis(100)).await;
+            assert!(timed_out);
+            assert!(started.elapsed() < Duration::from_secs(2), "caller released at the bound, not after the stall");
+            drop(guard);
+        }
+        assert!(!flag.load(Ordering::SeqCst), "flag cleared after the timeout path");
+        assert!(FlagGuard::try_acquire(&flag).is_some(), "next swap can run");
+    }
+
+    #[test]
+    fn the_flag_is_cleared_on_panic_unwind() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = AtomicBool::new(false);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = FlagGuard::try_acquire(&flag).unwrap();
+            panic!("swap task panicked");
+        }));
+        assert!(r.is_err());
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_quick_teardown_reports_no_timeout() {
+        assert!(!teardown_bounded(|| {}, Duration::from_secs(1)).await);
+    }
+
+    /// Finding 4 at the recovery level: when something else owns the slot by
+    /// the time the attempts are over, the run is abandoned, never announced.
+    #[tokio::test]
+    async fn a_run_made_obsolete_mid_backoff_ends_silently() {
+        let epoch = Cell::new(7u64);
+        let captured = 7u64;
+        let out = recover_stream(
+            DeviceType::Microphone,
+            policy(),
+            || Some("dead"),
+            |_| async {},
+            || async { Err(anyhow::anyhow!("not back")) },
+            |s: &str| Some(s),
+            || epoch.get() == captured, // production: session live AND slot epoch unchanged
+            |_| { epoch.set(8); async {} }, // the hot-swap lands during the first backoff
+        )
+        .await;
+        assert_eq!(out, RecoveryOutcome::Abandoned);
     }
 
     #[test]

@@ -108,6 +108,67 @@ pub struct ClaudeRequest {
     pub max_tokens: u32,
     pub system: String,
     pub messages: Vec<ChatMessage>,
+    /// Omitted for summaries (the model's default). Live assist sends the
+    /// thinking-off setting, see `CLAUDE_THINKING_OFF`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<serde_json::Value>,
+}
+
+/// Per-call knobs for `generate_completion`. Summaries use
+/// `CompletionOptions::summary()`, which keeps their behaviour unchanged.
+#[derive(Debug, Clone)]
+pub(crate) struct CompletionOptions {
+    /// Claude `max_tokens`. On models that think by default this budget also
+    /// covers the thinking tokens.
+    pub claude_max_tokens: u32,
+    /// Ask Claude not to think before answering. Live assist needs this: with
+    /// default thinking a Sonnet 5.5 assist call took 4.0-4.9 s, without it
+    /// 1.8-2.0 s (measured 2026-11-17, WORK-524).
+    pub claude_thinking_off: bool,
+    /// Whole-request timeout (connect, send, response headers).
+    pub timeout: Duration,
+}
+
+impl CompletionOptions {
+    pub(crate) fn summary() -> Self {
+        Self {
+            claude_max_tokens: 8192,
+            claude_thinking_off: false,
+            timeout: REQUEST_TIMEOUT_DURATION,
+        }
+    }
+}
+
+/// The Messages API value that turns thinking off on models that think by
+/// default. DO NOT send `{"type": "disabled"}`: claude-sonnet-5-5 rejects it
+/// with HTTP 400 and names this value instead (verified live 2026-11-17).
+/// Older models that do not know it reject it too; `claude_rejects_thinking`
+/// spots that and the caller retries once without the field.
+pub(crate) const CLAUDE_THINKING_OFF: &str = "between_tools";
+
+/// Claude request body. `thinking_off` adds `CLAUDE_THINKING_OFF`.
+pub(crate) fn build_claude_body(
+    model_name: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    max_tokens: u32,
+    thinking_off: bool,
+) -> serde_json::Value {
+    serde_json::json!(ClaudeRequest {
+        system: system_prompt.to_string(),
+        model: model_name.to_string(),
+        max_tokens,
+        messages: vec![ChatMessage {
+            role: "user".to_string(),
+            content: user_prompt.to_string(),
+        }],
+        thinking: thinking_off.then(|| serde_json::json!({ "type": CLAUDE_THINKING_OFF })),
+    })
+}
+
+/// True when Claude refused the request because of its `thinking` field.
+fn claude_rejects_thinking(status: reqwest::StatusCode, error_body: &str) -> bool {
+    status == reqwest::StatusCode::BAD_REQUEST && error_body.to_ascii_lowercase().contains("thinking")
 }
 
 // Claude-specific response structure
@@ -271,6 +332,43 @@ pub(crate) async fn generate_summary(
     app_data_dir: Option<&PathBuf>,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<LlmCompletion, String> {
+    generate_completion(
+        client,
+        provider,
+        model_name,
+        api_key,
+        system_prompt,
+        user_prompt,
+        ollama_endpoint,
+        custom_openai_endpoint,
+        max_tokens,
+        temperature,
+        top_p,
+        app_data_dir,
+        cancellation_token,
+        &CompletionOptions::summary(),
+    )
+    .await
+}
+
+/// `generate_summary` with per-call options (see `CompletionOptions`).
+pub(crate) async fn generate_completion(
+    client: &Client,
+    provider: &LLMProvider,
+    model_name: &str,
+    api_key: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    ollama_endpoint: Option<&str>,
+    custom_openai_endpoint: Option<&str>,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    app_data_dir: Option<&PathBuf>,
+    cancellation_token: Option<&CancellationToken>,
+    options: &CompletionOptions,
+) -> Result<LlmCompletion, String> {
+    let request_timeout = options.timeout;
     // Check if cancelled before starting
     if let Some(token) = cancellation_token {
         if token.is_cancelled() {
@@ -378,17 +476,15 @@ pub(crate) async fn generate_summary(
             top_p,
         )
     } else {
-        serde_json::json!(ClaudeRequest {
-            system: system_prompt.to_string(),
-            model: model_name.to_string(),
-            // Shared budget: on models with thinking enabled by default this
-            // covers thinking tokens as well as the answer.
-            max_tokens: 8192,
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: user_prompt.to_string(),
-            }]
-        })
+        // Shared budget: on models with thinking enabled by default this
+        // covers thinking tokens as well as the answer.
+        build_claude_body(
+            model_name,
+            system_prompt,
+            user_prompt,
+            options.claude_max_tokens,
+            options.claude_thinking_off,
+        )
     };
 
     info!("🐞 LLM Request to {}: model={}", provider_name(provider), model_name);
@@ -398,7 +494,7 @@ pub(crate) async fn generate_summary(
         .post(api_url.clone())
         .headers(headers.clone())
         .json(&request_body)
-        .timeout(REQUEST_TIMEOUT_DURATION)
+        .timeout(request_timeout)
         .send();
 
     // Use tokio::select to race between cancellation and request completion
@@ -409,7 +505,7 @@ pub(crate) async fn generate_summary(
                     if e.is_timeout() {
                         format!(
                             "LLM request timed out after {} seconds",
-                            REQUEST_TIMEOUT_DURATION.as_secs()
+                            request_timeout.as_secs()
                         )
                     } else {
                         format!("Failed to send request to LLM: {}", e)
@@ -425,7 +521,7 @@ pub(crate) async fn generate_summary(
             if e.is_timeout() {
                 format!(
                     "LLM request timed out after {} seconds",
-                    REQUEST_TIMEOUT_DURATION.as_secs()
+                    request_timeout.as_secs()
                 )
             } else {
                 format!("Failed to send request to LLM: {}", e)
@@ -440,24 +536,34 @@ pub(crate) async fn generate_summary(
         let error_body = await_or_cancel(response.text(), cancellation_token)
             .await?
             .unwrap_or_else(|error| format!("Failed to read LLM error response body: {error}"));
-        if provider != &LLMProvider::Ollama || !ollama_rejects_reasoning_effort(status, &error_body) {
+        let retry_without = if provider == &LLMProvider::Ollama
+            && ollama_rejects_reasoning_effort(status, &error_body)
+        {
+            warn!("Ollama rejected reasoning_effort; retrying once without it");
+            "reasoning_effort"
+        } else if provider == &LLMProvider::Claude
+            && options.claude_thinking_off
+            && claude_rejects_thinking(status, &error_body)
+        {
+            warn!("Claude rejected the thinking setting for {}; retrying once without it", model_name);
+            "thinking"
+        } else {
             return Err(format!(
                 "LLM API request failed with status {}: {}",
                 status, error_body
             ));
-        }
+        };
 
-        warn!("Ollama rejected reasoning_effort; retrying once without it");
         let mut retry_body = request_body;
         retry_body
             .as_object_mut()
-            .ok_or_else(|| "Failed to prepare Ollama compatibility retry".to_string())?
-            .remove("reasoning_effort");
+            .ok_or_else(|| "Failed to prepare compatibility retry".to_string())?
+            .remove(retry_without);
         let retry_future = client
             .post(api_url)
             .headers(headers)
             .json(&retry_body)
-            .timeout(REQUEST_TIMEOUT_DURATION)
+            .timeout(request_timeout)
             .send();
         await_or_cancel(retry_future, cancellation_token)
             .await?
@@ -465,7 +571,7 @@ pub(crate) async fn generate_summary(
                 if e.is_timeout() {
                     format!(
                         "LLM retry request timed out after {} seconds",
-                        REQUEST_TIMEOUT_DURATION.as_secs()
+                        request_timeout.as_secs()
                     )
                 } else {
                     format!("Failed to send retry request to LLM: {}", e)
@@ -909,6 +1015,32 @@ mod tests {
                 reasoning_stripped: true,
             })
         );
+    }
+
+    #[test]
+    fn summary_claude_body_keeps_the_model_default_thinking() {
+        let options = CompletionOptions::summary();
+        assert!(!options.claude_thinking_off);
+        let body = build_claude_body("m", "sys", "user", options.claude_max_tokens, options.claude_thinking_off);
+        assert!(body.get("thinking").is_none(), "summaries must not change thinking: {body}");
+        assert_eq!(body["max_tokens"], 8192);
+        assert_eq!(body["system"], "sys");
+        assert_eq!(body["messages"][0]["content"], "user");
+    }
+
+    #[test]
+    fn thinking_off_uses_the_value_the_api_accepts() {
+        let body = build_claude_body("m", "sys", "user", 400, true);
+        assert_eq!(body["thinking"], json!({"type": "between_tools"}));
+        assert_ne!(body["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn only_a_400_about_thinking_triggers_the_thinking_retry() {
+        let msg = r#"{"type":"error","error":{"type":"invalid_request_error","message":"thinking type between_tools is not supported"}}"#;
+        assert!(claude_rejects_thinking(reqwest::StatusCode::BAD_REQUEST, msg));
+        assert!(!claude_rejects_thinking(reqwest::StatusCode::BAD_REQUEST, "max_tokens too large"));
+        assert!(!claude_rejects_thinking(reqwest::StatusCode::UNAUTHORIZED, msg));
     }
 }
 

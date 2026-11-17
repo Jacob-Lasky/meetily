@@ -76,11 +76,18 @@ fn session_live(s: &Arc<super::RecordingState>) -> bool {
 /// This unwind-clears behaviour depends on `panic = "unwind"` (the default).
 /// If a release profile ever sets `panic = "abort"`, Drop won't run on panic
 /// and the stuck-flag failure mode returns — add a start-time reset then.
+///
+/// It is also the single claim on the stop tail: `claim` returns None while
+/// another stop holds it, so a second Stop (UI and tray at once) cannot run
+/// the tail concurrently, remove the transcript and live-assist listeners
+/// before the first stop's drain ends, or emit a second `recording-stopped`.
 struct StoppingGuard;
 impl StoppingGuard {
-    fn new() -> Self {
-        IS_RECORDING_STOPPING.store(true, Ordering::SeqCst);
-        StoppingGuard
+    fn claim() -> Option<Self> {
+        IS_RECORDING_STOPPING
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| StoppingGuard)
     }
 }
 impl Drop for StoppingGuard {
@@ -454,6 +461,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     let session = manager.get_state().clone();
 
     let transcript_log = manager.transcript_log();
+    let meeting_folder = manager.get_meeting_folder();
     // Store the manager globally to keep it alive
     {
         let mut global_manager = RECORDING_MANAGER.lock().unwrap();
@@ -486,6 +494,9 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     // Keep the recording manager's transcript (history sync, transcripts.json)
     // in step with the live events. Listener IDs are removed in stop_recording.
     register_transcript_listeners(&app, transcript_log);
+    // Live assist follows the same events; it is stopped first thing in
+    // stop_recording. Pinned cards go to the meeting folder.
+    crate::live_assist::start_session(&app, meeting_folder);
 
     // Emit success event
     app.emit("recording-started", serde_json::json!({
@@ -625,6 +636,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     let session = manager.get_state().clone();
 
     let transcript_log = manager.transcript_log();
+    let meeting_folder = manager.get_meeting_folder();
     // Store the manager globally to keep it alive
     {
         let mut global_manager = RECORDING_MANAGER.lock().unwrap();
@@ -657,6 +669,9 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     // Keep the recording manager's transcript (history sync, transcripts.json)
     // in step with the live events. Listener IDs are removed in stop_recording.
     register_transcript_listeners(&app, transcript_log);
+    // Live assist follows the same events; it is stopped first thing in
+    // stop_recording. Pinned cards go to the meeting folder.
+    crate::live_assist::start_session(&app, meeting_folder);
 
     // Emit success event
     app.emit("recording-started", serde_json::json!({
@@ -691,6 +706,21 @@ pub async fn stop_recording<R: Runtime>(
         return Ok(());
     }
 
+    // Claim the stop tail first. IS_RECORDING stays true until the tail
+    // completes (the frontend polls it to keep the stop UI up), and a mic-
+    // disconnect fallback queued before Stop short-circuits on this flag
+    // instead of retrying against the taken manager. RAII so a panic in the
+    // tail below can't leave the flag stuck true.
+    let Some(_stopping_guard) = StoppingGuard::claim() else {
+        info!("Stop already in progress; ignoring the second request");
+        return Ok(());
+    };
+
+    // No live-assist calls once Stop is pressed: suggestions are for the
+    // call, not for the transcript drain below. The session itself keeps
+    // following retractions until the drain ends (stop_session below).
+    crate::live_assist::stop_calls();
+
     // Emit shutdown progress to frontend
     let _ = app.emit(
         "recording-shutdown-progress",
@@ -707,12 +737,6 @@ pub async fn stop_recording<R: Runtime>(
         global_manager.take()
     };
 
-    // Mark the stop tail as in progress so a mic-disconnect fallback that was
-    // queued before Stop short-circuits instead of retrying against the taken
-    // manager. IS_RECORDING itself stays true until the tail completes — the
-    // frontend polls it to keep the stop UI up. RAII so a panic in the tail
-    // below can't leave the flag stuck true.
-    let _stopping_guard = StoppingGuard::new();
 
     let stop_result = if let Some(mut manager) = manager_for_cleanup {
         // Use FORCE FLUSH to immediately process all accumulated audio - eliminates 30s delay!
@@ -734,6 +758,7 @@ pub async fn stop_recording<R: Runtime>(
         }
         Err(e) => {
             error!("❌ Failed to stop audio streams: {}", e);
+            crate::live_assist::stop_session(&app);
             return Err(format!("Failed to stop audio streams: {}", e)); // _stopping_guard clears on return
         }
     }
@@ -815,6 +840,9 @@ pub async fn stop_recording<R: Runtime>(
         }
         info!("✅ Transcript update/retract listeners removed");
     }
+    // Same point for live assist: a bleed retraction during the drain still
+    // withdraws (and un-saves) a pinned card built from that line.
+    crate::live_assist::stop_session(&app);
 
     // Step 3: Now safely unload Whisper model after ALL chunks are processed
     let _ = app.emit(
@@ -1880,5 +1908,21 @@ async fn trigger_mic_fallback_to_default<R: Runtime>(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod stop_claim_tests {
+    use super::*;
+
+    #[test]
+    fn only_one_stop_can_hold_the_tail_and_drop_releases_it() {
+        let first = StoppingGuard::claim().expect("free at start");
+        assert!(IS_RECORDING_STOPPING.load(Ordering::SeqCst));
+        assert!(StoppingGuard::claim().is_none(), "a second Stop ran the tail concurrently");
+        drop(first);
+        assert!(!IS_RECORDING_STOPPING.load(Ordering::SeqCst));
+        let again = StoppingGuard::claim();
+        assert!(again.is_some(), "the next recording's Stop must still work");
     }
 }

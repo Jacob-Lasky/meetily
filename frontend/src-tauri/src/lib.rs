@@ -47,6 +47,7 @@ pub mod onboarding;
 pub mod openai;
 pub mod anthropic;
 pub mod groq;
+pub mod live_assist;
 pub mod openrouter;
 pub mod parakeet_engine;
 pub mod state;
@@ -743,6 +744,12 @@ pub fn run() {
             api::api_get_custom_openai_config,
             api::api_test_custom_openai_connection,
             // Summary commands
+            live_assist::live_assist_get_enabled,
+            live_assist::live_assist_set_enabled,
+            live_assist::live_assist_get_cards,
+            live_assist::live_assist_dismiss,
+            live_assist::live_assist_set_pinned,
+            live_assist::live_assist_get_pinned,
             summary::commands::api_process_transcript,
             summary::commands::api_get_summary,
             summary::commands::api_save_meeting_summary,

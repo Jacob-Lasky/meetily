@@ -454,6 +454,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     let session = manager.get_state().clone();
 
     let transcript_log = manager.transcript_log();
+    let meeting_folder = manager.get_meeting_folder();
     // Store the manager globally to keep it alive
     {
         let mut global_manager = RECORDING_MANAGER.lock().unwrap();
@@ -486,6 +487,9 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     // Keep the recording manager's transcript (history sync, transcripts.json)
     // in step with the live events. Listener IDs are removed in stop_recording.
     register_transcript_listeners(&app, transcript_log);
+    // Live assist follows the same events; it is stopped first thing in
+    // stop_recording. Pinned cards go to the meeting folder.
+    crate::live_assist::start_session(&app, meeting_folder);
 
     // Emit success event
     app.emit("recording-started", serde_json::json!({
@@ -625,6 +629,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     let session = manager.get_state().clone();
 
     let transcript_log = manager.transcript_log();
+    let meeting_folder = manager.get_meeting_folder();
     // Store the manager globally to keep it alive
     {
         let mut global_manager = RECORDING_MANAGER.lock().unwrap();
@@ -657,6 +662,9 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     // Keep the recording manager's transcript (history sync, transcripts.json)
     // in step with the live events. Listener IDs are removed in stop_recording.
     register_transcript_listeners(&app, transcript_log);
+    // Live assist follows the same events; it is stopped first thing in
+    // stop_recording. Pinned cards go to the meeting folder.
+    crate::live_assist::start_session(&app, meeting_folder);
 
     // Emit success event
     app.emit("recording-started", serde_json::json!({
@@ -690,6 +698,10 @@ pub async fn stop_recording<R: Runtime>(
         info!("Recording was not active");
         return Ok(());
     }
+
+    // No live-assist calls once Stop is pressed: suggestions are for the
+    // call, not for the transcript drain below. This also saves its pins.
+    crate::live_assist::stop_session(&app);
 
     // Emit shutdown progress to frontend
     let _ = app.emit(

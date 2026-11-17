@@ -165,18 +165,34 @@ Rules:
 - Use only what is in the transcript. Never invent product facts, prices, numbers, names, features or commitments that were not said. If an answer needs a fact you were not given, make it an ask or a todo instead.
 - text: a terse fragment of 15 words or fewer (hard limit 25), so Me can glance at it mid-sentence. No preamble like "Ask them" or "Consider".
 - quote: copy, word for word, the transcript line (or part of it) the card responds to.
+- Never repeat or rephrase a card Me already has or dismissed; if nothing new is worth adding, return no cards.
 - Reply with one JSON object and nothing else: {"cards":[{"kind":"ask","text":"...","quote":"..."}]}. No cards: {"cards":[]}."#;
 
-/// User prompt: the context window, oldest line first, one line each.
-pub fn user_prompt<'a>(lines: impl IntoIterator<Item = (Side, &'a str)>) -> String {
+/// User prompt: the context window, oldest line first, one line each, then
+/// the cards Me already has or dismissed (`shown`, newest first). Without that list
+/// each call re-suggested the same follow-ups: the 2026-11-17 live run showed
+/// "How are account numbers spoken...?" twice, five seconds apart.
+pub fn user_prompt<'a>(
+    lines: impl IntoIterator<Item = (Side, &'a str)>,
+    shown: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let one_line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut out = String::from("Transcript, oldest first:\n");
     for (side, text) in lines {
         // One transcript row per prompt line, so a quote maps back to one row.
-        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
         out.push_str(side.prefix());
         out.push_str(": ");
-        out.push_str(&text);
+        out.push_str(&one_line(text));
         out.push('\n');
+    }
+    let shown: Vec<String> = shown.into_iter().map(one_line).collect();
+    if !shown.is_empty() {
+        out.push_str("\nCards Me already has or dismissed (do not repeat or rephrase these):\n");
+        for text in shown {
+            out.push_str("- ");
+            out.push_str(&text);
+            out.push('\n');
+        }
     }
     out
 }
@@ -280,7 +296,16 @@ mod tests {
 
     #[test]
     fn user_prompt_labels_lines_and_keeps_one_row_per_line() {
-        let prompt = user_prompt([(Side::Me, "Hi there"), (Side::Them, "Price?\nAnd SLA?"), (Side::Unknown, "x")]);
+        let prompt = user_prompt([(Side::Me, "Hi there"), (Side::Them, "Price?\nAnd SLA?"), (Side::Unknown, "x")], []);
         assert_eq!(prompt, "Transcript, oldest first:\nMe: Hi there\nThem: Price? And SLA?\nSpeaker: x\n");
+    }
+
+    #[test]
+    fn user_prompt_lists_the_cards_already_shown() {
+        let prompt = user_prompt([(Side::Them, "Price?")], ["Average call length?", "Send\nquote"]);
+        assert_eq!(
+            prompt,
+            "Transcript, oldest first:\nThem: Price?\n\nCards Me already has or dismissed (do not repeat or rephrase these):\n- Average call length?\n- Send quote\n"
+        );
     }
 }

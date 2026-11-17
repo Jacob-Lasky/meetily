@@ -2,14 +2,17 @@
 
 import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { Sparkles } from 'lucide-react';
 import { toast } from 'sonner';
 import { Switch } from './ui/switch';
+import { ASSIST_STATUS_EVENT, AssistStatus } from '@/lib/live-assist';
 
 /**
- * Settings > Summary: the live-assist switch. Off by default; while off the
- * app makes no live-assist model calls. Stored by the backend
- * (live_assist_set_enabled) so it applies while the window is hidden too.
+ * Settings > Summary: the live-assist switch (the tray's "Live Assist" item
+ * flips the same setting). Off by default; while off the app makes no
+ * live-assist model calls. Stored by the backend (live_assist_set_enabled) so
+ * it applies while the window is hidden too.
  */
 export function LiveAssistSettings() {
   const [enabled, setEnabled] = useState<boolean | null>(null);
@@ -21,6 +24,14 @@ export function LiveAssistSettings() {
         console.error('live assist: could not read the setting', e);
         setEnabled(false);
       });
+    // The tray's "Live Assist" item changes the same setting.
+    const unlisten = listen<AssistStatus>(ASSIST_STATUS_EVENT, (e) => {
+      if (e.payload.state === 'off') setEnabled(false);
+      if (e.payload.state === 'idle' || e.payload.state === 'thinking') setEnabled(true);
+    });
+    return () => {
+      unlisten.then((un) => un());
+    };
   }, []);
 
   const onChange = async (next: boolean) => {

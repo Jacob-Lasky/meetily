@@ -1,6 +1,6 @@
 use tauri::{
     Emitter,
-    menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem},
+    menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, PredefinedMenuItem},
     tray::TrayIconBuilder,
     AppHandle, Manager, Runtime,
 };
@@ -48,6 +48,15 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, item_id: &str) {
             }
         }
         "check_updates" => check_updates_handler(app),
+        "toggle_live_assist" => {
+            // The menu item shows the stored value; flip that, not the
+            // item's own (already toggled) check state.
+            let enabled = !crate::live_assist::load_enabled(app);
+            if let Err(e) = crate::live_assist::set_enabled(app, enabled) {
+                log::error!("Tray: could not change live assist: {}", e);
+                update_tray_menu(app);
+            }
+        }
         "quit" => app.exit(0),
         _ => {}
     }
@@ -393,6 +402,11 @@ fn build_menu<R: Runtime>(
     builder
         .item(&PredefinedMenuItem::separator(app)?)
         .item(&MenuItemBuilder::with_id("open_window", "Open Main Window").build(app)?)
+        .item(
+            &CheckMenuItemBuilder::with_id("toggle_live_assist", "Live Assist")
+                .checked(crate::live_assist::load_enabled(app))
+                .build(app)?,
+        )
         .item(&MenuItemBuilder::with_id("settings", "Settings").build(app)?)
         .item(&MenuItemBuilder::with_id("check_updates", "Check for Updates").build(app)?)
         .item(&PredefinedMenuItem::separator(app)?)

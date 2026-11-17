@@ -61,12 +61,17 @@ pub struct Card {
     pub created_at_ms: i64,
 }
 
-/// What a call needs: its id (to match the result) and the context lines.
+/// What a call needs: its id (to match the result), the context lines and
+/// the texts of the cards already on screen, newest first.
 #[derive(Debug, Clone)]
 pub struct CallRequest {
     pub call_id: u64,
     pub lines: Vec<Line>,
+    pub shown: Vec<String>,
 }
+
+/// Most shown-card texts sent with a call; older cards have scrolled away.
+const MAX_SHOWN_IN_PROMPT: usize = 10;
 
 #[derive(Debug, Default)]
 pub struct Engine {
@@ -83,6 +88,9 @@ pub struct Engine {
     cards: Vec<Card>,
     /// Lines retracted while a call that saw them was in flight.
     retracted_in_flight: Vec<u64>,
+    /// Texts of cards Me dismissed, newest first (at most
+    /// MAX_SHOWN_IN_PROMPT): not suggested again.
+    dismissed: VecDeque<String>,
 }
 
 /// Result of applying a call's output.
@@ -150,7 +158,17 @@ impl Engine {
             return None;
         }
         self.next_call_id += 1;
-        let request = CallRequest { call_id: self.next_call_id, lines: self.lines.iter().cloned().collect() };
+        let request = CallRequest {
+            call_id: self.next_call_id,
+            lines: self.lines.iter().cloned().collect(),
+            shown: self
+                .cards
+                .iter()
+                .take(MAX_SHOWN_IN_PROMPT)
+                .map(|c| c.text.clone())
+                .chain(self.dismissed.iter().cloned())
+                .collect(),
+        };
         self.in_flight = Some(request.clone());
         self.last_call = Some(now);
         self.retracted_in_flight.clear();
@@ -185,7 +203,9 @@ impl Engine {
                 continue;
             }
             let norm = normalize(&card.text);
-            if self.cards.iter().chain(added.iter()).any(|c: &Card| normalize(&c.text) == norm) {
+            let repeat = self.cards.iter().chain(added.iter()).any(|c: &Card| normalize(&c.text) == norm)
+                || self.dismissed.iter().any(|t| normalize(t) == norm);
+            if repeat {
                 continue;
             }
             self.next_card_no += 1;
@@ -220,9 +240,13 @@ impl Engine {
     }
 
     pub fn dismiss(&mut self, id: &str) -> bool {
-        let before = self.cards.len();
-        self.cards.retain(|c| c.id != id);
-        before != self.cards.len()
+        let Some(pos) = self.cards.iter().position(|c| c.id == id) else {
+            return false;
+        };
+        let card = self.cards.remove(pos);
+        self.dismissed.push_front(card.text);
+        self.dismissed.truncate(MAX_SHOWN_IN_PROMPT);
+        true
     }
 
     pub fn set_pinned(&mut self, id: &str, pinned: bool) -> Option<Card> {
@@ -521,6 +545,34 @@ mod tests {
         assert_eq!(source_line(&lines, "nothing like it"), Some(3), "fallback: newest Speaker-Out");
         assert_eq!(source_line(&lines, ""), Some(3));
         assert_eq!(source_line(&[], "x"), None);
+    }
+
+    #[test]
+    fn a_call_carries_the_cards_already_shown_newest_first() {
+        let t0 = Instant::now();
+        let mut e = Engine::new(Config::default());
+        e.on_line(1, Side::Them, "a", t0);
+        let c1 = e.poll(t0 + ms(1500), true).unwrap();
+        assert!(c1.shown.is_empty());
+        e.on_call_done(c1.call_id, vec![raw(CardKind::Ask, "First", "a"), raw(CardKind::Todo, "Second", "a")], 0);
+        e.on_line(2, Side::Them, "b", t0 + ms(6000));
+        let c2 = e.poll(t0 + ms(7500), true).unwrap();
+        assert_eq!(c2.shown, vec!["First".to_string(), "Second".to_string()]);
+    }
+
+    #[test]
+    fn a_dismissed_card_is_not_suggested_again() {
+        let t0 = Instant::now();
+        let mut e = Engine::new(Config::default());
+        e.on_line(1, Side::Them, "a", t0);
+        let c1 = e.poll(t0 + ms(1500), true).unwrap();
+        let id = e.on_call_done(c1.call_id, vec![raw(CardKind::Ask, "Budget?", "a")], 0).added[0].id.clone();
+        assert!(e.dismiss(&id));
+        e.on_line(2, Side::Them, "b", t0 + ms(6000));
+        let c2 = e.poll(t0 + ms(7500), true).unwrap();
+        assert_eq!(c2.shown, vec!["Budget?".to_string()], "the model is told about it");
+        let applied = e.on_call_done(c2.call_id, vec![raw(CardKind::Ask, "budget", "b")], 0);
+        assert!(applied.added.is_empty(), "and a repeat is dropped anyway");
     }
 
     #[test]

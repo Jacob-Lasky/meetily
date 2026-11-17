@@ -6,9 +6,10 @@
 //! log follows), so the trigger works while the window is hidden or another
 //! page is open. Cards reach the UI as `assist-update` / `assist-withdraw`.
 //!
-//! The feature is off by default (`live_assist.json` store, key `enabled`).
-//! While it is off no LLM call is made; turning it off mid-call cancels the
-//! call in flight. Calls use the configured summary provider and model.
+//! The feature is off by default (`live_assist.json` store, key `enabled`;
+//! switched in Settings > Summary or the tray's "Live Assist" item). While it
+//! is off no LLM call is made; turning it off mid-call cancels the call in
+//! flight. Calls use the configured summary provider and model.
 //!
 //! Pinned cards are written to `live-assist.json` in the meeting folder so
 //! the meeting page can show them afterwards. DO NOT move them into a new DB
@@ -161,6 +162,9 @@ async fn run<R: Runtime>(
 ) {
     let mut engine = Engine::new(Config::default());
     let mut cancel: Option<CancellationToken> = None;
+    // (call id, arrival of the Speaker-Out final that triggered it), for the
+    // latency the user sees: final -> cards.
+    let mut trigger: Option<(u64, Instant)> = None;
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut was_enabled = ENABLED.load(Ordering::SeqCst);
@@ -175,8 +179,8 @@ async fn run<R: Runtime>(
                     Msg::Retract(seq) => {
                         let had_pins = !engine.pinned().is_empty();
                         let withdrawn = engine.on_retract(seq);
+                        info!("live assist: transcript line {seq} retracted, withdrawing {} card(s)", withdrawn.len());
                         if !withdrawn.is_empty() {
-                            info!("live assist: transcript line {seq} retracted, withdrawing {} card(s)", withdrawn.len());
                             emit_withdraw(&app, withdrawn, "retracted");
                             if had_pins {
                                 save_pins(folder.as_deref(), &engine.pinned());
@@ -187,7 +191,8 @@ async fn run<R: Runtime>(
                         if engine.in_flight() == Some(call_id) {
                             cancel = None;
                         }
-                        apply_result(&app, &mut engine, call_id, result);
+                        let since_final = trigger.filter(|(id, _)| *id == call_id).map(|(_, at)| at.elapsed());
+                        apply_result(&app, &mut engine, call_id, result, since_final);
                     }
                     Msg::Dismiss(id) => {
                         let was_pinned = engine.cards().iter().any(|c| c.id == id && c.pinned);
@@ -227,9 +232,18 @@ async fn run<R: Runtime>(
         if let Some(request) = engine.poll(Instant::now(), enabled) {
             let token = CancellationToken::new();
             cancel = Some(token.clone());
-            let prompt = cards::user_prompt(request.lines.iter().map(|l| (l.side, l.text.as_str())));
+            let prompt = cards::user_prompt(
+                request.lines.iter().map(|l| (l.side, l.text.as_str())),
+                request.shown.iter().map(String::as_str),
+            );
             let call_id = request.call_id;
-            info!("live assist: call {call_id} with {} line(s)", request.lines.len());
+            let last_final = request.lines.iter().rev().find(|l| l.side == Side::Them).map(|l| l.at);
+            trigger = last_final.map(|at| (call_id, at));
+            info!(
+                "live assist: call {call_id} with {} line(s), {} ms after the Speaker-Out final",
+                request.lines.len(),
+                last_final.map_or(0, |at| at.elapsed().as_millis())
+            );
             emit_status(&app, "thinking", None);
             let app = app.clone();
             let tx = tx.clone();
@@ -252,7 +266,13 @@ async fn run<R: Runtime>(
     emit_status(&app, "stopped", None);
 }
 
-fn apply_result<R: Runtime>(app: &AppHandle<R>, engine: &mut Engine, call_id: u64, result: Result<String, String>) {
+fn apply_result<R: Runtime>(
+    app: &AppHandle<R>,
+    engine: &mut Engine,
+    call_id: u64,
+    result: Result<String, String>,
+    since_final: Option<Duration>,
+) {
     let output = match result {
         Ok(output) => output,
         Err(e) => {
@@ -273,8 +293,12 @@ fn apply_result<R: Runtime>(app: &AppHandle<R>, engine: &mut Engine, call_id: u6
         }
     };
     let applied = engine.on_call_done(call_id, raw, chrono::Utc::now().timestamp_millis());
+    info!(
+        "live assist: call {call_id} added {} card(s), {} ms after the Speaker-Out final",
+        applied.added.len(),
+        since_final.map_or(0, |d| d.as_millis())
+    );
     if !applied.added.is_empty() {
-        info!("live assist: call {call_id} added {} card(s)", applied.added.len());
         if let Err(e) = app.emit(ASSIST_UPDATE_EVENT, serde_json::json!({ "cards": applied.added })) {
             error!("live assist: failed to emit cards: {e}");
         }
@@ -321,7 +345,7 @@ async fn call_llm<R: Runtime>(app: &AppHandle<R>, prompt: &str, cancel: &Cancell
 // SETTING
 // ============================================================================
 
-fn load_enabled<R: Runtime>(app: &AppHandle<R>) -> bool {
+pub fn load_enabled<R: Runtime>(app: &AppHandle<R>) -> bool {
     match app.store(SETTINGS_STORE) {
         Ok(store) => store.get(ENABLED_KEY).and_then(|v| v.as_bool()).unwrap_or(false),
         Err(e) => {
@@ -329,6 +353,22 @@ fn load_enabled<R: Runtime>(app: &AppHandle<R>) -> bool {
             false
         }
     }
+}
+
+/// Save the setting and apply it to a running session at once (turning it
+/// off cancels the call in flight). Shared by Settings and the tray item.
+pub fn set_enabled<R: Runtime>(app: &AppHandle<R>, enabled: bool) -> Result<(), String> {
+    let store = app.store(SETTINGS_STORE).map_err(|e| format!("settings store unavailable: {e}"))?;
+    store.set(ENABLED_KEY, serde_json::Value::Bool(enabled));
+    store.save().map_err(|e| format!("could not save the setting: {e}"))?;
+    ENABLED.store(enabled, Ordering::SeqCst);
+    info!("live assist: {}", if enabled { "enabled" } else { "disabled" });
+    // A running session reports the change itself on its next tick.
+    if session_tx().is_none() {
+        emit_status(app, if enabled { "idle" } else { "off" }, None);
+    }
+    crate::tray::update_tray_menu(app);
+    Ok(())
 }
 
 // ============================================================================
@@ -387,18 +427,6 @@ pub async fn live_assist_get_enabled<R: Runtime>(app: AppHandle<R>) -> bool {
     load_enabled(&app)
 }
 
-#[tauri::command]
-pub async fn live_assist_set_enabled<R: Runtime>(app: AppHandle<R>, enabled: bool) -> Result<(), String> {
-    let store = app.store(SETTINGS_STORE).map_err(|e| format!("settings store unavailable: {e}"))?;
-    store.set(ENABLED_KEY, serde_json::Value::Bool(enabled));
-    store.save().map_err(|e| format!("could not save the setting: {e}"))?;
-    ENABLED.store(enabled, Ordering::SeqCst);
-    info!("live assist: {}", if enabled { "enabled" } else { "disabled" });
-    if session_tx().is_none() {
-        emit_status(&app, if enabled { "idle" } else { "off" }, None);
-    }
-    Ok(())
-}
 
 /// Cards of the running session (empty when not recording), newest first.
 #[tauri::command]
@@ -409,6 +437,11 @@ pub async fn live_assist_get_cards() -> Vec<Card> {
         return Vec::new();
     }
     rx.await.unwrap_or_default()
+}
+
+#[tauri::command]
+pub async fn live_assist_set_enabled<R: Runtime>(app: AppHandle<R>, enabled: bool) -> Result<(), String> {
+    set_enabled(&app, enabled)
 }
 
 #[tauri::command]

@@ -66,9 +66,10 @@ static HTTP: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
 struct Session {
     tx: mpsc::UnboundedSender<Msg>,
     listeners: Vec<tauri::EventId>,
-    /// Cancelled by stop_session itself, so the actor starts no call after
-    /// Stop even when a tick or queued line is handled before `Msg::Stop`.
-    stopped: CancellationToken,
+    /// Cancelled by `stop_calls` (Stop pressed): no call starts after it,
+    /// the one in flight is cancelled and its result dropped, while the
+    /// session keeps following retractions through the transcript drain.
+    calls_off: CancellationToken,
 }
 
 enum Msg {
@@ -135,19 +136,27 @@ pub fn start_session<R: Runtime>(app: &AppHandle<R>, meeting_folder: Option<Path
         }
     });
 
-    let stopped = CancellationToken::new();
-    tauri::async_runtime::spawn(run(app.clone(), rx, tx.clone(), meeting_folder, stopped.clone()));
-    *SESSION.lock().unwrap() = Some(Session { tx, listeners: vec![update_id, retract_id], stopped });
+    let calls_off = CancellationToken::new();
+    tauri::async_runtime::spawn(run(app.clone(), rx, tx.clone(), meeting_folder, calls_off.clone()));
+    *SESSION.lock().unwrap() = Some(Session { tx, listeners: vec![update_id, retract_id], calls_off });
     info!("live assist: session started (enabled={})", ENABLED.load(Ordering::SeqCst));
 }
 
-/// Stop the session: no more calls, the one in flight is cancelled, pins are
-/// written. Called as Stop is pressed, before the transcript drain.
+/// Stop making calls (Stop was pressed). Synchronous, so no call can start
+/// after it returns, even if the session task has not run yet.
+pub fn stop_calls() {
+    if let Some(session) = SESSION.lock().unwrap().as_ref() {
+        session.calls_off.cancel();
+    }
+}
+
+/// End the session: listeners removed, pins written. Called after the
+/// transcript drain, so retractions emitted by the drain still apply.
 pub fn stop_session<R: Runtime>(app: &AppHandle<R>) {
     let Some(session) = SESSION.lock().unwrap().take() else {
         return;
     };
-    session.stopped.cancel();
+    session.calls_off.cancel();
     for id in session.listeners {
         app.unlisten(id);
     }
@@ -164,7 +173,7 @@ async fn run<R: Runtime>(
     mut rx: mpsc::UnboundedReceiver<Msg>,
     tx: mpsc::UnboundedSender<Msg>,
     folder: Option<PathBuf>,
-    stopped: CancellationToken,
+    calls_off: CancellationToken,
 ) {
     let mut engine = Engine::new(Config::default());
     let mut cancel: Option<CancellationToken> = None;
@@ -196,6 +205,11 @@ async fn run<R: Runtime>(
                     Msg::CallDone { call_id, result } => {
                         if engine.in_flight() == Some(call_id) {
                             cancel = None;
+                            if !calls_allowed(&calls_off) {
+                                // A result that was already queued when assist
+                                // was turned off or Stop was pressed: drop it.
+                                engine.on_call_failed(call_id);
+                            }
                         }
                         let since_final = trigger.filter(|(id, _)| *id == call_id).map(|(_, at)| at.elapsed());
                         apply_result(&app, &mut engine, call_id, result, since_final);
@@ -216,26 +230,25 @@ async fn run<R: Runtime>(
             }
             _ = tick.tick() => {}
         }
-        if stopped.is_cancelled() {
-            break;
-        }
 
-        let enabled = ENABLED.load(Ordering::SeqCst);
-        if !enabled {
+        let allowed = calls_allowed(&calls_off);
+        if !allowed {
             if let Some(token) = cancel.take() {
                 token.cancel();
                 if let Some(id) = engine.in_flight() {
-                    info!("live assist: turned off, cancelling call {id}");
+                    info!("live assist: calls stopped, cancelling call {id}");
                     engine.on_call_failed(id);
                 }
             }
         }
+        // The status reports the setting, not Stop: the UI mirrors it.
+        let enabled = ENABLED.load(Ordering::SeqCst);
         if enabled != was_enabled {
             emit_status(&app, if enabled { "idle" } else { "off" }, None);
             was_enabled = enabled;
         }
-        if let Some(request) = engine.poll(Instant::now(), enabled) {
-            let token = stopped.child_token();
+        if let Some(request) = engine.poll(Instant::now(), allowed) {
+            let token = calls_off.child_token();
             cancel = Some(token.clone());
             let prompt = cards::user_prompt(
                 request.lines.iter().map(|l| (l.side, l.text.as_str())),
@@ -269,6 +282,11 @@ async fn run<R: Runtime>(
     }
     save_pins(folder.as_deref(), &engine.pinned());
     emit_status(&app, "stopped", None);
+}
+
+/// Calls may run: assist is on and Stop has not been pressed.
+fn calls_allowed(calls_off: &CancellationToken) -> bool {
+    ENABLED.load(Ordering::SeqCst) && !calls_off.is_cancelled()
 }
 
 fn apply_result<R: Runtime>(

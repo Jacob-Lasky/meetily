@@ -700,8 +700,9 @@ pub async fn stop_recording<R: Runtime>(
     }
 
     // No live-assist calls once Stop is pressed: suggestions are for the
-    // call, not for the transcript drain below. This also saves its pins.
-    crate::live_assist::stop_session(&app);
+    // call, not for the transcript drain below. The session itself keeps
+    // following retractions until the drain ends (stop_session below).
+    crate::live_assist::stop_calls();
 
     // Emit shutdown progress to frontend
     let _ = app.emit(
@@ -746,6 +747,7 @@ pub async fn stop_recording<R: Runtime>(
         }
         Err(e) => {
             error!("❌ Failed to stop audio streams: {}", e);
+            crate::live_assist::stop_session(&app);
             return Err(format!("Failed to stop audio streams: {}", e)); // _stopping_guard clears on return
         }
     }
@@ -827,6 +829,9 @@ pub async fn stop_recording<R: Runtime>(
         }
         info!("✅ Transcript update/retract listeners removed");
     }
+    // Same point for live assist: a bleed retraction during the drain still
+    // withdraws (and un-saves) a pinned card built from that line.
+    crate::live_assist::stop_session(&app);
 
     // Step 3: Now safely unload Whisper model after ALL chunks are processed
     let _ = app.emit(

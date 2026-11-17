@@ -61,14 +61,17 @@ export function withCard(cards: AssistCard[], card: AssistCard): AssistCard[] {
 
 /**
  * Cards after a remount sync: the backend's list, plus live cards that arrived
- * while it was fetched, minus cards withdrawn meanwhile.
+ * while it was fetched, minus cards withdrawn meanwhile. For a card in both,
+ * the current copy wins: it may carry a pin made after the snapshot was taken.
  */
 export function mergeSynced(
   backend: AssistCard[],
   current: AssistCard[],
   withdrawn: ReadonlySet<string>,
 ): AssistCard[] {
-  return withAdded(backend, current).filter((c) => !withdrawn.has(c.id));
+  const currentById = new Map(current.map((c) => [c.id, c]));
+  const synced = backend.map((c) => currentById.get(c.id) ?? c);
+  return withAdded(synced, current).filter((c) => !withdrawn.has(c.id));
 }
 
 export const KIND_LABEL: Record<AssistCardKind, string> = {

@@ -66,6 +66,9 @@ static HTTP: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
 struct Session {
     tx: mpsc::UnboundedSender<Msg>,
     listeners: Vec<tauri::EventId>,
+    /// Cancelled by stop_session itself, so the actor starts no call after
+    /// Stop even when a tick or queued line is handled before `Msg::Stop`.
+    stopped: CancellationToken,
 }
 
 enum Msg {
@@ -73,7 +76,7 @@ enum Msg {
     Retract(u64),
     CallDone { call_id: u64, result: Result<String, String> },
     Dismiss(String),
-    Pin { id: String, pinned: bool, reply: oneshot::Sender<Option<Card>> },
+    Pin { id: String, pinned: bool, reply: oneshot::Sender<Result<Card, String>> },
     Cards(oneshot::Sender<Vec<Card>>),
     Stop,
 }
@@ -132,8 +135,9 @@ pub fn start_session<R: Runtime>(app: &AppHandle<R>, meeting_folder: Option<Path
         }
     });
 
-    tauri::async_runtime::spawn(run(app.clone(), rx, tx.clone(), meeting_folder));
-    *SESSION.lock().unwrap() = Some(Session { tx, listeners: vec![update_id, retract_id] });
+    let stopped = CancellationToken::new();
+    tauri::async_runtime::spawn(run(app.clone(), rx, tx.clone(), meeting_folder, stopped.clone()));
+    *SESSION.lock().unwrap() = Some(Session { tx, listeners: vec![update_id, retract_id], stopped });
     info!("live assist: session started (enabled={})", ENABLED.load(Ordering::SeqCst));
 }
 
@@ -143,6 +147,7 @@ pub fn stop_session<R: Runtime>(app: &AppHandle<R>) {
     let Some(session) = SESSION.lock().unwrap().take() else {
         return;
     };
+    session.stopped.cancel();
     for id in session.listeners {
         app.unlisten(id);
     }
@@ -159,6 +164,7 @@ async fn run<R: Runtime>(
     mut rx: mpsc::UnboundedReceiver<Msg>,
     tx: mpsc::UnboundedSender<Msg>,
     folder: Option<PathBuf>,
+    stopped: CancellationToken,
 ) {
     let mut engine = Engine::new(Config::default());
     let mut cancel: Option<CancellationToken> = None;
@@ -201,11 +207,7 @@ async fn run<R: Runtime>(
                         }
                     }
                     Msg::Pin { id, pinned, reply } => {
-                        let card = engine.set_pinned(&id, pinned);
-                        if card.is_some() {
-                            save_pins(folder.as_deref(), &engine.pinned());
-                        }
-                        let _ = reply.send(card);
+                        let _ = reply.send(pin_and_save(&mut engine, folder.as_deref(), &id, pinned));
                     }
                     Msg::Cards(reply) => {
                         let _ = reply.send(engine.cards().to_vec());
@@ -213,6 +215,9 @@ async fn run<R: Runtime>(
                 }
             }
             _ = tick.tick() => {}
+        }
+        if stopped.is_cancelled() {
+            break;
         }
 
         let enabled = ENABLED.load(Ordering::SeqCst);
@@ -230,7 +235,7 @@ async fn run<R: Runtime>(
             was_enabled = enabled;
         }
         if let Some(request) = engine.poll(Instant::now(), enabled) {
-            let token = CancellationToken::new();
+            let token = stopped.child_token();
             cancel = Some(token.clone());
             let prompt = cards::user_prompt(
                 request.lines.iter().map(|l| (l.side, l.text.as_str())),
@@ -273,14 +278,16 @@ fn apply_result<R: Runtime>(
     result: Result<String, String>,
     since_final: Option<Duration>,
 ) {
+    if engine.in_flight() != Some(call_id) {
+        // Cancelled (assist turned off, or stopped) before it returned.
+        return;
+    }
     let output = match result {
         Ok(output) => output,
         Err(e) => {
-            if engine.in_flight() == Some(call_id) {
-                warn!("live assist: call {call_id} failed: {e}");
-                engine.on_call_failed(call_id);
-                emit_status(app, "error", Some(e));
-            }
+            warn!("live assist: call {call_id} failed: {e}");
+            engine.on_call_failed(call_id);
+            emit_status(app, "error", Some(e));
             return;
         }
     };
@@ -381,6 +388,26 @@ struct PinsFile {
     cards: Vec<Card>,
 }
 
+/// Pin or unpin a card and write the pins. If they cannot be written, the
+/// pin is undone and the error returned, so the UI never shows a pin that
+/// will not be kept with the meeting.
+fn pin_and_save(engine: &mut Engine, folder: Option<&Path>, id: &str, pinned: bool) -> Result<Card, String> {
+    let before = engine.cards().iter().find(|c| c.id == id).map(|c| c.pinned).ok_or("card not found")?;
+    let card = engine.set_pinned(id, pinned).ok_or("card not found")?;
+    let saved = match folder {
+        Some(folder) => write_pins(folder, &engine.pinned())
+            .map_err(|e| format!("could not save pinned cards in {}: {e}", folder.display())),
+        None if pinned => Err("this recording has no meeting folder, so pins cannot be kept".to_string()),
+        None => Ok(()),
+    };
+    if let Err(e) = saved {
+        engine.set_pinned(id, before);
+        error!("live assist: {e}");
+        return Err(e);
+    }
+    Ok(card)
+}
+
 fn save_pins(folder: Option<&Path>, pinned: &[Card]) {
     let Some(folder) = folder else {
         if !pinned.is_empty() {
@@ -457,7 +484,7 @@ pub async fn live_assist_set_pinned(id: String, pinned: bool) -> Result<Card, St
     let tx = session_tx().ok_or("not recording")?;
     let (reply, rx) = oneshot::channel();
     tx.send(Msg::Pin { id, pinned, reply }).map_err(|_| "not recording")?;
-    rx.await.map_err(|_| "not recording")?.ok_or_else(|| "card not found".to_string())
+    rx.await.map_err(|_| "not recording")?
 }
 
 /// Pinned cards saved with a meeting (empty when it has none).
@@ -500,6 +527,38 @@ mod tests {
         assert_eq!(read_pins(dir.path()), Ok(vec![]), "unpinning the last card empties the file");
         let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(leftovers, vec![std::ffi::OsString::from(PINS_FILE)], "no temp file left behind");
+    }
+
+    fn engine_with_one_card() -> (Engine, String) {
+        use std::time::Instant;
+        let t0 = Instant::now();
+        let mut engine = Engine::new(Config::default());
+        engine.on_line(1, Side::Them, "can you send pricing", t0);
+        let call = engine.poll(t0 + std::time::Duration::from_secs(2), true).unwrap();
+        let raw = vec![super::cards::RawCard { kind: CardKind::Todo, text: "Send pricing".into(), quote: String::new() }];
+        let id = engine.on_call_done(call.call_id, raw, 0).added[0].id.clone();
+        (engine, id)
+    }
+
+    #[test]
+    fn pinning_writes_the_meeting_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, id) = engine_with_one_card();
+        assert!(pin_and_save(&mut engine, Some(dir.path()), &id, true).unwrap().pinned);
+        assert_eq!(read_pins(dir.path()).unwrap().len(), 1);
+        assert!(!pin_and_save(&mut engine, Some(dir.path()), &id, false).unwrap().pinned);
+        assert_eq!(read_pins(dir.path()), Ok(vec![]));
+    }
+
+    #[test]
+    fn a_pin_that_cannot_be_saved_is_undone_and_reported() {
+        let (mut engine, id) = engine_with_one_card();
+        assert!(pin_and_save(&mut engine, None, &id, true).is_err(), "no meeting folder");
+        assert!(engine.pinned().is_empty());
+        let missing = std::path::Path::new("/nonexistent/w524/folder");
+        assert!(pin_and_save(&mut engine, Some(missing), &id, true).is_err(), "write failure");
+        assert!(engine.pinned().is_empty());
+        assert_eq!(pin_and_save(&mut engine, None, "nope", true), Err("card not found".to_string()));
     }
 
     #[test]

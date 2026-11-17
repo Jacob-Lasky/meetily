@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
+import { toast } from 'sonner';
 import { ChevronLeft, ChevronRight, Loader2, Pin, PinOff, Sparkles, TriangleAlert, X } from 'lucide-react';
 import {
   ASSIST_STATUS_EVENT,
@@ -70,12 +71,19 @@ export function LiveAssistPanel({ isRecording }: { isRecording: boolean }) {
   // (navigating back from another page) picks up the session's cards.
   useEffect(() => {
     if (!isRecording) return;
+    // A fetch still pending when this recording stops must not fill the next one.
+    let current = true;
     withdrawnRef.current = new Set();
     setStatus({ state: 'idle' });
     invoke<AssistCard[]>('live_assist_get_cards')
-      .then((backend) => setCards((prev) => mergeSynced(backend, prev, withdrawnRef.current)))
+      .then((backend) => {
+        if (current) setCards((prev) => mergeSynced(backend, prev, withdrawnRef.current));
+      })
       .catch((e) => console.error('live assist: could not load cards', e));
-    return () => setCards([]);
+    return () => {
+      current = false;
+      setCards([]);
+    };
   }, [isRecording]);
 
   if (!enabled || !isRecording) return null;
@@ -92,11 +100,13 @@ export function LiveAssistPanel({ isRecording }: { isRecording: boolean }) {
       const updated = await invoke<AssistCard>('live_assist_set_pinned', { id: card.id, pinned });
       setCards((prev) => withCard(prev, updated));
     } catch (e) {
-      console.error('live assist: pin failed', e);
+      toast.error(pinned ? 'Could not pin the card' : 'Could not unpin the card', { description: String(e) });
     }
   };
 
   const dismiss = (card: AssistCard) => {
+    // Also keeps a card-list sync still in flight from bringing it back.
+    withdrawnRef.current.add(card.id);
     setCards((prev) => withoutIds(prev, [card.id]));
     invoke('live_assist_dismiss', { id: card.id }).catch((e) => console.error('live assist: dismiss failed', e));
   };

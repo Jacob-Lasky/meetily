@@ -192,9 +192,12 @@ impl Engine {
     /// to a line retracted mid-call, and repeats of a card already shown, are
     /// dropped. A result for a call that is no longer in flight is ignored.
     pub fn on_call_done(&mut self, call_id: u64, raw: Vec<RawCard>, created_at_ms: i64) -> Applied {
-        let Some(call) = self.in_flight.take().filter(|c| c.call_id == call_id) else {
+        // Check the id BEFORE taking: a late result for a cancelled call must
+        // not clear the newer call that is in flight now.
+        if self.in_flight() != Some(call_id) {
             return Applied::default();
-        };
+        }
+        let Some(call) = self.in_flight.take() else { return Applied::default() };
         let retracted = std::mem::take(&mut self.retracted_in_flight);
         let mut added = Vec::new();
         for card in raw {
@@ -414,6 +417,21 @@ mod tests {
         assert!(e.poll(t0 + ms(2100), true).is_none(), "a trigger from while it was off fired later");
         e.on_line(2, Side::Them, "b", t0 + ms(3000));
         assert!(e.poll(t0 + ms(4500), true).is_some(), "new speech after turning on still triggers");
+    }
+
+    #[test]
+    fn a_late_result_does_not_clear_the_newer_call_in_flight() {
+        let t0 = Instant::now();
+        let mut e = Engine::new(Config::default());
+        e.on_line(1, Side::Them, "a", t0);
+        let first = e.poll(t0 + ms(1500), true).unwrap();
+        e.on_call_failed(first.call_id); // cancelled (assist turned off and on again)
+        e.on_line(2, Side::Them, "b", t0 + ms(5000));
+        let second = e.poll(t0 + ms(6500), true).unwrap();
+        e.on_call_done(first.call_id, vec![raw(CardKind::Ask, "late", "a")], 0);
+        assert_eq!(e.in_flight(), Some(second.call_id), "the late result cleared the newer call");
+        let applied = e.on_call_done(second.call_id, vec![raw(CardKind::Ask, "fresh", "b")], 0);
+        assert_eq!(applied.added.len(), 1);
     }
 
     #[test]

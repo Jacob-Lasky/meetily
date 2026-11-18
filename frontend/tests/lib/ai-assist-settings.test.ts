@@ -1,11 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  type AssistSettings,
-  DEFAULT_SETTINGS,
   briefEntry,
-  contextChars,
-  MAX_CONTEXT_CHARS,
-  overviewIncluded,
   deepHiveServer,
   formatPairs,
   joinCommand,
@@ -37,27 +32,6 @@ describe('AI Assist settings helpers', () => {
     });
     expect(formatPairs({ A: '1' }, '=')).toBe('A=1');
     expect(formatPairs({ Authorization: 'Bearer x' }, ':')).toBe('Authorization: Bearer x');
-  });
-
-  test('context size counts about me and enabled knowledge only', () => {
-    const s: AssistSettings = {
-      ...DEFAULT_SETTINGS,
-      aboutMe: 'abc',
-      knowledge: [
-        { id: '1', name: 'a', text: 'hello', enabled: true },
-        { id: '2', name: 'b', text: 'ignored', enabled: false },
-      ],
-    };
-    expect(contextChars(s)).toBe(8);
-    expect(contextChars(s, 100)).toBe(108);
-    expect(contextChars({ ...s, builtin: { ...s.builtin, deepgramOverview: false } }, 100)).toBe(8);
-    // An overview that does not fit is left out.
-    expect(contextChars(s, MAX_CONTEXT_CHARS)).toBe(8);
-    // The meeting brief counts, and can push the overview out.
-    expect(contextChars(s, 100, 50)).toBe(158);
-    expect(overviewIncluded(s, 100, 50)).toBe(true);
-    expect(overviewIncluded(s, 100, MAX_CONTEXT_CHARS - 100)).toBe(false);
-    expect(contextChars(s, 100, MAX_CONTEXT_CHARS - 100)).toBe(8 + MAX_CONTEXT_CHARS - 100);
   });
 
   test('the DeepHive preset is the stdio relay limited to search_knowledge', () => {

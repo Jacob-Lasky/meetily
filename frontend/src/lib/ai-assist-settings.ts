@@ -46,6 +46,16 @@ export interface PromptPreview {
   built_in: string;
   full: string;
   research: string | null;
+  /** The backend's own count against MAX_CONTEXT_CHARS, brief included. */
+  context_chars: number;
+  /** Whether the built-in overview fits and goes into the prompt. */
+  overview_included: boolean;
+  brief_chars: number;
+}
+
+/** What `ai_assist_save_settings` reports back. */
+export interface SavedSettings {
+  overview_included: boolean;
 }
 
 export interface EarlierMeeting {
@@ -79,30 +89,6 @@ export const DEFAULT_SETTINGS: AssistSettings = {
 
 /** Same as settings.rs BUILTIN_DOCS_NAME: user servers cannot take it. */
 export const BUILTIN_DOCS_NAME = 'Deepgram docs';
-
-function ownChars(s: AssistSettings): number {
-  return [...s.aboutMe].length + s.knowledge.filter((k) => k.enabled).reduce((n, k) => n + [...k.text].length, 0);
-}
-
-/**
- * Whether the built-in overview goes into the prompt: on, and it fits with
- * about me, enabled knowledge and the meeting brief (settings.rs
- * `overview_included`; the backend leaves it out otherwise).
- */
-export function overviewIncluded(s: AssistSettings, builtinChars: number, briefChars = 0): boolean {
-  return s.builtin.deepgramOverview && ownChars(s) + briefChars + builtinChars <= MAX_CONTEXT_CHARS;
-}
-
-/**
- * Characters of standing context the backend counts against
- * MAX_CONTEXT_CHARS (settings.rs `context_chars`): about me, enabled
- * knowledge, the meeting brief (`briefChars`) and the built-in overview
- * (`builtinChars`, its length) when it is included.
- */
-export function contextChars(s: AssistSettings, builtinChars = 0, briefChars = 0): number {
-  const overview = overviewIncluded(s, builtinChars, briefChars) ? builtinChars : 0;
-  return ownChars(s) + briefChars + overview;
-}
 
 export function newId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;

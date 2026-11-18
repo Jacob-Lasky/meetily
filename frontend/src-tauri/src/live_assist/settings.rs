@@ -427,6 +427,17 @@ mod tests {
     }
 
     #[test]
+    fn the_brief_counts_and_can_push_the_overview_out() {
+        let overview = DEEPGRAM_PUBLIC.chars().count();
+        let mut s = AssistSettings::default();
+        s.about_me = "x".repeat(MAX_CONTEXT_CHARS - overview - 100);
+        assert!(s.overview_included(100));
+        assert_eq!(s.context_chars(100), MAX_CONTEXT_CHARS);
+        assert!(!s.overview_included(101), "one more brief character and it no longer fits");
+        assert_eq!(s.context_chars(101), MAX_CONTEXT_CHARS - overview + 1);
+    }
+
+    #[test]
     fn active_servers_need_research_and_the_server_on() {
         let mut r = Research { enabled: false, ..Default::default() };
         r.servers.push(McpServer {

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { homeDir } from '@tauri-apps/api/path';
 import { toast } from 'sonner';
 import { BookOpen, Bot, FileText, Plug, Plus, RotateCcw, Trash2, Upload, UserRound, Wrench } from 'lucide-react';
@@ -19,8 +20,7 @@ import {
   McpServer,
   McpToolInfo,
   PromptPreview,
-  contextChars,
-  overviewIncluded,
+  SavedSettings,
   deepHiveServer,
   formatPairs,
   joinCommand,
@@ -28,7 +28,7 @@ import {
   parsePairs,
   splitCommand,
 } from '@/lib/ai-assist-settings';
-import { KIND_LABEL, type AssistCardKind } from '@/lib/live-assist';
+import { ASSIST_BRIEF_CLEARED_EVENT, KIND_LABEL, type AssistCardKind } from '@/lib/live-assist';
 import type { LiveEngine } from '@/lib/live-engine';
 
 const PROVIDERS: { value: string; label: string }[] = [
@@ -74,9 +74,6 @@ export function AIAssistSettings() {
   const [preview, setPreview] = useState<PromptPreview | null>(null);
   const [saving, setSaving] = useState(false);
   const [builtinText, setBuiltinText] = useState<string | null>(null);
-  // The saved meeting brief's length: the backend counts it against the
-  // context limit too (settings.rs `context_chars`).
-  const [briefChars, setBriefChars] = useState(0);
   // Bumped when the form is replaced wholesale (Discard), so editors that
   // keep their own text (command line, env/header pairs) start over from it.
   const [revision, setRevision] = useState(0);
@@ -99,20 +96,33 @@ export function AIAssistSettings() {
     invoke<string>('ai_assist_builtin_knowledge')
       .then(setBuiltinText)
       .catch(() => setBuiltinText(''));
-    invoke<string>('ai_assist_get_brief')
-      .then((b) => setBriefChars([...b].length))
-      .catch(() => setBriefChars(0));
   }, []);
 
-  // The prompt as it would be with the unsaved form.
+  // The prompt as it would be with the unsaved form, and the backend's own
+  // context count (brief included). Asked again when the brief is cleared at
+  // the end of a recording and when the window regains focus.
+  const [briefTick, setBriefTick] = useState(0);
   useEffect(() => {
+    const bump = () => setBriefTick((n) => n + 1);
+    const unlisten = listen(ASSIST_BRIEF_CLEARED_EVENT, bump);
+    window.addEventListener('focus', bump);
+    return () => {
+      unlisten.then((f) => f()).catch(() => {});
+      window.removeEventListener('focus', bump);
+    };
+  }, []);
+  useEffect(() => {
+    let live = true;
     const t = setTimeout(() => {
       invoke<PromptPreview>('ai_assist_prompt_preview', { settings: form })
-        .then(setPreview)
+        .then((p) => live && setPreview(p))
         .catch((e) => console.error('ai assist: prompt preview failed', e));
     }, 300);
-    return () => clearTimeout(t);
-  }, [form]);
+    return () => {
+      live = false;
+      clearTimeout(t);
+    };
+  }, [form, briefTick]);
 
   const dirty = useMemo(() => saved !== null && JSON.stringify(saved) !== JSON.stringify(form), [saved, form]);
   const update = useCallback((patch: Partial<AssistSettings>) => setForm((f) => ({ ...f, ...patch })), []);
@@ -120,9 +130,15 @@ export function AIAssistSettings() {
   const save = async () => {
     setSaving(true);
     try {
-      await invoke('ai_assist_save_settings', { settings: form });
+      const result = await invoke<SavedSettings>('ai_assist_save_settings', { settings: form });
       setSaved(form);
-      toast.success('AI Assist settings saved');
+      if (form.builtin.deepgramOverview && !result.overview_included) {
+        toast.warning('AI Assist settings saved, without the built-in overview', {
+          description: 'It does not fit with your own context and the meeting brief. Turn some knowledge off to bring it back.',
+        });
+      } else {
+        toast.success('AI Assist settings saved');
+      }
     } catch (e) {
       toast.error('Could not save the AI Assist settings', { description: String(e) });
     } finally {
@@ -134,9 +150,10 @@ export function AIAssistSettings() {
     return <p className="text-sm text-gray-500 p-6">Loading…</p>;
   }
 
-  const builtinChars = builtinText ? [...builtinText].length : 0;
-  const chars = contextChars(form, builtinChars, briefChars);
-  const overviewIn = overviewIncluded(form, builtinChars, briefChars);
+  // Null until the backend has counted this form (and the current brief).
+  const chars = preview?.context_chars ?? null;
+  const briefChars = preview?.brief_chars ?? 0;
+  const overviewIn = preview?.overview_included ?? true;
 
   return (
     <div className="space-y-6 mt-6 pb-24" data-testid="ai-assist-settings">
@@ -357,7 +374,7 @@ function KnowledgeSection({
   briefChars,
   builtinText,
   overviewIn,
-}: SectionProps & { chars: number; briefChars: number; builtinText: string | null; overviewIn: boolean }) {
+}: SectionProps & { chars: number | null; briefChars: number; builtinText: string | null; overviewIn: boolean }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const [draftName, setDraftName] = useState('');
   const [draftText, setDraftText] = useState('');
@@ -388,7 +405,7 @@ function KnowledgeSection({
     if (fileRef.current) fileRef.current.value = '';
   };
 
-  const over = chars > MAX_CONTEXT_CHARS;
+  const over = chars !== null && chars > MAX_CONTEXT_CHARS;
 
   return (
     <div className={section}>
@@ -477,8 +494,10 @@ function KnowledgeSection({
         </div>
       </div>
       <p className={`text-xs mt-2 ${over ? 'text-red-600' : 'text-gray-500'}`}>
-        {briefChars > 0 ? 'Built-in overview, about me, enabled knowledge and the meeting brief' : 'Built-in overview, about me and enabled knowledge'}
-        : {chars.toLocaleString()} / {MAX_CONTEXT_CHARS.toLocaleString()} characters
+        {briefChars > 0
+          ? 'Built-in overview, about me, enabled knowledge and the meeting brief'
+          : 'Built-in overview, about me and enabled knowledge'}
+        : {chars === null ? '…' : chars.toLocaleString()} / {MAX_CONTEXT_CHARS.toLocaleString()} characters
         {over && ' — over the limit; turn some off to save'}
       </p>
     </div>

@@ -230,63 +230,69 @@ def tool_name_for(tool: str, server: str, taken: set[str]) -> str:
 MAX_TOOL_RESULT_CHARS = 8000
 
 
-#: A string value in a JSON result is not cut below this many characters.
-_MIN_JSON_STRING_CHARS = 200
+#: Room kept for a "[cut: N more characters]" marker.
+_CUT_MARKER_ROOM = 40
+
+
+def _cut_strings(node: Any, cap: int) -> Any:
+    """`node` with every string longer than `cap` plus the marker room cut to
+    `cap` characters and marked. Strings no longer than that stay whole, so
+    the result never grows and its size only rises with `cap`."""
+    if isinstance(node, str):
+        if len(node) <= cap + _CUT_MARKER_ROOM:
+            return node
+        return node[:cap] + f" [cut: {len(node) - cap} more characters]"
+    if isinstance(node, dict):
+        return {k: _cut_strings(v, cap) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_cut_strings(v, cap) for v in node]
+    return node
 
 
 def _clip_json(text: str) -> str | None:
-    """A JSON object or array result, shortened by cutting its longest string
-    values until it fits, so it stays valid JSON and keeps every field (an
-    answer after a long context field survives). None when the text is not
-    JSON, or when cutting strings cannot make it fit."""
-    stripped = text.lstrip()
-    if not stripped.startswith(("{", "[")):
+    """A JSON result, shortened so it stays valid JSON and keeps every field
+    (an answer after a long context field survives): every string longer than
+    one shared cap is cut to it, the largest cap that fits found by bisection.
+    None when the text is not JSON, is nested too deep to walk, or does not
+    fit even with every string cut to nothing (then the plain cut applies)."""
+    if not text.lstrip().startswith(("{", "[", '"')):
         return None
     try:
         value = json.loads(text)
-    except ValueError:
-        return None
 
-    def strings(node: Any, out: list[tuple[Any, Any]]) -> None:
-        items = node.items() if isinstance(node, dict) else enumerate(node) if isinstance(node, list) else ()
-        for key, child in items:
-            if isinstance(child, str):
-                out.append((node, key))
+        def dumped(cap: int) -> str:
+            return json.dumps(_cut_strings(value, cap), ensure_ascii=False)
+
+        best = dumped(0)
+        if len(best) > MAX_TOOL_RESULT_CHARS:
+            return None
+        low, high = 0, MAX_TOOL_RESULT_CHARS
+        while low < high:
+            mid = (low + high + 1) // 2
+            out = dumped(mid)
+            if len(out) <= MAX_TOOL_RESULT_CHARS:
+                low, best = mid, out
             else:
-                strings(child, out)
-
-    for _ in range(64):
-        dumped = json.dumps(value, ensure_ascii=False)
-        excess = len(dumped) - MAX_TOOL_RESULT_CHARS
-        if excess <= 0:
-            return dumped
-        found: list[tuple[Any, Any]] = []
-        strings(value, found)
-        if not found:
-            return None
-        node, key = max(found, key=lambda ref: len(ref[0][ref[1]]))
-        s = node[key]
-        marker_room = 40
-        keep = max(_MIN_JSON_STRING_CHARS, len(s) - excess - marker_room)
-        if keep >= len(s):
-            return None
-        node[key] = s[:keep] + f" [cut: {len(s) - keep} more characters]"
-    return None
+                high = mid - 1
+        return best
+    except (ValueError, RecursionError):
+        return None
 
 
 def clip_tool_result(text: str) -> str:
-    """Fit a tool result under MAX_TOOL_RESULT_CHARS and say what was left
-    out. A JSON result keeps its structure (`_clip_json`); other text is cut
-    at the last line break before the limit (docs results are line-oriented
-    markdown)."""
+    """Fit a tool result in MAX_TOOL_RESULT_CHARS, marker included, and say
+    what was left out. A JSON result keeps its structure (`_clip_json`);
+    other text is cut at the last line break before the limit (docs results
+    are line-oriented markdown)."""
     if len(text) <= MAX_TOOL_RESULT_CHARS:
         return text
     clipped = _clip_json(text)
     if clipped is not None:
         return clipped
-    cut = text.rfind("\n", 0, MAX_TOOL_RESULT_CHARS)
-    if cut < MAX_TOOL_RESULT_CHARS // 2:
-        cut = MAX_TOOL_RESULT_CHARS
+    budget = MAX_TOOL_RESULT_CHARS - _CUT_MARKER_ROOM
+    cut = text.rfind("\n", 0, budget)
+    if cut < budget // 2:
+        cut = budget
     return text[:cut] + f"\n[cut: {len(text) - cut} more characters]"
 
 

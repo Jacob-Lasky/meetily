@@ -1001,7 +1001,15 @@ pub fn load_settings<R: Runtime>(app: &AppHandle<R>) -> AssistSettings {
 
 /// Validate and save Settings › AI Assist; a running call picks them up at
 /// once (the Direct engine reads them per call, the sidecar is re-sent its config).
-pub async fn save_settings<R: Runtime>(app: &AppHandle<R>, settings: &AssistSettings) -> Result<(), String> {
+/// What a save reports back: whether the built-in overview made it into the
+/// prompt with the brief stored at that moment (it steps out when it does
+/// not fit, `AssistSettings::overview_included`).
+#[derive(Serialize)]
+pub struct SavedSettings {
+    overview_included: bool,
+}
+
+pub async fn save_settings<R: Runtime>(app: &AppHandle<R>, settings: &AssistSettings) -> Result<SavedSettings, String> {
     settings.validate(load_brief(app).chars().count())?;
     if settings.model.is_some() {
         // A model of its own must be callable: same key and endpoint rules
@@ -1011,13 +1019,14 @@ pub async fn save_settings<R: Runtime>(app: &AppHandle<R>, settings: &AssistSett
     // Settings and brief share one limit: check and store under one lock,
     // so a brief saved meanwhile is counted.
     let _guard = CONTEXT_SAVE.lock().unwrap();
-    settings.validate(load_brief(app).chars().count())?;
+    let brief_chars = load_brief(app).chars().count();
+    settings.validate(brief_chars)?;
     let store = app.store(SETTINGS_STORE).map_err(|e| format!("settings store unavailable: {e}"))?;
     store.set(SETTINGS_KEY, serde_json::to_value(settings).map_err(|e| e.to_string())?);
     store.save().map_err(|e| format!("could not save the AI Assist settings: {e}"))?;
     info!("live assist: AI Assist settings saved");
     reconfigure_session();
-    Ok(())
+    Ok(SavedSettings { overview_included: settings.overview_included(brief_chars) })
 }
 
 pub fn load_brief<R: Runtime>(app: &AppHandle<R>) -> String {
@@ -1222,7 +1231,10 @@ pub async fn ai_assist_get_settings<R: Runtime>(app: AppHandle<R>) -> AssistSett
 }
 
 #[tauri::command]
-pub async fn ai_assist_save_settings<R: Runtime>(app: AppHandle<R>, settings: AssistSettings) -> Result<(), String> {
+pub async fn ai_assist_save_settings<R: Runtime>(
+    app: AppHandle<R>,
+    settings: AssistSettings,
+) -> Result<SavedSettings, String> {
     save_settings(&app, &settings).await
 }
 
@@ -1239,12 +1251,17 @@ pub async fn ai_assist_set_brief<R: Runtime>(app: AppHandle<R>, brief: String) -
 /// What Settings shows: the built-in rules (not editable) and the full
 /// system prompt these settings and the current brief produce. `settings`
 /// is the unsaved form; `research` is whether the Pipecat engine's lane
-/// would be on.
+/// would be on. `context_chars` and `overview_included` are the backend's
+/// own count against MAX_CONTEXT_CHARS (brief included), so Settings never
+/// keeps a second copy of that rule.
 #[derive(Serialize)]
 pub struct PromptPreview {
     built_in: String,
     full: String,
     research: Option<String>,
+    context_chars: usize,
+    overview_included: bool,
+    brief_chars: usize,
 }
 
 #[tauri::command]
@@ -1252,10 +1269,14 @@ pub async fn ai_assist_prompt_preview<R: Runtime>(app: AppHandle<R>, settings: A
     let brief = load_brief(&app);
     let research = research_wanted(&settings);
     let parts = prompt_parts(&settings, &brief, research);
+    let brief_chars = brief.chars().count();
     PromptPreview {
         built_in: cards::built_in_rules(&parts),
         full: cards::system_prompt(&parts),
         research: research.then(|| cards::research_prompt(&prompt_parts(&settings, &brief, true))),
+        context_chars: settings.context_chars(brief_chars),
+        overview_included: settings.overview_included(brief_chars),
+        brief_chars,
     }
 }
 

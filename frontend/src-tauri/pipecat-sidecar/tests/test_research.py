@@ -624,7 +624,7 @@ async def test_long_tool_results_are_cut_before_the_model_sees_them():
     r = await configured([], tools=FakeTools(answers={"search_knowledge": "x" * (MAX_TOOL_RESULT_CHARS + 500)}), loop=loop)
     r.ask("q?", "t")
     await settle()
-    assert len(seen[0]) < MAX_TOOL_RESULT_CHARS + 100 and seen[0].endswith("[cut: 500 more characters]")
+    assert len(seen[0]) <= MAX_TOOL_RESULT_CHARS and seen[0].endswith("more characters]")
 
 
 def test_a_cut_falls_on_a_line_break():
@@ -649,6 +649,25 @@ def test_a_json_result_stays_valid_and_keeps_every_field():
     parsed = json.loads(out)
     assert parsed["results"][0]["answer"] == "Flux is 260 ms"
     assert "[cut: " in parsed["context"]
-    # Many short strings that cannot be cut fall back to the plain cut.
-    many = json.dumps(["s" * 150] * 100)
-    assert clip_tool_result(many).rsplit("\n[cut: ", 1)[1].endswith("more characters]")
+    # Many long strings share one cap, so every field survives.
+    rows = {"results": [{"body": "b" * 1000, "n": i} for i in range(65)], "answer": "use Flux"}
+    out = clip_tool_result(json.dumps(rows))
+    assert len(out) <= MAX_TOOL_RESULT_CHARS
+    parsed = json.loads(out)
+    assert parsed["answer"] == "use Flux" and [r["n"] for r in parsed["results"]] == list(range(65))
+    # A JSON string scalar stays a JSON string.
+    assert json.loads(clip_tool_result(json.dumps("s" * 9000))).startswith("sss")
+
+
+def test_results_that_cannot_keep_their_structure_get_the_plain_cut_within_the_limit():
+    import json
+
+    from meetily_sidecar.research import MAX_TOOL_RESULT_CHARS, clip_tool_result
+
+    # Structure alone over the limit (numbers cannot be cut).
+    numbers = json.dumps(list(range(3000)))
+    # Nested deeper than Python will walk.
+    deep = "[" * 5000 + '"' + "x" * 8100 + '"' + "]" * 5000
+    for text in (numbers, deep, "plain " * 2000):
+        out = clip_tool_result(text)
+        assert len(out) <= MAX_TOOL_RESULT_CHARS and out.endswith("more characters]")

@@ -307,7 +307,15 @@ def _clip_json(text: str) -> str | None:
     Counted markers first; when even a zero cap does not fit that way, a bare
     ellipsis. None when the text is not JSON, is nested too deep to walk, or
     does not fit even with every string cut to nothing (then the plain cut
-    applies)."""
+    applies).
+
+    Contract limit (WORK-581): guaranteed are valid JSON, every key and item
+    kept, at most MAX_TOOL_RESULT_CHARS, and every string no longer than the
+    cap whole. No field is privileged: which strings to put back whole when
+    many compete for the leftover room is a knapsack with no right answer
+    without knowing which field matters, so a short field (an answer) can be
+    left cut when hundreds of other strings are cut too. Docs searches, the
+    results this is sized for, return markdown text, not JSON."""
     if not text.lstrip().startswith(("{", "[", '"')):
         return None
     try:

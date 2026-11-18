@@ -71,7 +71,10 @@ impl LlmTarget {
                 Ok(None) => return Err("Custom OpenAI provider selected but no configuration found".to_string()),
                 Err(e) => return Err(format!("Failed to retrieve custom OpenAI config: {}", e)),
             };
-            info!("✓ Using custom OpenAI endpoint: {}", config.endpoint);
+            info!(
+                "✓ Using custom OpenAI endpoint_origin={}",
+                crate::utils::url_origin_for_log(&config.endpoint)
+            );
             target.api_key = config.api_key.unwrap_or_default();
             target.custom_openai_endpoint = Some(config.endpoint);
             target.custom_openai_max_tokens = config.max_tokens.map(|t| t as u32);

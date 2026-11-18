@@ -37,23 +37,26 @@ pub fn default_output_device() -> Result<AudioDevice> {
 
     #[cfg(target_os = "linux")]
     {
-        // DO NOT return cpal's default_output_device() here. On Linux, output
-        // capture is resolved by looking up an ALSA *input* device of the same
-        // name (see get_device_and_config), and the default output is named
-        // "default", which as an input is the microphone. Returning it made the
-        // "system audio" stream a second copy of the mic. System audio on Linux
-        // must come from a monitor source exposed as an ALSA capture PCM, e.g.
-        // a ~/.asoundrc `pcm.system_monitor { type pulse; device "@DEFAULT_MONITOR@" }`.
-        let host = cpal::default_host();
-        let names = host.input_devices()?.filter_map(|d| d.name().ok());
-        if let Some(name) = super::platform::linux::first_monitor_device_name(names) {
-            info!("🔊 Using monitor source for system audio: '{}'", name);
-            return Ok(AudioDevice::new(name, DeviceType::Output));
-        }
-        return Err(anyhow!(
-            "No monitor capture device found for system audio. Define an ALSA PCM whose \
-             name contains \"monitor\" that captures the PipeWire/PulseAudio default sink monitor"
-        ));
+        // System audio on Linux is captured natively via PulseAudio/PipeWire
+        // (see audio/capture/pulse_linux.rs), not via cpal's ALSA host, so the
+        // "default" device must be a real Pulse sink, identified by its exact
+        // name like configure_linux_audio() lists them. Use the server's actual default
+        // sink; the first listed sink is not necessarily the one in use.
+        let sink = match crate::audio::capture::default_pulse_sink() {
+            Ok(Some(sink)) => sink,
+            Ok(None) => {
+                return Err(anyhow!(
+                    "PulseAudio/PipeWire reports no default output with a monitor source"
+                ))
+            }
+            Err(e) => {
+                return Err(anyhow!(
+                    "System audio is unavailable. Ensure PulseAudio or PipeWire’s PulseAudio compatibility service is running. ({})",
+                    e
+                ))
+            }
+        };
+        return Ok(AudioDevice::new(sink.name, DeviceType::Output).with_default(true));
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]

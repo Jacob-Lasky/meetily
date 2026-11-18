@@ -20,7 +20,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use log::{error, info, warn};
 
 static METADATA_CACHE: LazyLock<ModelMetadataCache> =
     LazyLock::new(|| ModelMetadataCache::new(Duration::from_secs(300)));
@@ -603,8 +603,9 @@ impl SummaryService {
         error_msg: &str,
     ) {
         error!(
-            "Processing failed for meeting_id {}: {}",
-            meeting_id, error_msg
+            "Processing failed for meeting_id={}; error_bytes={}",
+            meeting_id,
+            error_msg.len()
         );
         match SummaryProcessesRepository::update_process_failed(
             pool,

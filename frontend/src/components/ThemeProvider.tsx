@@ -3,6 +3,7 @@
 import { useEffect } from 'react'
 import { ThemeProvider as NextThemesProvider, useTheme } from 'next-themes'
 import { isTauri } from '@tauri-apps/api/core'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import { Toaster } from 'sonner'
 
 export type ThemePreference = 'system' | 'light' | 'dark'
@@ -17,9 +18,13 @@ export const THEME_STORAGE_KEY = 'meetily-theme'
 function syncNativeWindowTheme(preference: string | null | undefined) {
   if (!isTauri()) return
   const native = preference === 'light' || preference === 'dark' ? preference : null
-  import('@tauri-apps/api/window')
-    .then(({ getCurrentWindow }) => getCurrentWindow().setTheme(native))
-    .catch((error) => console.warn('[Theme] Failed to set native window theme:', error))
+  const warn = (error: unknown) => console.warn('[Theme] Failed to set native window theme:', error)
+  try {
+    // Static import: a dynamic one would wait for a separate chunk to load.
+    getCurrentWindow().setTheme(native).catch(warn)
+  } catch (error) {
+    warn(error)
+  }
 }
 
 // Apply the stored preference as soon as this bundle loads rather than after
@@ -27,11 +32,13 @@ function syncNativeWindowTheme(preference: string | null | undefined) {
 // title bar mismatched only until the JS bundle has loaded. The window opens
 // with the OS theme because tauri.conf.json no longer forces one.
 if (typeof window !== 'undefined') {
+  let stored: string | null = null
   try {
-    syncNativeWindowTheme(window.localStorage.getItem(THEME_STORAGE_KEY))
+    stored = window.localStorage.getItem(THEME_STORAGE_KEY)
   } catch {
-    // localStorage unavailable: the effect below syncs after mount instead.
+    // localStorage unavailable: treat as System; the effect below resyncs.
   }
+  syncNativeWindowTheme(stored)
 }
 
 function NativeWindowThemeSync() {

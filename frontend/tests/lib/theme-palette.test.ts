@@ -104,4 +104,27 @@ describe('white labels on palette backgrounds', () => {
     expect(checked).toBeGreaterThan(20);
     expect(failures).toEqual([]);
   });
+
+  // The default Button variant's label is text-primary-foreground, which is
+  // dark in dark mode; overriding only its background hides the label.
+  test('Buttons that override the background also set the label colour', () => {
+    const failures: string[] = [];
+    let checked = 0;
+    for (const file of files) {
+      const src: string = fs.readFileSync(file, 'utf8');
+      for (const m of src.matchAll(/<Button\b((?:=>|[^>])*)>/g)) {
+        const attrs = m[1];
+        const variant = attrs.match(/variant=["{']+([a-z]+)/)?.[1] ?? 'default';
+        if (variant !== 'default') continue;
+        if (!/(?:^|[\s"'`])bg-(?!background|transparent)[a-z]+(?:-\d+)?(?![\w-])/.test(attrs)) continue;
+        checked++;
+        if (!/(?:^|[\s"'`])text-(?:white|[a-z]+-\d{2,3}|foreground|primary)(?![\w-])/.test(attrs)) {
+          const line = src.slice(0, m.index).split('\n').length;
+          failures.push(`${path.relative(root, file)}:${line}`);
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(2);
+    expect(failures).toEqual([]);
+  });
 });

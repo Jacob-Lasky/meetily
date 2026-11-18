@@ -308,6 +308,12 @@ struct SpeakerTurn {
     confidence: f32,
     /// Deepgram's 0-based diarization speaker id.
     speaker: i64,
+    /// The run's first and last word, as indexes into the final's word list
+    /// (the `src` of its `TimedWord`s). This, not time, is what puts a word
+    /// in a run when a line is cut: two speakers' words can share a start
+    /// time, and adjacent runs touch.
+    first_src: usize,
+    last_src: usize,
 }
 
 /// A final nova `Results` message: which channel it covers and its segment,
@@ -362,7 +368,7 @@ fn diarized_turns(words: &[DeepgramWord]) -> Vec<SpeakerTurn> {
     let Some(mut speaker) = words.iter().find_map(|w| w.speaker) else {
         return turns;
     };
-    for w in words {
+    for (i, w) in words.iter().enumerate() {
         let display = word_display(w);
         if display.is_empty() {
             continue;
@@ -373,6 +379,7 @@ fn diarized_turns(words: &[DeepgramWord]) -> Vec<SpeakerTurn> {
                 last.text.push(' ');
                 last.text.push_str(display);
                 last.end_ms = (w.end * 1000.0).max(last.end_ms);
+                last.last_src = i;
             }
             _ => {
                 turns.push(SpeakerTurn {
@@ -381,6 +388,8 @@ fn diarized_turns(words: &[DeepgramWord]) -> Vec<SpeakerTurn> {
                     end_ms: (w.end * 1000.0).max(w.start * 1000.0),
                     confidence: 0.0,
                     speaker,
+                    first_src: i,
+                    last_src: i,
                 });
                 confidences.push(Vec::new());
             }
@@ -1084,22 +1093,20 @@ fn trim_bleed(mic: &LabeledSegment, speakers: &[&LabeledSegment]) -> Option<Labe
 /// `seg` cut down to the words `keep` selects, its text rebuilt from those
 /// words as displayed, its time from their span and its confidence from
 /// theirs. None when no word is kept. Diarized runs are clipped the same way:
-/// each kept word belongs to exactly one run, the last run starting at or
-/// before it (Deepgram's runs touch: one ends where the next begins, so an
-/// "inside the run" test gave a boundary word to both), or the first run if
-/// it starts before them all. Each run's text, start and confidence come
+/// each kept word stays in the run it was in (by its `src`, the run's word
+/// range; time cannot decide it: adjacent runs touch, and two speakers'
+/// words can start together). Each run's text, start and confidence come
 /// from its own kept words, and a run left with none is dropped.
-/// `TimedWord` has no speaker, so the runs' times are what assigns words.
 fn with_words(seg: &LabeledSegment, keep: impl Fn(&TimedWord) -> bool) -> Option<LabeledSegment> {
     let words: Vec<TimedWord> = seg.words.iter().filter(|w| keep(w)).cloned().collect();
     let (first, last) = (words.first()?, words.last()?);
-    let run_of = |w: &TimedWord| seg.turns.iter().rposition(|t| t.start_ms <= w.start_ms).unwrap_or(0);
+    let run_of = |w: &TimedWord| seg.turns.iter().position(|t| (t.first_src..=t.last_src).contains(&w.src));
     let turns = seg
         .turns
         .iter()
         .enumerate()
         .filter_map(|(i, t)| {
-            let inside: Vec<&TimedWord> = words.iter().filter(|w| run_of(w) == i).collect();
+            let inside: Vec<&TimedWord> = words.iter().filter(|w| run_of(w) == Some(i)).collect();
             let first = inside.first()?;
             Some(SpeakerTurn {
                 text: words_text(inside.iter().copied()),
@@ -2668,14 +2675,17 @@ mod tests {
     fn a_cut_replayed_line_keeps_its_diarized_runs() {
         let skip = ShownUntil { speaker_out_ms: 10_000.0, ..ShownUntil::default() };
         let mut line = timed_seg("we said this then you said that", 8_000.0, 15_000.0, SPEAKER_OUT_LABEL);
-        let turn = |text: &str, start_ms: f64, end_ms: f64, speaker: i64| SpeakerTurn {
+        let turn = |text: &str, start_ms: f64, end_ms: f64, speaker: i64, first_src: usize, last_src: usize| SpeakerTurn {
             text: text.into(),
             start_ms,
             end_ms,
             confidence: 0.9,
             speaker,
+            first_src,
+            last_src,
         };
-        line.turns = vec![turn("we said this then", 8_000.0, 11_999.0, 0), turn("you said that", 12_000.0, 15_000.0, 1)];
+        line.turns =
+            vec![turn("we said this then", 8_000.0, 11_999.0, 0, 0, 3), turn("you said that", 12_000.0, 15_000.0, 1, 4, 6)];
         let kept = skip.unshown(line).expect("new words remain");
         assert_eq!(kept.text, "then you said that");
         let runs: Vec<(String, i64)> = kept.turns.iter().map(|t| (t.text.clone(), t.speaker)).collect();
@@ -2696,14 +2706,26 @@ mod tests {
         for (w, c) in line.words.iter_mut().zip([0.1, 0.9, 0.7]) {
             w.confidence = Some(c);
         }
-        let turn = |text: &str, start_ms: f64, end_ms: f64, speaker: i64| SpeakerTurn {
+        let turn = |text: &str, start_ms: f64, end_ms: f64, speaker: i64, first_src: usize, last_src: usize| SpeakerTurn {
             text: text.into(),
             start_ms,
             end_ms,
             confidence: 0.5,
             speaker,
+            first_src,
+            last_src,
         };
-        line.turns = vec![turn("old kept", 0.0, 1_000.0, 0), turn("new", 1_000.0, 1_500.0, 1)];
+        line.turns = vec![turn("old kept", 0.0, 1_000.0, 0, 0, 1), turn("new", 1_000.0, 1_500.0, 1, 2, 2)];
+        // Cycle 2 round 2: two speakers' words starting together stay apart.
+        let mut same_start = line.clone();
+        same_start.words[1].start_ms = 1_000.0; // "kept" (speaker 0) and "new" (speaker 1) both at 1000 ms
+        let runs: Vec<(String, i64)> = with_words(&same_start, |w| w.start_ms >= 1_000.0)
+            .unwrap()
+            .turns
+            .iter()
+            .map(|t| (t.text.clone(), t.speaker))
+            .collect();
+        assert_eq!(runs, vec![("kept".to_string(), 0), ("new".to_string(), 1)]);
         // Cut at 500 + jitter: "kept" (starts at 500) is not after it, so only
         // "new" (1000) stays, on the boundary of both runs.
         let kept = skip.unshown(line.clone()).unwrap();
@@ -3024,7 +3046,7 @@ mod tests {
     }
 
     fn turn(text: &str, start_ms: f64, end_ms: f64, speaker: i64) -> SpeakerTurn {
-        SpeakerTurn { text: text.to_string(), start_ms, end_ms, confidence: 0.8, speaker }
+        SpeakerTurn { text: text.to_string(), start_ms, end_ms, confidence: 0.8, speaker, first_src: 0, last_src: 0 }
     }
 
     #[test]

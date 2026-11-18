@@ -397,7 +397,7 @@ fn research_wanted(settings: &AssistSettings) -> bool {
 }
 
 fn prompt_parts<'a>(settings: &'a AssistSettings, brief: &'a str, research: bool) -> PromptParts<'a> {
-    let builtin = settings.builtin.deepgram_overview.then_some((DEEPGRAM_PUBLIC_NAME, DEEPGRAM_PUBLIC));
+    let builtin = settings.overview_included().then_some((DEEPGRAM_PUBLIC_NAME, DEEPGRAM_PUBLIC));
     PromptParts {
         kinds: settings.card_kinds.enabled(),
         instructions: &settings.instructions,
@@ -423,8 +423,11 @@ async fn deepgram_key<R: Runtime>(app: &AppHandle<R>) -> Option<String> {
 
 /// The built-in Deepgram docs server with the saved key, or None without one.
 async fn builtin_docs_server<R: Runtime>(app: &AppHandle<R>) -> Option<settings::McpServer> {
-    let key = deepgram_key(app).await?;
-    Some(settings::McpServer {
+    Some(builtin_docs_server_with(&deepgram_key(app).await?))
+}
+
+fn builtin_docs_server_with(key: &str) -> settings::McpServer {
+    settings::McpServer {
         id: "builtin-deepgram-docs".into(),
         name: settings::BUILTIN_DOCS_NAME.into(),
         enabled: true,
@@ -435,7 +438,7 @@ async fn builtin_docs_server<R: Runtime>(app: &AppHandle<R>) -> Option<settings:
         url: DEEPGRAM_DOCS_MCP_URL.into(),
         headers: [("Authorization".to_string(), format!("Token {}", key.trim()))].into_iter().collect(),
         allowed_tools: vec![DEEPGRAM_DOCS_TOOL.into()],
-    })
+    }
 }
 
 /// The card system prompt for these settings and brief.
@@ -1320,12 +1323,11 @@ fn clip_chars(text: &str, max: usize) -> String {
 /// key stays in Rust; the UI never sees it).
 #[tauri::command]
 pub async fn ai_assist_test_builtin_docs<R: Runtime>(app: AppHandle<R>) -> Result<Vec<mcp_probe::ToolInfo>, String> {
-    let server = builtin_docs_server(&app)
-        .await
-        .ok_or("no Deepgram API key is saved (Settings › Transcription › Deepgram)")?;
-    let key = deepgram_key(&app).await.unwrap_or_default();
+    // One read of the key, used for both the request and the redaction.
+    let key = deepgram_key(&app).await.ok_or("no Deepgram API key is saved (Settings › Transcription › Deepgram)")?;
+    let server = builtin_docs_server_with(&key);
     // An error body could echo the request's headers: never hand the key to the UI.
-    let redact = |e: String| if key.trim().is_empty() { e } else { e.replace(key.trim(), "***") };
+    let redact = |e: String| e.replace(key.trim(), "***");
     let tools = mcp_probe::list_tools(&server).await.map_err(redact)?;
     if !tools.iter().any(|t| t.name == DEEPGRAM_DOCS_TOOL) {
         return Err(format!(

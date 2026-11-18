@@ -189,23 +189,38 @@ fn yes() -> bool {
 }
 
 impl AssistSettings {
-    /// About me + enabled knowledge, the built-in overview included when it
-    /// is on, in characters.
-    pub fn context_chars(&self) -> usize {
-        let builtin = if self.builtin.deepgram_overview { DEEPGRAM_PUBLIC.chars().count() } else { 0 };
-        builtin
-            + self.about_me.chars().count()
+    /// About me + enabled knowledge, in characters.
+    fn own_context_chars(&self) -> usize {
+        self.about_me.chars().count()
             + self.knowledge.iter().filter(|k| k.enabled).map(|k| k.text.chars().count()).sum::<usize>()
     }
 
+    /// The built-in overview goes into the prompt: it is on, and it fits
+    /// under the context limit next to about me and the enabled knowledge
+    /// (settings saved before it existed may already fill the limit; then
+    /// it is left out rather than going over).
+    pub fn overview_included(&self) -> bool {
+        self.builtin.deepgram_overview
+            && self.own_context_chars() + DEEPGRAM_PUBLIC.chars().count() <= MAX_CONTEXT_CHARS
+    }
+
+    /// About me + enabled knowledge, plus the built-in overview when it is
+    /// on, in characters (what `validate` holds to MAX_CONTEXT_CHARS).
+    pub fn context_chars(&self) -> usize {
+        let builtin = if self.builtin.deepgram_overview { DEEPGRAM_PUBLIC.chars().count() } else { 0 };
+        builtin + self.own_context_chars()
+    }
+
     /// Settings read from the store. An object saved before the built-ins
-    /// existed (no `builtin` key) gets research on, the new default: it was
-    /// saved off only because off was the old default, and the built-in
-    /// docs server needs it.
+    /// existed (no `builtin` key) and with no MCP servers of its own gets
+    /// research on, the new default: with no server, off could only have
+    /// been the old default, and turning it on reaches only the built-in
+    /// docs. One that lists servers keeps its choice: on would start sending
+    /// lookups to them.
     pub fn from_stored(value: serde_json::Value) -> Result<Self, serde_json::Error> {
         let had_builtin = value.get("builtin").is_some();
         let mut settings: Self = serde_json::from_value(value)?;
-        if !had_builtin {
+        if !had_builtin && settings.research.servers.is_empty() {
             settings.research.enabled = true;
         }
         Ok(settings)
@@ -363,6 +378,17 @@ mod tests {
         assert!(s.research.enabled && s.builtin.deepgram_docs);
         let new = serde_json::json!({ "research": { "enabled": false, "servers": [] }, "builtin": { "deepgramDocs": true } });
         assert!(!AssistSettings::from_stored(new).unwrap().research.enabled, "a choice made with the built-ins present stands");
+        let with_server = serde_json::json!({ "research": { "enabled": false, "servers": [{
+            "id": "d", "name": "Mine", "transport": "stdio", "command": "x" }] } });
+        assert!(!AssistSettings::from_stored(with_server).unwrap().research.enabled, "an opt-out with servers stands");
+    }
+
+    #[test]
+    fn an_old_full_context_leaves_the_overview_out_instead_of_going_over() {
+        let mut s = AssistSettings::default();
+        assert!(s.overview_included());
+        s.knowledge.push(KnowledgeItem { id: "a".into(), name: "n".into(), text: "x".repeat(MAX_CONTEXT_CHARS - 10), enabled: true });
+        assert!(!s.overview_included(), "it would push the prompt past the limit");
     }
 
     #[test]

@@ -6,6 +6,7 @@ cases = {
     "[Deepgram [docs]](https://e.com)": "Deepgram [docs]",
     "[a [b](https://u)](https://v)": "a b",
     "![arch](https://e.com/a.png) after": " after",
+    "![Deepgram [logo]](https://e.com/logo.png) after": " after",
     "[Wiki](https://e.com/a_(b)) end": "Wiki end",
     "Nova-3 ([docs](https://d.com/x)).": "Nova-3.",
     "plain [text] and (paren)": "plain [text] and (paren)",

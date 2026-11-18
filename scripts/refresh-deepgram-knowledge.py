@@ -25,7 +25,7 @@ _TARGET = r"\((?:[^()\s]|\([^()\s]*\))*\)"
 def strip_links(text: str) -> str:
     """Images go, "([docs](url))" asides go, and [text](url) becomes text,
     innermost first, so a link inside link text reduces too."""
-    text = re.sub(r"!\[[^\]]*\]" + _TARGET, "", text)
+    text = re.sub(r"!\[(?:[^\[\]]|\[[^\[\]]*\])*\]" + _TARGET, "", text)
     text = re.sub(r"\s*\(\[docs\]" + _TARGET + r"\)", "", text)
     while True:
         # Link text may hold one level of brackets ("[Deepgram [docs]](url)").

@@ -57,3 +57,51 @@ describe('theme palette', () => {
     }
   });
 });
+
+// Every class string that puts white text on a solid palette background must
+// read in both themes. Icon-only controls need the 3:1 non-text ratio, and
+// WCAG exempts disabled controls.
+describe('white labels on palette backgrounds', () => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const fs = require('node:fs');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const path = require('node:path');
+  const MIN_RATIO: Record<string, number> = {
+    'src/components/RecordingControls.tsx:349': 3, // round stop icon, no text
+    'src/components/RecordingControls.tsx:374': 1, // disabled icon, exempt
+  };
+  const files: string[] = [];
+  const walk = (dir: string) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (p.endsWith('.tsx')) files.push(p);
+    }
+  };
+  const root = path.join(__dirname, '../..');
+  walk(path.join(root, 'src'));
+
+  test('meets contrast in light and dark', () => {
+    const failures: string[] = [];
+    let checked = 0;
+    for (const file of files) {
+      const rel = path.relative(root, file);
+      fs.readFileSync(file, 'utf8').split('\n').forEach((line: string, i: number) => {
+        if (!/(^|[\s"'`])text-white(?![\w/-])/.test(line)) return;
+        // Unprefixed backgrounds only: hover:/disabled: states are not resting labels.
+        for (const m of line.matchAll(/(?:^|[\s"'`])bg-([a-z]+)-(\d{2,3})(?![\w/-])/g)) {
+          if (!palette.light[`--pal-s-${m[1]}-${m[2]}`]) continue;
+          checked++;
+          const where = `${rel}:${i + 1}`;
+          const min = MIN_RATIO[where] ?? 4.5;
+          for (const mode of ['light', 'dark'] as const) {
+            const ratio = contrast(palette[mode]['--pal-i-white'], palette[mode][`--pal-s-${m[1]}-${m[2]}`]);
+            if (ratio < min) failures.push(`${where} bg-${m[1]}-${m[2]} ${mode} ${ratio.toFixed(2)}`);
+          }
+        }
+      });
+    }
+    expect(checked).toBeGreaterThan(20);
+    expect(failures).toEqual([]);
+  });
+});

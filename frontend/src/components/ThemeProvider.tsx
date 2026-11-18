@@ -10,19 +10,35 @@ export type ThemePreference = 'system' | 'light' | 'dark'
 export const THEME_STORAGE_KEY = 'meetily-theme'
 
 /**
- * Keeps the native window chrome (title bar, and the webview's
- * prefers-color-scheme) in step with the in-app preference. `null` hands the
- * window back to the OS, which is what makes "System" follow live OS changes.
+ * Hands the preference to the native window chrome (title bar, and the
+ * webview's prefers-color-scheme). `null` gives the window back to the OS,
+ * which is what makes "System" follow live OS changes.
  */
+function syncNativeWindowTheme(preference: string | null | undefined) {
+  if (!isTauri()) return
+  const native = preference === 'light' || preference === 'dark' ? preference : null
+  import('@tauri-apps/api/window')
+    .then(({ getCurrentWindow }) => getCurrentWindow().setTheme(native))
+    .catch((error) => console.warn('[Theme] Failed to set native window theme:', error))
+}
+
+// Apply the stored preference as soon as this bundle loads rather than after
+// React mounts, so a saved Light/Dark that differs from the OS leaves the
+// title bar mismatched only until the JS bundle has loaded. The window opens
+// with the OS theme because tauri.conf.json no longer forces one.
+if (typeof window !== 'undefined') {
+  try {
+    syncNativeWindowTheme(window.localStorage.getItem(THEME_STORAGE_KEY))
+  } catch {
+    // localStorage unavailable: the effect below syncs after mount instead.
+  }
+}
+
 function NativeWindowThemeSync() {
   const { theme } = useTheme()
 
   useEffect(() => {
-    if (!theme || !isTauri()) return
-    const native = theme === 'light' || theme === 'dark' ? theme : null
-    import('@tauri-apps/api/window')
-      .then(({ getCurrentWindow }) => getCurrentWindow().setTheme(native))
-      .catch((error) => console.warn('[Theme] Failed to set native window theme:', error))
+    if (theme) syncNativeWindowTheme(theme)
   }, [theme])
 
   return null

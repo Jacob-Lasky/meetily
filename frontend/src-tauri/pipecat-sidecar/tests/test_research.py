@@ -485,3 +485,17 @@ def test_mcp_tool_results_never_reach_the_log_even_at_debug():
     assert not keep_record({"name": "pipecat.services.mcp_service", "level": level(10)})
     assert keep_record({"name": "pipecat.services.mcp_service", "level": level(20)}), "INFO lines stay"
     assert keep_record({"name": "meetily_sidecar.research", "level": level(10)})
+
+
+async def test_session_end_waits_for_a_connecting_server_and_closes_it(monkeypatch):
+    import pipecat.services.mcp_service as mcp_service
+
+    SlowClient.instances = []
+    monkeypatch.setattr(mcp_service, "MCPClient", SlowClient)
+    monkeypatch.setattr(MCPTools, "server_params", staticmethod(lambda cfg: None))
+    r = Research(lambda m: None)
+    tools = MCPTools([{"name": "A", "transport": "stdio", "command": "x"}], lambda e: None)
+    await r.configure(tools=tools, loop=loop_that("{}"), system_prompt="", limits=ResearchLimits(), config_key="k")
+    await asyncio.sleep(0.01)  # the warm-up is connecting
+    await r.close()
+    assert [c.closed for c in SlowClient.instances] == [True], "closed before close() returned"

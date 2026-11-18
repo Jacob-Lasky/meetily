@@ -32,8 +32,11 @@ export function MeetingBrief({ defaultOpen }: { defaultOpen: boolean }) {
         if (b) setOpen(true);
       })
       .catch((e) => console.error('ai assist: could not load the brief', e));
-    const unlisten = listen(ASSIST_BRIEF_CLEARED_EVENT, () => {
-      // A save still pending would write the old call's brief back.
+    // Only the brief that was kept with the stopped meeting is cleared: a
+    // box already holding a brief typed for the next call keeps it (and its
+    // pending save).
+    const unlisten = listen<{ brief: string }>(ASSIST_BRIEF_CLEARED_EVENT, (e) => {
+      if (latest.current !== e.payload.brief) return;
       if (saveTimer.current) {
         clearTimeout(saveTimer.current);
         saveTimer.current = null;

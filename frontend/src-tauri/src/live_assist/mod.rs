@@ -237,11 +237,15 @@ pub fn start_session<R: Runtime>(app: &AppHandle<R>, meeting_folder: Option<Path
 /// after it returns, even if the session task has not run yet. Also notes
 /// the brief this call ran with (see `Session::brief_at_stop`).
 pub fn stop_calls<R: Runtime>(app: &AppHandle<R>) {
-    let brief = load_brief(app);
-    if let Some(session) = SESSION.lock().unwrap().as_ref() {
+    // Cancel first, read the brief after: no call may start in between.
+    let brief_at_stop = {
+        let session = SESSION.lock().unwrap();
+        let Some(session) = session.as_ref() else { return };
         session.calls_off.cancel();
-        session.brief_at_stop.lock().unwrap().get_or_insert(brief);
-    }
+        session.brief_at_stop.clone()
+    };
+    let brief = load_brief(app);
+    brief_at_stop.lock().unwrap().get_or_insert(brief);
 }
 
 /// End the session: listeners removed, pins written. Called after the
@@ -916,6 +920,10 @@ pub async fn save_settings<R: Runtime>(app: &AppHandle<R>, settings: &AssistSett
         // as the calls themselves, checked now instead of on every turn.
         assist_target(app, settings).await.map_err(|e| format!("the AI Assist model cannot be used: {e}"))?;
     }
+    // Settings and brief share one limit: check and store under one lock,
+    // so a brief saved meanwhile is counted.
+    let _guard = CONTEXT_SAVE.lock().unwrap();
+    settings.validate(load_brief(app).chars().count())?;
     let store = app.store(SETTINGS_STORE).map_err(|e| format!("settings store unavailable: {e}"))?;
     store.set(SETTINGS_KEY, serde_json::to_value(settings).map_err(|e| e.to_string())?);
     store.save().map_err(|e| format!("could not save the AI Assist settings: {e}"))?;
@@ -933,6 +941,7 @@ pub fn load_brief<R: Runtime>(app: &AppHandle<R>) -> String {
 }
 
 pub fn set_brief<R: Runtime>(app: &AppHandle<R>, brief: &str) -> Result<(), String> {
+    let _guard = CONTEXT_SAVE.lock().unwrap();
     let total = brief.chars().count() + load_settings(app).context_chars();
     if total > settings::MAX_CONTEXT_CHARS {
         return Err(format!(
@@ -947,6 +956,10 @@ pub fn set_brief<R: Runtime>(app: &AppHandle<R>, brief: &str) -> Result<(), Stri
     Ok(())
 }
 
+/// Held while settings or the brief are checked against the shared context
+/// limit and stored.
+static CONTEXT_SAVE: Mutex<()> = Mutex::new(());
+
 /// Clear the brief if it is still `expected`.
 fn clear_brief_if<R: Runtime>(app: &AppHandle<R>, expected: &str) {
     let Ok(store) = app.store(SETTINGS_STORE) else { return };
@@ -957,12 +970,15 @@ fn clear_brief_if<R: Runtime>(app: &AppHandle<R>, expected: &str) {
     if let Err(e) = store.save() {
         warn!("live assist: could not clear the meeting brief: {e}");
     }
-    if let Err(e) = app.emit(BRIEF_CLEARED_EVENT, ()) {
+    // The cleared text goes with the event: a box holding anything else (a
+    // brief already typed for the next call) keeps it.
+    if let Err(e) = app.emit(BRIEF_CLEARED_EVENT, serde_json::json!({ "brief": expected })) {
         error!("live assist: failed to emit brief-cleared: {e}");
     }
 }
 
-/// The brief was kept with the meeting that just stopped and cleared.
+/// The brief was kept with the meeting that just stopped and cleared:
+/// `{ "brief": string }`, the text that was cleared.
 pub const BRIEF_CLEARED_EVENT: &str = "assist-brief-cleared";
 
 fn reconfigure_session() {

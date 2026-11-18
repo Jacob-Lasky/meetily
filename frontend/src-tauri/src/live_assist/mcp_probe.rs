@@ -88,11 +88,13 @@ async fn stdio(server: &McpServer) -> Result<Vec<ToolInfo>, String> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        // Its own process group, so the whole tree goes at the end: a
-        // shell, `npx` or relay often starts the real server as a child,
-        // which killing the direct child alone would leave running.
-        .process_group(0)
         .kill_on_drop(true);
+    // Its own process group, so the whole tree goes at the end: a shell,
+    // `npx` or relay often starts the real server as a child, which killing
+    // the direct child alone would leave running. Unix only (tokio has no
+    // process groups elsewhere); other platforms kill the direct child.
+    #[cfg(unix)]
+    cmd.process_group(0);
     let mut child = cmd.spawn().map_err(|e| format!("could not start {}: {e}", server.command.trim()))?;
     let group = child.id();
     let mut stdin = child.stdin.take().ok_or("no stdin")?;
@@ -110,14 +112,18 @@ async fn stdio(server: &McpServer) -> Result<Vec<ToolInfo>, String> {
         .await
         .map_err(|_| format!("{} did not answer within {} s", server.name, PROBE_TIMEOUT.as_secs()));
     drop(stdin);
+    #[cfg(unix)]
     if let Some(pgid) = group {
         kill_group(pgid);
     }
+    #[cfg(not(unix))]
+    let _ = group;
     let _ = child.kill().await;
     tools_from(&reply??)
 }
 
 /// SIGKILL a process group (tokio has no group kill; `kill(1)` does).
+#[cfg(unix)]
 fn kill_group(pgid: u32) {
     let _ = std::process::Command::new("kill")
         .args(["-KILL", "--", &format!("-{pgid}")])
@@ -248,6 +254,7 @@ done"#;
 
     /// A server that starts its real worker as a child and then answers:
     /// the worker must not outlive the Test.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_whole_process_tree_is_killed() {
         let dir = tempfile::tempdir().unwrap();

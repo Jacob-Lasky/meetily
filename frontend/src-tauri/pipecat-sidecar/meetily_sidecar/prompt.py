@@ -1,8 +1,10 @@
 """Live-assist user prompt and card parsing.
 
 A port of `src/live_assist/cards.rs` (`user_prompt`, `parse_cards`,
-`normalize`). The SYSTEM prompt is not copied here: Rust sends
-`cards::SYSTEM_PROMPT` in the assist config, so its wording has one home.
+`normalize`). The system prompts are not copied here: Rust builds them
+(`cards::system_prompt`, `cards::research_prompt`, from Settings › AI Assist
+and the meeting brief) and sends them in the assist config, so their wording
+has one home.
 `tests/fixtures/user_prompt.json` is checked by both the Python and the Rust
 tests, so the two user-prompt builders cannot drift apart.
 """
@@ -115,3 +117,23 @@ def parse_cards(output: str) -> list[Card]:
         raise ParseError('model output JSON was not {"cards": [...]}')
     cards = [c for c in (_card(i) for i in items) if c is not None]
     return cards[:MAX_CARDS_PER_CALL]
+
+
+#: Longest research question passed on; a longer one is not a lookup.
+MAX_RESEARCH_CHARS = 300
+
+
+def parse_research(output: str) -> str | None:
+    """The `research` question in a card reply (`{"cards": [...],
+    "research": "..."}`), or None. Only the research lane uses it; Rust's
+    parser ignores the field."""
+    value = _first_json_value(output or "")
+    if not isinstance(value, dict):
+        return None
+    question = value.get("research")
+    if not isinstance(question, str):
+        return None
+    question = " ".join(question.split())
+    if not question or len(question) > MAX_RESEARCH_CHARS:
+        return None
+    return question

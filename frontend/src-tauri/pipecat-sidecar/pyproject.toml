@@ -5,7 +5,8 @@ description = "Meetily live engine: Deepgram Flux STT per channel and turn-trigg
 requires-python = ">=3.12"
 dependencies = [
     # 1.16.0 is the newest pipecat-ai on PyPI as of 2026-11-18 (WORK-559).
-    "pipecat-ai[deepgram,anthropic,openai,groq]==1.16.0",
+    # `mcp` (WORK-581): the research lane's MCPClient; pulls mcp 2.x (2.3.0, the newest, on 2026-11-18).
+    "pipecat-ai[deepgram,anthropic,openai,groq,mcp]==1.16.0",
     # Imported directly by server.py (also a pipecat-ai dependency).
     "websockets>=17.4",
 ]

@@ -19,6 +19,11 @@ bleed suppression, keyed by Rust's sequence ids, so a retracted Mic-In line
 also leaves the prompt. The turn that triggered the call is appended when Rust
 has not sent its line yet (it is still on its way, or only predicted).
 
+A card reply may also ask for a lookup (`"research": "..."`, only offered
+when the research lane is on): the question goes to `Research`, which answers
+it with MCP tools as a later card (WORK-581). The card call itself never
+waits on that.
+
 Pure asyncio: the LLM is an injected coroutine, so tests drive this with fakes.
 """
 
@@ -33,7 +38,8 @@ from typing import Awaitable, Callable
 
 from loguru import logger
 
-from .prompt import ParseError, normalize, parse_cards, user_prompt
+from .prompt import ParseError, normalize, parse_cards, parse_research, user_prompt
+from .research import Research
 
 Infer = Callable[[str, str], Awaitable[str]]
 Emit = Callable[[dict], None]
@@ -120,6 +126,7 @@ class Assist:
         limits: Limits = Limits(),
     ):
         self._emit = emit
+        self.research = Research(emit, clock=clock)
         self._infer = infer
         self._clock = clock
         self.limits = limits
@@ -155,6 +162,7 @@ class Assist:
         if self._enabled and not enabled:
             self._waiting_turn = None
             self._cancel_current("assist turned off")
+            self.research.cancel("assist turned off")
         self._enabled = enabled
         logger.info(f"live assist: {'enabled' if enabled else 'disabled'}")
 
@@ -285,9 +293,11 @@ class Assist:
         since_eot = None
         if call.end_of_turn_at is not None:
             since_eot = round((self._clock() - call.end_of_turn_at) * 1000)
+        question = None
         if call.error is not None:
             self._emit({"type": "assist_error", "call_id": call.call_id, "error": call.error})
         else:
+            question = parse_research(call.output or "")
             try:
                 cards = parse_cards(call.output or "")
             except ParseError as e:
@@ -310,6 +320,8 @@ class Assist:
                     "since_end_of_turn_ms": since_eot,
                 }
             )
+        if question is not None and self._enabled:
+            self.research.ask(question, call.text)
         waiting, self._waiting_turn = self._waiting_turn, None
         if waiting is not None and self._can_call():
             self._start(waiting[0], "final", end_of_turn_at=waiting[1])
@@ -332,3 +344,4 @@ class Assist:
                 await call.task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+        await self.research.close()

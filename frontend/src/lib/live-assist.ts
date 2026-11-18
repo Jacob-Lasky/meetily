@@ -10,6 +10,10 @@
 export const ASSIST_UPDATE_EVENT = 'assist-update';
 export const ASSIST_WITHDRAW_EVENT = 'assist-withdraw';
 export const ASSIST_STATUS_EVENT = 'assist-status';
+/** The research lane (Pipecat engine, WORK-581). */
+export const ASSIST_RESEARCH_EVENT = 'assist-research';
+/** The meeting brief was saved with the meeting that stopped and cleared. */
+export const ASSIST_BRIEF_CLEARED_EVENT = 'assist-brief-cleared';
 
 export type AssistCardKind = 'answer' | 'ask' | 'fact' | 'todo';
 
@@ -23,6 +27,8 @@ export interface AssistCard {
   source_seq: number;
   pinned: boolean;
   created_at_ms: number;
+  /** Research cards: the MCP servers the lookup used (e.g. "DeepHive"). */
+  origin?: string;
 }
 
 export interface AssistUpdate {
@@ -35,6 +41,13 @@ export interface AssistWithdraw {
 }
 
 export type AssistState = 'idle' | 'thinking' | 'error' | 'off' | 'stopped';
+
+export interface AssistResearch {
+  state: 'started' | 'done' | 'error';
+  question: string;
+  message?: string;
+  cards?: number;
+}
 
 export interface AssistStatus {
   state: AssistState;

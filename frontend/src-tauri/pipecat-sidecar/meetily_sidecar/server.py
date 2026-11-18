@@ -240,6 +240,7 @@ def handle_control(assist: Assist, msg: dict[str, Any]):
             enabled=bool(msg.get("enabled")),
             limits=limits,
         )
+        _configure_research(assist, msg.get("research"), llm if infer is not None else None)
     elif kind == "assist_enabled":
         assist.set_enabled(bool(msg.get("enabled")))
     elif kind == "line":
@@ -248,6 +249,51 @@ def handle_control(assist: Assist, msg: dict[str, Any]):
         assist.retract(int(msg["seq"]))
     elif kind == "shown":
         assist.set_shown(list(msg.get("texts") or []))
+
+
+def _configure_research(assist: Assist, raw: Any, llm: dict | None):
+    """Set up (or turn off) the research lane from the config's `research`
+    part. The MCP connections are kept when only the prompts changed."""
+    from .llm import UnsupportedProvider, make_tool_loop
+    from .research import MCPTools, ResearchLimits
+
+    raw = raw if isinstance(raw, dict) else {}
+    limits = ResearchLimits.from_config(raw)
+    servers = [s for s in (raw.get("servers") or []) if isinstance(s, dict)]
+    tools = loop = None
+    key = None
+    if raw.get("enabled") and servers and llm is not None:
+        try:
+            loop = make_tool_loop(llm, limits.max_tokens, limits.max_tool_calls)
+        except UnsupportedProvider as e:
+            assist._emit({"type": "research_error", "research_id": None, "question": None, "error": str(e)})
+        else:
+            key = json.dumps(servers, sort_keys=True)
+
+            def on_error(error: str):
+                assist._emit({"type": "research_error", "research_id": None, "question": None, "error": error})
+
+            tools = MCPTools(servers, on_error)
+    research = assist.research
+    if tools is None and not research.has_tools:
+        # Off, and nothing to tear down.
+        research.set_prompt(str(raw.get("system_prompt") or ""), limits)
+        return
+    task = asyncio.get_running_loop().create_task(
+        research.configure(
+            tools=tools,
+            loop=loop,
+            system_prompt=str(raw.get("system_prompt") or ""),
+            limits=limits,
+            config_key=key,
+        )
+    )
+    _BACKGROUND.add(task)
+    task.add_done_callback(_BACKGROUND.discard)
+
+
+#: Tasks started from sync control handling; held so they are not collected.
+_BACKGROUND: set[asyncio.Task] = set()
 
 
 def build_flux_service(api_key: str, query: dict[str, list[str]], *, eager: bool):

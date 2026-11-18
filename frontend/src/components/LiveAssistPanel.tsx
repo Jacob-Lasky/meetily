@@ -4,13 +4,16 @@ import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
-import { ChevronLeft, ChevronRight, Loader2, Pin, PinOff, Sparkles, TriangleAlert, X } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Loader2, Pin, PinOff, Search, Sparkles, TriangleAlert, X } from 'lucide-react';
+import { MeetingBrief } from './MeetingBrief';
 import {
+  ASSIST_RESEARCH_EVENT,
   ASSIST_STATUS_EVENT,
   ASSIST_UPDATE_EVENT,
   ASSIST_WITHDRAW_EVENT,
   AssistCard,
   AssistCardKind,
+  AssistResearch,
   AssistStatus,
   AssistUpdate,
   AssistWithdraw,
@@ -31,15 +34,17 @@ const KIND_STYLE: Record<AssistCardKind, string> = {
 const COLLAPSED_KEY = 'liveAssistCollapsed';
 
 /**
- * Side panel on the recording view with the live-assist cards, newest on top.
- * Renders nothing unless the feature is on (Settings > Summary) and a
- * recording is running.
+ * Side panel on the recording view with the live-assist cards, newest on top,
+ * under the meeting brief. Renders nothing unless the feature is on
+ * (Settings › AI Assist); before a recording it holds only the brief, so it
+ * can be filled in before the call starts.
  */
 export function LiveAssistPanel({ isRecording }: { isRecording: boolean }) {
   const [enabled, setEnabled] = useState(false);
   const [cards, setCards] = useState<AssistCard[]>([]);
   const [status, setStatus] = useState<AssistStatus>({ state: 'idle' });
   const [collapsed, setCollapsed] = useState(false);
+  const [research, setResearch] = useState<AssistResearch | null>(null);
   const withdrawnRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
@@ -56,6 +61,7 @@ export function LiveAssistPanel({ isRecording }: { isRecording: boolean }) {
         e.payload.ids.forEach((id) => withdrawnRef.current.add(id));
         setCards((prev) => withoutIds(prev, e.payload.ids));
       }),
+      listen<AssistResearch>(ASSIST_RESEARCH_EVENT, (e) => setResearch(e.payload)),
       listen<AssistStatus>(ASSIST_STATUS_EVENT, (e) => {
         setStatus(e.payload);
         if (e.payload.state === 'off') setEnabled(false);
@@ -75,6 +81,7 @@ export function LiveAssistPanel({ isRecording }: { isRecording: boolean }) {
     let current = true;
     withdrawnRef.current = new Set();
     setStatus({ state: 'idle' });
+    setResearch(null);
     invoke<AssistCard[]>('live_assist_get_cards')
       .then((backend) => {
         if (current) setCards((prev) => mergeSynced(backend, prev, withdrawnRef.current));
@@ -86,7 +93,7 @@ export function LiveAssistPanel({ isRecording }: { isRecording: boolean }) {
     };
   }, [isRecording]);
 
-  if (!enabled || !isRecording) return null;
+  if (!enabled) return null;
 
   const toggleCollapsed = () => {
     setCollapsed((c) => {
@@ -142,11 +149,26 @@ export function LiveAssistPanel({ isRecording }: { isRecording: boolean }) {
           <ChevronRight className="w-4 h-4" />
         </button>
       </div>
+      <MeetingBrief defaultOpen={!isRecording} />
       {status.state === 'error' && status.message && (
         <p className="px-3 py-2 text-xs text-red-700 bg-red-50 border-b border-red-100">{status.message}</p>
       )}
+      {isRecording && research?.state === 'started' && (
+        <p className="px-3 py-2 text-xs text-blue-800 bg-blue-50 border-b border-blue-100 flex items-center gap-2" data-testid="assist-research">
+          <Search className="w-3.5 h-3.5 flex-shrink-0" />
+          <span className="truncate" title={research.question}>Looking up: {research.question}</span>
+          <Loader2 className="w-3.5 h-3.5 animate-spin flex-shrink-0" />
+        </p>
+      )}
+      {isRecording && research?.state === 'error' && (
+        <p className="px-3 py-2 text-xs text-amber-800 bg-amber-50 border-b border-amber-100" title={research.message}>
+          Lookup failed: {research.message}
+        </p>
+      )}
       <div className="flex-1 overflow-y-auto p-3 space-y-2 pb-28">
-        {cards.length === 0 ? (
+        {!isRecording ? (
+          <p className="text-xs text-gray-500 text-center mt-6">Cards appear here during a recording.</p>
+        ) : cards.length === 0 ? (
           <p className="text-xs text-gray-500 text-center mt-6">
             Suggestions appear here after the other side speaks.
           </p>
@@ -161,6 +183,11 @@ export function LiveAssistPanel({ isRecording }: { isRecording: boolean }) {
                 <span className={`text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded ${KIND_STYLE[card.kind]}`}>
                   {KIND_LABEL[card.kind]}
                 </span>
+                {card.origin && (
+                  <span className="text-[10px] text-gray-500" title="Looked up with MCP tools">
+                    via {card.origin}
+                  </span>
+                )}
                 <span className="flex-1" />
                 <button
                   onClick={() => setPinned(card, !card.pinned)}

@@ -7,9 +7,11 @@
 //! page is open. Cards reach the UI as `assist-update` / `assist-withdraw`.
 //!
 //! The feature is off by default (`live_assist.json` store, key `enabled`;
-//! switched in Settings > Summary or the tray's "Live Assist" item). While it
-//! is off no LLM call is made; turning it off mid-call cancels the call in
-//! flight. Calls use the configured summary provider and model.
+//! switched in Settings › AI Assist or the tray's "Live Assist" item). While
+//! it is off no LLM call is made; turning it off mid-call cancels the call in
+//! flight. Calls use the AI Assist model (default: the summary model) and
+//! the prompt `cards::system_prompt` builds from Settings › AI Assist and
+//! the meeting brief (`settings`).
 //!
 //! Pinned cards are written to `live-assist.json` in the meeting folder so
 //! the meeting page can show them afterwards. DO NOT move them into a new DB
@@ -19,6 +21,8 @@
 
 pub mod cards;
 pub mod engine;
+pub mod mcp_probe;
+pub mod settings;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,8 +41,9 @@ use crate::database::repositories::setting::SettingsRepository;
 use crate::state::AppState;
 use crate::summary::llm_client::{generate_completion, CompletionOptions};
 use crate::summary::llm_target::LlmTarget;
-use cards::{parse_cards, Side};
+use cards::{keep_kinds, parse_cards, PromptParts, Side};
 use engine::{Card, Config, Engine};
+use settings::{AssistSettings, McpTransport, BRIEF_KEY, SETTINGS_KEY};
 
 /// New cards, newest first: `{ "cards": Card[] }`.
 pub const ASSIST_UPDATE_EVENT: &str = "assist-update";
@@ -46,6 +51,9 @@ pub const ASSIST_UPDATE_EVENT: &str = "assist-update";
 pub const ASSIST_WITHDRAW_EVENT: &str = "assist-withdraw";
 /// `{ "state": "idle" | "thinking" | "error" | "off" | "stopped", "message"?: string }`.
 pub const ASSIST_STATUS_EVENT: &str = "assist-status";
+/// The research lane (Pipecat engine): `{ "state": "started" | "done" | "error",
+/// "question": string, "message"?: string, "cards"?: number }`.
+pub const ASSIST_RESEARCH_EVENT: &str = "assist-research";
 
 const SETTINGS_STORE: &str = "live_assist.json";
 const ENABLED_KEY: &str = "enabled";
@@ -94,6 +102,9 @@ enum Msg {
     SidecarDetached(u64),
     /// An event and the generation of the connection it came on.
     Sidecar(u64, SidecarEvent),
+    /// Settings › AI Assist or the meeting brief changed: the attached
+    /// sidecar gets the new config (the Direct engine reads them per call).
+    Reconfigure,
     Stop,
 }
 
@@ -121,6 +132,27 @@ enum SidecarEvent {
     AssistError {
         #[serde(default)]
         call_id: Option<u64>,
+        error: String,
+    },
+    ResearchStarted {
+        research_id: u64,
+        question: String,
+    },
+    ResearchCards {
+        research_id: u64,
+        question: String,
+        cards: Vec<serde_json::Value>,
+        /// Names of the MCP servers whose tools the lookup called.
+        #[serde(default)]
+        sources: Vec<String>,
+        #[serde(default)]
+        call_ms: Option<u64>,
+    },
+    ResearchError {
+        #[serde(default)]
+        research_id: Option<u64>,
+        #[serde(default)]
+        question: Option<String>,
         error: String,
     },
 }
@@ -283,38 +315,116 @@ fn send_shown(engine: &Engine) {
     to_sidecar(serde_json::json!({ "type": "shown", "texts": engine.shown_texts() }));
 }
 
-/// The assist config for the sidecar: the summary provider, model and key
-/// (the same `LlmTarget` as Direct calls and summaries), the system prompt
-/// (its one home is `cards::SYSTEM_PROMPT`), and whether calls may run.
+/// Research lane limits, sent to the sidecar (`meetily_sidecar/research.py`).
+/// A lookup is slower than a card by design (tools, a second model call); one
+/// still useful has to land while the topic is live.
+const RESEARCH_TIMEOUT: Duration = Duration::from_secs(45);
+const RESEARCH_MAX_TOOL_CALLS: u32 = 4;
+
+/// The provider, model and target for assist calls: the AI Assist model when
+/// one is set, else the summary model (Settings › Summary).
+async fn assist_target<R: Runtime>(
+    app: &AppHandle<R>,
+    settings: &AssistSettings,
+) -> Result<(String, String, LlmTarget), String> {
+    let state = app.try_state::<AppState>().ok_or("database not ready")?;
+    let pool = state.db_manager.pool();
+    let (provider, model) = match &settings.model {
+        Some(m) => (m.provider.clone(), m.model.clone()),
+        None => {
+            let summary = SettingsRepository::get_model_config(pool)
+                .await
+                .map_err(|e| format!("could not read the summary model setting: {e}"))?
+                .ok_or("no summary model is configured (Settings › Summary), and AI Assist has no model of its own")?;
+            (summary.provider, summary.model)
+        }
+    };
+    let target = LlmTarget::resolve(pool, &provider).await?;
+    Ok((provider, model, target))
+}
+
+/// Research needs an MCP server on and a kind its cards can use.
+fn research_on(settings: &AssistSettings) -> bool {
+    !settings.research.active_servers().is_empty() && (settings.card_kinds.answer || settings.card_kinds.fact)
+}
+
+fn prompt_parts<'a>(settings: &'a AssistSettings, brief: &'a str, research: bool) -> PromptParts<'a> {
+    PromptParts {
+        kinds: settings.card_kinds.enabled(),
+        instructions: &settings.instructions,
+        about_me: &settings.about_me,
+        knowledge: settings.knowledge.iter().filter(|k| k.enabled).map(|k| (k.name.as_str(), k.text.as_str())).collect(),
+        brief,
+        research,
+    }
+}
+
+/// The card system prompt for these settings and brief.
+pub fn compose_prompt(settings: &AssistSettings, brief: &str, research: bool) -> String {
+    cards::system_prompt(&prompt_parts(settings, brief, research))
+}
+
+/// MCP servers as the sidecar's `research.py` reads them.
+fn research_servers_json(settings: &AssistSettings) -> Vec<serde_json::Value> {
+    settings
+        .research
+        .active_servers()
+        .into_iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name.trim(),
+                "transport": match s.transport {
+                    McpTransport::Stdio => "stdio",
+                    McpTransport::Http => "http",
+                    McpTransport::Sse => "sse",
+                },
+                "command": s.command.trim(),
+                "args": s.args,
+                "env": s.env,
+                "url": s.url.trim(),
+                "headers": s.headers,
+                "allowed_tools": s.allowed_tools,
+            })
+        })
+        .collect()
+}
+
+/// The assist config for the sidecar: the AI Assist provider, model and key
+/// (the same `LlmTarget` rules as Direct calls and summaries), the system
+/// prompts (their one home is `cards`), the research lane's MCP servers, and
+/// whether calls may run.
 async fn sidecar_config<R: Runtime>(app: &AppHandle<R>, enabled: bool) -> serde_json::Value {
-    let llm = async {
-        let state = app.try_state::<AppState>().ok_or("database not ready")?;
-        let pool = state.db_manager.pool();
-        let settings = SettingsRepository::get_model_config(pool)
-            .await
-            .map_err(|e| format!("could not read the summary model setting: {e}"))?
-            .ok_or("no summary model is configured (Settings > Summary)")?;
-        let target = LlmTarget::resolve(pool, &settings.provider).await?;
+    let settings = load_settings(app);
+    let brief = load_brief(app);
+    let research = research_on(&settings);
+    let llm = assist_target(app, &settings).await.map(|(provider, model, target)| {
         let endpoint = target.ollama_endpoint.or(target.custom_openai_endpoint);
-        Ok::<_, String>(serde_json::json!({
-            "provider": settings.provider,
-            "model": settings.model,
+        serde_json::json!({
+            "provider": provider,
+            "model": model,
             "api_key": target.api_key,
             "endpoint": endpoint,
-        }))
-    }
-    .await;
+        })
+    });
     let window = Config::default();
     let mut config = serde_json::json!({
         "type": "assist_config",
         "enabled": enabled,
-        "system_prompt": cards::SYSTEM_PROMPT,
+        "system_prompt": compose_prompt(&settings, &brief, research),
         // The sidecar's limits come from here, their one home
         // (meetily_sidecar/assist.py `Limits`).
         "limits": {
             "call_timeout_secs": CALL_TIMEOUT.as_secs_f64(),
             "max_lines": window.max_lines,
             "max_age_secs": window.max_age.as_secs_f64(),
+            "max_tokens": CLAUDE_MAX_TOKENS,
+        },
+        "research": {
+            "enabled": research,
+            "servers": if research { research_servers_json(&settings) } else { Vec::new() },
+            "system_prompt": cards::research_prompt(&prompt_parts(&settings, &brief, true)),
+            "timeout_secs": RESEARCH_TIMEOUT.as_secs_f64(),
+            "max_tool_calls": RESEARCH_MAX_TOOL_CALLS,
             "max_tokens": CLAUDE_MAX_TOKENS,
         },
     });
@@ -408,6 +518,15 @@ async fn run<R: Runtime>(
                             apply_sidecar_event(&app, &mut engine, event, calls_allowed(&calls_off));
                         }
                     }
+                    Msg::Reconfigure => {
+                        if attached.is_some() {
+                            info!("live assist: AI Assist settings changed; sending the sidecar the new config");
+                            let allowed = calls_allowed(&calls_off);
+                            sidecar_allowed = Some(allowed);
+                            let config = sidecar_config(&app, allowed).await;
+                            to_sidecar(config);
+                        }
+                    }
                     Msg::CallDone { call_id, result } => {
                         if engine.in_flight() == Some(call_id) {
                             cancel = None;
@@ -496,7 +615,21 @@ async fn run<R: Runtime>(
     if let Some(token) = cancel.take() {
         token.cancel();
     }
-    save_pins(folder.as_deref(), &engine.pinned());
+    // The brief was for this call: kept with the meeting, then cleared so it
+    // does not leak into the next one. Compare-and-clear: a brief typed for
+    // the next call while this session wound down is left alone.
+    let brief = load_brief(&app);
+    let kept_brief = (!brief.trim().is_empty() && folder.is_some()).then_some(brief.as_str());
+    if let Some(folder) = folder.as_deref() {
+        if let Err(e) = write_pins(folder, &engine.pinned(), kept_brief) {
+            error!("live assist: failed to save pinned cards in {}: {e}", folder.display());
+        }
+    } else {
+        save_pins(None, &engine.pinned());
+    }
+    if !brief.is_empty() {
+        clear_brief_if(&app, &brief);
+    }
     emit_status(&app, "stopped", None);
 }
 
@@ -534,7 +667,8 @@ fn apply_sidecar_event<R: Runtime>(app: &AppHandle<R>, engine: &mut Engine, even
             }
             // Re-validate through the Rust parser (kinds, word limit, count).
             let raw = parse_cards(&serde_json::json!({ "cards": cards }).to_string()).unwrap_or_default();
-            let applied = engine.on_external_cards(call_id, raw, chrono::Utc::now().timestamp_millis());
+            let raw = keep_kinds(raw, &load_settings(app).card_kinds.enabled());
+            let applied = engine.on_external_cards(call_id, raw, None, chrono::Utc::now().timestamp_millis());
             info!(
                 "live assist: sidecar call {call_id} ({trigger}) added {} card(s), {} ms after the Speaker-Out end of turn (call {} ms)",
                 applied.added.len(),
@@ -550,6 +684,60 @@ fn apply_sidecar_event<R: Runtime>(app: &AppHandle<R>, engine: &mut Engine, even
             send_shown(engine);
             emit_status(app, "idle", None);
         }
+        SidecarEvent::ResearchStarted { research_id, question } => {
+            // DO NOT log the question: it is built from what was said.
+            info!("live assist: research {research_id} started");
+            if allowed {
+                emit_research(app, "started", &question, None, None);
+            }
+        }
+        SidecarEvent::ResearchError { research_id, question, error } => {
+            warn!("live assist: research {research_id:?} failed: {error}");
+            if allowed {
+                emit_research(app, "error", question.as_deref().unwrap_or(""), Some(error), None);
+            }
+        }
+        SidecarEvent::ResearchCards { research_id, question, cards, sources, call_ms } => {
+            if !allowed {
+                info!("live assist: dropping research {research_id}'s cards (assist off or stopped)");
+                return;
+            }
+            let raw = parse_cards(&serde_json::json!({ "cards": cards }).to_string()).unwrap_or_default();
+            let raw = keep_kinds(raw, &load_settings(app).card_kinds.enabled());
+            let origin = if sources.is_empty() { "research".to_string() } else { sources.join(", ") };
+            let applied = engine.on_external_cards(
+                research_id,
+                raw,
+                Some(origin),
+                chrono::Utc::now().timestamp_millis(),
+            );
+            info!(
+                "live assist: research {research_id} added {} card(s) (call {} ms)",
+                applied.added.len(),
+                call_ms.map_or("?".to_string(), |v| v.to_string()),
+            );
+            if !applied.added.is_empty() {
+                if let Err(e) = app.emit(ASSIST_UPDATE_EVENT, serde_json::json!({ "cards": applied.added })) {
+                    error!("live assist: failed to emit cards: {e}");
+                }
+            }
+            emit_withdraw(app, applied.evicted, "evicted");
+            send_shown(engine);
+            emit_research(app, "done", &question, None, Some(applied.added.len()));
+        }
+    }
+}
+
+fn emit_research<R: Runtime>(app: &AppHandle<R>, state: &str, question: &str, message: Option<String>, cards: Option<usize>) {
+    let mut payload = serde_json::json!({ "state": state, "question": question });
+    if let Some(m) = message {
+        payload["message"] = serde_json::Value::String(m);
+    }
+    if let Some(n) = cards {
+        payload["cards"] = serde_json::json!(n);
+    }
+    if let Err(e) = app.emit(ASSIST_RESEARCH_EVENT, payload) {
+        error!("live assist: failed to emit research status: {e}");
     }
 }
 
@@ -583,6 +771,7 @@ fn apply_result<R: Runtime>(
             Vec::new()
         }
     };
+    let raw = keep_kinds(raw, &load_settings(app).card_kinds.enabled());
     let applied = engine.on_call_done(call_id, raw, chrono::Utc::now().timestamp_millis());
     info!(
         "live assist: call {call_id} added {} card(s), {} ms after the Speaker-Out final",
@@ -599,25 +788,24 @@ fn apply_result<R: Runtime>(
 }
 
 async fn call_llm<R: Runtime>(app: &AppHandle<R>, prompt: &str, cancel: &CancellationToken) -> Result<String, String> {
-    let state = app.try_state::<AppState>().ok_or("database not ready")?;
-    let pool = state.db_manager.pool();
-    let settings = SettingsRepository::get_model_config(pool)
-        .await
-        .map_err(|e| format!("could not read the summary model setting: {e}"))?
-        .ok_or("no summary model is configured (Settings > Summary)")?;
-    let target = LlmTarget::resolve(pool, &settings.provider).await?;
+    let settings = load_settings(app);
+    let brief = load_brief(app);
+    // The Direct engine has no research lane: never offer the field.
+    let system = compose_prompt(&settings, &brief, false);
+    let (_, model, target) = assist_target(app, &settings).await?;
     let app_data_dir = app.path().app_data_dir().ok();
     let options = CompletionOptions {
         claude_max_tokens: CLAUDE_MAX_TOKENS,
         claude_thinking_off: true,
+        claude_cache_system: true,
         timeout: CALL_TIMEOUT,
     };
     let completion = generate_completion(
         &HTTP,
         &target.provider,
-        &settings.model,
+        &model,
         &target.api_key,
-        cards::SYSTEM_PROMPT,
+        &system,
         prompt,
         target.ollama_endpoint.as_deref(),
         target.custom_openai_endpoint.as_deref(),
@@ -662,6 +850,75 @@ pub fn set_enabled<R: Runtime>(app: &AppHandle<R>, enabled: bool) -> Result<(), 
     Ok(())
 }
 
+/// Settings › AI Assist. A missing or unreadable object is the defaults (the
+/// summary model, no context, all card kinds, no research).
+pub fn load_settings<R: Runtime>(app: &AppHandle<R>) -> AssistSettings {
+    let Ok(store) = app.store(SETTINGS_STORE) else { return AssistSettings::default() };
+    match store.get(SETTINGS_KEY) {
+        None => AssistSettings::default(),
+        Some(v) => serde_json::from_value(v).unwrap_or_else(|e| {
+            warn!("live assist: AI Assist settings unreadable ({e}); using the defaults");
+            AssistSettings::default()
+        }),
+    }
+}
+
+/// Validate and save Settings › AI Assist; a running call picks them up at
+/// once (the Direct engine reads them per call, the sidecar is re-sent its config).
+pub fn save_settings<R: Runtime>(app: &AppHandle<R>, settings: &AssistSettings) -> Result<(), String> {
+    settings.validate()?;
+    let store = app.store(SETTINGS_STORE).map_err(|e| format!("settings store unavailable: {e}"))?;
+    store.set(SETTINGS_KEY, serde_json::to_value(settings).map_err(|e| e.to_string())?);
+    store.save().map_err(|e| format!("could not save the AI Assist settings: {e}"))?;
+    info!("live assist: AI Assist settings saved");
+    reconfigure_session();
+    Ok(())
+}
+
+pub fn load_brief<R: Runtime>(app: &AppHandle<R>) -> String {
+    app.store(SETTINGS_STORE)
+        .ok()
+        .and_then(|store| store.get(BRIEF_KEY))
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+pub fn set_brief<R: Runtime>(app: &AppHandle<R>, brief: &str) -> Result<(), String> {
+    let total = brief.chars().count();
+    if total > settings::MAX_CONTEXT_CHARS {
+        return Err(format!("the meeting brief is {total} characters; the limit is {}", settings::MAX_CONTEXT_CHARS));
+    }
+    let store = app.store(SETTINGS_STORE).map_err(|e| format!("settings store unavailable: {e}"))?;
+    store.set(BRIEF_KEY, serde_json::Value::String(brief.to_string()));
+    store.save().map_err(|e| format!("could not save the meeting brief: {e}"))?;
+    reconfigure_session();
+    Ok(())
+}
+
+/// Clear the brief if it is still `expected`.
+fn clear_brief_if<R: Runtime>(app: &AppHandle<R>, expected: &str) {
+    let Ok(store) = app.store(SETTINGS_STORE) else { return };
+    if store.get(BRIEF_KEY).and_then(|v| v.as_str().map(str::to_string)).as_deref() != Some(expected) {
+        return;
+    }
+    store.delete(BRIEF_KEY);
+    if let Err(e) = store.save() {
+        warn!("live assist: could not clear the meeting brief: {e}");
+    }
+    if let Err(e) = app.emit(BRIEF_CLEARED_EVENT, ()) {
+        error!("live assist: failed to emit brief-cleared: {e}");
+    }
+}
+
+/// The brief was kept with the meeting that just stopped and cleared.
+pub const BRIEF_CLEARED_EVENT: &str = "assist-brief-cleared";
+
+fn reconfigure_session() {
+    if let Some(tx) = session_tx() {
+        let _ = tx.send(Msg::Reconfigure);
+    }
+}
+
 // ============================================================================
 // PINS
 // ============================================================================
@@ -670,6 +927,10 @@ pub fn set_enabled<R: Runtime>(app: &AppHandle<R>, enabled: bool) -> Result<(), 
 struct PinsFile {
     version: u32,
     cards: Vec<Card>,
+    /// The meeting brief the call ran with (WORK-581), written when the
+    /// recording stops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    brief: Option<String>,
 }
 
 /// Pin or unpin a card and write the pins. If they cannot be written, the
@@ -679,7 +940,7 @@ fn pin_and_save(engine: &mut Engine, folder: Option<&Path>, id: &str, pinned: bo
     let before = engine.cards().iter().find(|c| c.id == id).map(|c| c.pinned).ok_or("card not found")?;
     let card = engine.set_pinned(id, pinned).ok_or("card not found")?;
     let saved = match folder {
-        Some(folder) => write_pins(folder, &engine.pinned())
+        Some(folder) => write_pins(folder, &engine.pinned(), None)
             .map_err(|e| format!("could not save pinned cards in {}: {e}", folder.display())),
         None if pinned => Err("this recording has no meeting folder, so pins cannot be kept".to_string()),
         None => Ok(()),
@@ -699,19 +960,27 @@ fn save_pins(folder: Option<&Path>, pinned: &[Card]) {
         }
         return;
     };
-    if let Err(e) = write_pins(folder, pinned) {
+    if let Err(e) = write_pins(folder, pinned, None) {
         error!("live assist: failed to save pinned cards in {}: {e}", folder.display());
     }
 }
 
-/// Write the pins atomically (temp file + rename in the same folder). No
-/// pins and no file yet: nothing is written.
-fn write_pins(folder: &Path, pinned: &[Card]) -> std::io::Result<()> {
+/// Write the pins (and, when the recording stops, the brief) atomically:
+/// temp file + rename in the same folder. Nothing to keep and no file yet:
+/// nothing is written. A write without a brief keeps the one on disk.
+fn write_pins(folder: &Path, pinned: &[Card], brief: Option<&str>) -> std::io::Result<()> {
     let path = folder.join(PINS_FILE);
-    if pinned.is_empty() && !path.exists() {
+    if pinned.is_empty() && brief.is_none() && !path.exists() {
         return Ok(());
     }
-    let body = serde_json::to_vec_pretty(&PinsFile { version: 1, cards: pinned.to_vec() })?;
+    let brief = match brief {
+        Some(b) => Some(b.to_string()),
+        None => std::fs::read(&path)
+            .ok()
+            .and_then(|body| serde_json::from_slice::<PinsFile>(&body).ok())
+            .and_then(|f| f.brief),
+    };
+    let body = serde_json::to_vec_pretty(&PinsFile { version: 1, cards: pinned.to_vec(), brief })?;
     let tmp = folder.join(format!(".{PINS_FILE}.tmp"));
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, &path)
@@ -771,6 +1040,128 @@ pub async fn live_assist_set_pinned(id: String, pinned: bool) -> Result<Card, St
     rx.await.map_err(|_| "not recording")?
 }
 
+/// Settings › AI Assist.
+#[tauri::command]
+pub async fn ai_assist_get_settings<R: Runtime>(app: AppHandle<R>) -> AssistSettings {
+    load_settings(&app)
+}
+
+#[tauri::command]
+pub async fn ai_assist_save_settings<R: Runtime>(app: AppHandle<R>, settings: AssistSettings) -> Result<(), String> {
+    save_settings(&app, &settings)
+}
+
+#[tauri::command]
+pub async fn ai_assist_get_brief<R: Runtime>(app: AppHandle<R>) -> String {
+    load_brief(&app)
+}
+
+#[tauri::command]
+pub async fn ai_assist_set_brief<R: Runtime>(app: AppHandle<R>, brief: String) -> Result<(), String> {
+    set_brief(&app, &brief)
+}
+
+/// What Settings shows: the built-in rules (not editable) and the full
+/// system prompt these settings and the current brief produce. `settings`
+/// is the unsaved form; `research` is whether the Pipecat engine's lane
+/// would be on.
+#[derive(Serialize)]
+pub struct PromptPreview {
+    built_in: String,
+    full: String,
+    research: Option<String>,
+}
+
+#[tauri::command]
+pub async fn ai_assist_prompt_preview<R: Runtime>(app: AppHandle<R>, settings: AssistSettings) -> PromptPreview {
+    let brief = load_brief(&app);
+    let research = research_on(&settings);
+    let parts = prompt_parts(&settings, &brief, research);
+    PromptPreview {
+        built_in: cards::built_in_rules(&parts),
+        full: cards::system_prompt(&parts),
+        research: research.then(|| cards::research_prompt(&prompt_parts(&settings, &brief, true))),
+    }
+}
+
+/// An earlier meeting the brief can draw on.
+#[derive(Serialize)]
+pub struct EarlierMeeting {
+    id: String,
+    title: String,
+    created_at: String,
+    /// The summary's opening, plain text; empty when it has no summary yet.
+    summary: String,
+}
+
+/// Most characters of one earlier meeting's summary put in the brief.
+const EARLIER_SUMMARY_CHARS: usize = 1_500;
+
+/// Earlier meetings for the brief: every word of `query` in the title or the
+/// summary, newest first. Meetily keeps no attendee list, and a recording's
+/// title is a timestamp until its summary names it, so the match is on
+/// words (an account, a person, a topic), not on this call's title.
+#[tauri::command]
+pub async fn ai_assist_find_meetings(
+    state: tauri::State<'_, AppState>,
+    query: String,
+) -> Result<Vec<EarlierMeeting>, String> {
+    let words: Vec<String> = query.split_whitespace().take(6).map(|w| w.to_lowercase()).collect();
+    let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT m.id, m.title, m.created_at, sp.result FROM meetings m \
+         LEFT JOIN summary_processes sp ON sp.meeting_id = m.id \
+         ORDER BY m.created_at DESC LIMIT 400",
+    )
+    .fetch_all(state.db_manager.pool())
+    .await
+    .map_err(|e| format!("could not read meetings: {e}"))?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id, title, created_at, result)| {
+            let summary = result.as_deref().map(summary_text).unwrap_or_default();
+            let haystack = format!("{} {}", title.to_lowercase(), summary.to_lowercase());
+            if !words.iter().all(|w| haystack.contains(w.as_str())) {
+                return None;
+            }
+            Some(EarlierMeeting { id, title, created_at, summary: clip_chars(&summary, EARLIER_SUMMARY_CHARS) })
+        })
+        .take(12)
+        .collect())
+}
+
+/// Plain summary text from a `summary_processes.result` JSON: its Markdown
+/// (top level, or the `english_cache` copy) without the title heading.
+fn summary_text(result: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(result) else { return String::new() };
+    let markdown = value
+        .get("markdown")
+        .and_then(|v| v.as_str())
+        .or_else(|| value.pointer("/english_cache/markdown").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    markdown
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("# "))
+        .map(|l| l.replace("**", ""))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn clip_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    format!("{}…", text.chars().take(max).collect::<String>().trim_end())
+}
+
+/// Connect to one MCP server and list its tools (Settings › AI Assist
+/// "Test"). The same check the research lane's first lookup would hit.
+#[tauri::command]
+pub async fn ai_assist_test_mcp(server: settings::McpServer) -> Result<Vec<mcp_probe::ToolInfo>, String> {
+    mcp_probe::list_tools(&server).await
+}
+
 /// Pinned cards saved with a meeting (empty when it has none).
 #[tauri::command]
 pub async fn live_assist_get_pinned(state: tauri::State<'_, AppState>, meeting_id: String) -> Result<Vec<Card>, String> {
@@ -798,6 +1189,7 @@ mod tests {
             source_seq: 7,
             pinned: true,
             created_at_ms: 1_763_400_000_000,
+            origin: None,
         }
     }
 
@@ -805,9 +1197,9 @@ mod tests {
     fn pins_round_trip_through_the_meeting_folder() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(read_pins(dir.path()), Ok(vec![]), "no file: no pins");
-        write_pins(dir.path(), &[card("a"), card("b")]).unwrap();
+        write_pins(dir.path(), &[card("a"), card("b")], None).unwrap();
         assert_eq!(read_pins(dir.path()).unwrap(), vec![card("a"), card("b")]);
-        write_pins(dir.path(), &[]).unwrap();
+        write_pins(dir.path(), &[], None).unwrap();
         assert_eq!(read_pins(dir.path()), Ok(vec![]), "unpinning the last card empties the file");
         let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(leftovers, vec![std::ffi::OsString::from(PINS_FILE)], "no temp file left behind");
@@ -848,7 +1240,7 @@ mod tests {
     #[test]
     fn no_pins_writes_no_file() {
         let dir = tempfile::tempdir().unwrap();
-        write_pins(dir.path(), &[]).unwrap();
+        write_pins(dir.path(), &[], None).unwrap();
         assert!(!dir.path().join(PINS_FILE).exists());
     }
 

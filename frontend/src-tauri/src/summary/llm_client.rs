@@ -106,7 +106,9 @@ pub struct MessageContent {
 pub struct ClaudeRequest {
     pub model: String,
     pub max_tokens: u32,
-    pub system: String,
+    /// A plain string, or (live assist with prompt caching) one text block
+    /// carrying `cache_control`.
+    pub system: serde_json::Value,
     pub messages: Vec<ChatMessage>,
     /// Omitted for summaries (the model's default). Live assist sends the
     /// thinking-off setting, see `CLAUDE_THINKING_OFF`.
@@ -125,6 +127,12 @@ pub(crate) struct CompletionOptions {
     /// default thinking a Sonnet 5.5 assist call took 4.0-4.9 s, without it
     /// 1.8-2.0 s (measured 2026-11-17, WORK-524).
     pub claude_thinking_off: bool,
+    /// Mark Claude's system prompt cacheable (`cache_control: ephemeral`).
+    /// Live assist sends the same system prompt (rules, background,
+    /// knowledge, brief) on every call of a meeting; cached, it is read at a
+    /// tenth of the input price and faster. A prompt below the model's
+    /// minimum cacheable length is simply not cached, with no error.
+    pub claude_cache_system: bool,
     /// Whole-request timeout (connect, send, response headers).
     pub timeout: Duration,
 }
@@ -134,6 +142,7 @@ impl CompletionOptions {
         Self {
             claude_max_tokens: 8192,
             claude_thinking_off: false,
+            claude_cache_system: false,
             timeout: REQUEST_TIMEOUT_DURATION,
         }
     }
@@ -146,16 +155,23 @@ impl CompletionOptions {
 /// spots that and the caller retries once without the field.
 pub(crate) const CLAUDE_THINKING_OFF: &str = "between_tools";
 
-/// Claude request body. `thinking_off` adds `CLAUDE_THINKING_OFF`.
+/// Claude request body. `thinking_off` adds `CLAUDE_THINKING_OFF`;
+/// `cache_system` sends the system prompt as one cacheable text block.
 pub(crate) fn build_claude_body(
     model_name: &str,
     system_prompt: &str,
     user_prompt: &str,
     max_tokens: u32,
     thinking_off: bool,
+    cache_system: bool,
 ) -> serde_json::Value {
+    let system = if cache_system {
+        serde_json::json!([{ "type": "text", "text": system_prompt, "cache_control": { "type": "ephemeral" } }])
+    } else {
+        serde_json::Value::String(system_prompt.to_string())
+    };
     serde_json::json!(ClaudeRequest {
-        system: system_prompt.to_string(),
+        system,
         model: model_name.to_string(),
         max_tokens,
         messages: vec![ChatMessage {
@@ -484,6 +500,7 @@ pub(crate) async fn generate_completion(
             user_prompt,
             options.claude_max_tokens,
             options.claude_thinking_off,
+            options.claude_cache_system,
         )
     };
 
@@ -1021,7 +1038,7 @@ mod tests {
     fn summary_claude_body_keeps_the_model_default_thinking() {
         let options = CompletionOptions::summary();
         assert!(!options.claude_thinking_off);
-        let body = build_claude_body("m", "sys", "user", options.claude_max_tokens, options.claude_thinking_off);
+        let body = build_claude_body("m", "sys", "user", options.claude_max_tokens, options.claude_thinking_off, options.claude_cache_system);
         assert!(body.get("thinking").is_none(), "summaries must not change thinking: {body}");
         assert_eq!(body["max_tokens"], 8192);
         assert_eq!(body["system"], "sys");
@@ -1030,9 +1047,19 @@ mod tests {
 
     #[test]
     fn thinking_off_uses_the_value_the_api_accepts() {
-        let body = build_claude_body("m", "sys", "user", 400, true);
+        let body = build_claude_body("m", "sys", "user", 400, true, false);
         assert_eq!(body["thinking"], json!({"type": "between_tools"}));
         assert_ne!(body["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn a_cached_system_prompt_is_one_ephemeral_text_block() {
+        let body = build_claude_body("m", "rules and background", "user", 400, true, true);
+        assert_eq!(
+            body["system"],
+            json!([{ "type": "text", "text": "rules and background", "cache_control": { "type": "ephemeral" } }])
+        );
+        assert!(!CompletionOptions::summary().claude_cache_system, "summaries are unchanged");
     }
 
     #[test]

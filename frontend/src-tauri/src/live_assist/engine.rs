@@ -59,6 +59,10 @@ pub struct Card {
     pub pinned: bool,
     /// Unix epoch milliseconds.
     pub created_at_ms: i64,
+    /// Where a research card's fact came from (the MCP servers the lookup
+    /// used, WORK-581). Absent on cards from the transcript and background.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 /// What a call needs: its id (to match the result), the context lines and
@@ -201,9 +205,29 @@ impl Engine {
     /// the window as it is now, which already holds the turn that triggered
     /// the call (its line arrives while the model is still answering) and no
     /// longer holds lines retracted meanwhile. Same dedup and eviction rules.
-    pub fn on_external_cards(&mut self, call_id: u64, raw: Vec<RawCard>, created_at_ms: i64) -> Applied {
+    ///
+    /// `origin` marks research cards (the research lane's lookups, which have
+    /// their own id sequence, so their ids get their own prefix).
+    pub fn on_external_cards(
+        &mut self,
+        call_id: u64,
+        raw: Vec<RawCard>,
+        origin: Option<String>,
+        created_at_ms: i64,
+    ) -> Applied {
         let lines: Vec<Line> = self.lines.iter().cloned().collect();
-        self.add_cards(&format!("assist-p{call_id}"), &lines, &[], raw, created_at_ms)
+        let prefix = if origin.is_some() { format!("assist-r{call_id}") } else { format!("assist-p{call_id}") };
+        let mut applied = self.add_cards(&prefix, &lines, &[], raw, created_at_ms);
+        if origin.is_some() {
+            let ids: Vec<String> = applied.added.iter().map(|c| c.id.clone()).collect();
+            for card in self.cards.iter_mut().filter(|c| ids.contains(&c.id)) {
+                card.origin = origin.clone();
+            }
+            for card in &mut applied.added {
+                card.origin = origin.clone();
+            }
+        }
+        applied
     }
 
     /// Texts sent with a call so the model does not repeat itself: the cards
@@ -247,6 +271,7 @@ impl Engine {
                 source_seq,
                 pinned: false,
                 created_at_ms,
+                origin: None,
             });
         }
         // The model lists cards in its own order; show the first one on top.
@@ -371,6 +396,7 @@ mod tests {
                 raw(CardKind::Fact, "40k calls a day", "forty thousand calls"),
                 raw(CardKind::Ask, "Which plan?", "pricing"),
             ],
+            None,
             5,
         );
         let got: Vec<(&str, u64)> = applied.added.iter().map(|c| (c.text.as_str(), c.source_seq)).collect();
@@ -379,8 +405,28 @@ mod tests {
         assert_eq!(e.in_flight(), None, "no Rust call is involved");
         e.dismiss(&applied.added[1].id.clone());
         assert_eq!(e.shown_texts(), vec!["Which plan?".to_string(), "40k calls a day".to_string()]);
-        let again = e.on_external_cards(8, vec![raw(CardKind::Fact, "40k calls a day", "")], 6);
+        let again = e.on_external_cards(8, vec![raw(CardKind::Fact, "40k calls a day", "")], None, 6);
         assert!(again.added.is_empty(), "a dismissed card is not shown again");
+    }
+
+    #[test]
+    fn research_cards_carry_their_origin_and_their_own_ids() {
+        let t0 = Instant::now();
+        let mut e = Engine::new(Config::default());
+        e.on_line(1, Side::Them, "What does nova-3 streaming cost per minute?", t0);
+        let applied = e.on_external_cards(
+            1,
+            vec![raw(CardKind::Fact, "$0.0077/min pay-as-you-go", "What does nova-3 streaming cost per minute?")],
+            Some("DeepHive".into()),
+            9,
+        );
+        assert_eq!(applied.added.len(), 1);
+        assert!(applied.added[0].id.starts_with("assist-r1-"), "{}", applied.added[0].id);
+        assert_eq!(applied.added[0].origin.as_deref(), Some("DeepHive"));
+        assert_eq!(e.cards()[0].origin.as_deref(), Some("DeepHive"), "the engine's copy carries it too");
+        let fast = e.on_external_cards(1, vec![raw(CardKind::Ask, "Which volume?", "cost per minute")], None, 10);
+        assert!(fast.added[0].id.starts_with("assist-p1-"), "a fast call with the same id cannot collide");
+        assert_eq!(fast.added[0].origin, None);
     }
 
     #[test]
@@ -390,7 +436,7 @@ mod tests {
         e.on_line(1, Side::Them, "Send me the SOC 2 report.", t0);
         e.on_line(2, Side::Me, "Send me the SOC 2 report.", t0); // bleed
         e.on_retract(2);
-        let applied = e.on_external_cards(1, vec![raw(CardKind::Todo, "Send SOC 2", "Send me the SOC 2 report")], 0);
+        let applied = e.on_external_cards(1, vec![raw(CardKind::Todo, "Send SOC 2", "Send me the SOC 2 report")], None, 0);
         assert_eq!(applied.added[0].source_seq, 1, "never tied to the retracted Mic-In copy");
     }
 

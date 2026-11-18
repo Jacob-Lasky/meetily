@@ -9,7 +9,7 @@ import { Switch } from './ui/switch';
 import { ASSIST_STATUS_EVENT, AssistStatus } from '@/lib/live-assist';
 
 /**
- * Settings > Summary: the live-assist switch (the tray's "Live Assist" item
+ * Settings › AI Assist: the live-assist switch (the tray's "Live Assist" item
  * flips the same setting). Off by default; while off the app makes no
  * live-assist model calls. Stored by the backend (live_assist_set_enabled) so
  * it applies while the window is hidden too.
@@ -55,7 +55,7 @@ export function LiveAssistSettings() {
           </div>
           <p className="text-sm text-gray-600">
             While recording, shows short suggestion cards (answers, follow-up questions, facts, to-dos) after the
-            other side speaks. Uses the summary model above: on the Direct live engine at most one call every 5
+            other side speaks, using what you set below. On the Direct live engine at most one call every 5
             seconds, on the Pipecat engine one call each time the other side finishes a turn. Needs the Deepgram
             provider recording system audio, which is how the app tells your microphone from the other side.
           </p>

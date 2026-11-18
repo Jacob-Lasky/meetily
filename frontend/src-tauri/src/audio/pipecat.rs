@@ -797,10 +797,11 @@ pub(crate) mod tests {
         let venv = tempfile::tempdir().unwrap();
         let err = SidecarCommand::run("/opt/app/pipecat-sidecar".into(), venv.path()).unwrap_err();
         assert!(err.contains("still being set up"), "{err}");
-        std::fs::create_dir_all(venv.path().join("bin")).unwrap();
-        std::fs::write(venv.path().join("bin/python"), b"").unwrap();
+        let python = super::venv_python(venv.path());
+        std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+        std::fs::write(&python, b"").unwrap();
         let run = SidecarCommand::run("/opt/app/pipecat-sidecar".into(), venv.path()).unwrap();
-        assert_eq!(run.program, venv.path().join("bin/python"), "the held PID is the sidecar, not uv");
+        assert_eq!(run.program, python, "the held PID is the sidecar, not uv");
         assert_eq!(run.args, vec!["-m", "meetily_sidecar"]);
         assert!(run.env.contains(&("PYTHONDONTWRITEBYTECODE".into(), "1".into())));
         let sync = SidecarCommand::sync("/usr/bin/uv".into(), "/opt/app/pipecat-sidecar".into(), "/data/venv".into());

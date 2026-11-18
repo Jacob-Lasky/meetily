@@ -67,7 +67,9 @@ export function LiveAssistPanel({ isRecording }: { isRecording: boolean }) {
         setCards((prev) => withoutIds(prev, e.payload.ids));
       }),
       listen<AssistResearch>(ASSIST_RESEARCH_EVENT, (e) => setResearch(e.payload)),
-      listen<AssistBriefRead>(ASSIST_BRIEF_EVENT, (e) => setBriefRead(e.payload)),
+      listen<AssistBriefRead>(ASSIST_BRIEF_EVENT, (e) =>
+        setBriefRead(e.payload.state === 'cancelled' ? null : e.payload),
+      ),
       listen<AssistStatus>(ASSIST_STATUS_EVENT, (e) => {
         setStatus(e.payload);
         if (e.payload.state === 'off') setEnabled(false);

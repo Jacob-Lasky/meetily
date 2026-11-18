@@ -55,7 +55,9 @@ pub const ASSIST_STATUS_EVENT: &str = "assist-status";
 /// "question": string, "message"?: string, "cards"?: number }`.
 pub const ASSIST_RESEARCH_EVENT: &str = "assist-research";
 /// Reading the meeting brief (WORK-559): `{ "state": "reading" | "done" |
-/// "error", "chars": number, "cards"?: number, "message"?: string }`.
+/// "error" | "cancelled", "chars": number, "cards"?: number, "message"?: string }`.
+/// "cancelled": a read stopped before its result (brief changed or cleared,
+/// assist turned off); the panel drops its "Reading" line.
 pub const ASSIST_BRIEF_EVENT: &str = "assist-brief";
 
 const SETTINGS_STORE: &str = "live_assist.json";
@@ -666,25 +668,29 @@ async fn run<R: Runtime>(
                     }
                     Msg::Reconfigure => {
                         let brief = load_brief(&app);
-                        if brief_read.is_some() && brief_read.as_deref() != Some(brief.as_str()) {
+                        if brief_read.as_deref() != Some(brief.as_str()) {
                             // The brief changed after a read started: that read's
                             // result is about the old text, so drop it (a newer
-                            // read number), and a cleared brief takes its cards
-                            // with it.
+                            // read number).
                             if let Some(token) = brief_cancel.take() {
                                 token.cancel();
+                                emit_brief(&app, "cancelled", 0, None, None);
                             }
                             brief_reads += 1;
                             brief_read = None;
-                            if brief.trim().is_empty() {
-                                brief_due = None;
-                                emit_withdraw(&app, engine.withdraw_brief_cards(), "evicted");
+                        }
+                        if brief.trim().is_empty() {
+                            // A cleared brief takes its cards with it, whatever
+                            // was read or scheduled before.
+                            brief_due = None;
+                            let withdrawn = engine.withdraw_brief_cards();
+                            if !withdrawn.is_empty() {
+                                emit_withdraw(&app, withdrawn, "evicted");
                                 if attached.is_some() {
                                     send_shown(&engine);
                                 }
                             }
-                        }
-                        if !brief.trim().is_empty() && brief_read.as_deref() != Some(brief.as_str()) {
+                        } else if brief_read.as_deref() != Some(brief.as_str()) {
                             brief_due = Some(Instant::now() + BRIEF_SETTLE);
                         }
                         if attached.is_some() {
@@ -776,6 +782,7 @@ async fn run<R: Runtime>(
                 // Read again when calls are allowed again (assist back on);
                 // after Stop they never are, so this does nothing then.
                 token.cancel();
+                emit_brief(&app, "cancelled", 0, None, None);
                 brief_reads += 1;
                 brief_read = None;
                 brief_due = Some(Instant::now());

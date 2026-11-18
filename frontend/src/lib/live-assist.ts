@@ -57,7 +57,8 @@ export interface AssistResearch {
 }
 
 export interface AssistBriefRead {
-  state: 'reading' | 'done' | 'error';
+  /** 'cancelled': the read stopped before a result (brief changed, assist off). */
+  state: 'reading' | 'done' | 'error' | 'cancelled';
   /** Length of the brief that was read. */
   chars: number;
   /** Cards the read added (state 'done'). */

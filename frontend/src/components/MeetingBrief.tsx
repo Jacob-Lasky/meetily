@@ -107,7 +107,7 @@ export function MeetingBrief({ defaultOpen }: { defaultOpen: boolean }) {
           <textarea
             aria-label="Meeting brief"
             rows={5}
-            className="w-full rounded-md border border-gray-300 p-2 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400"
+            className="w-full rounded-md border border-gray-300 bg-white p-2 text-xs text-gray-900 placeholder:text-gray-500 focus:outline-none focus:ring-1 focus:ring-blue-400"
             placeholder="Agenda, account, who is on the call, what you want out of it…"
             value={brief}
             onChange={(e) => change(e.target.value)}
@@ -116,7 +116,7 @@ export function MeetingBrief({ defaultOpen }: { defaultOpen: boolean }) {
             <Search className="w-3.5 h-3.5 text-gray-400 absolute left-2 top-2" />
             <input
               aria-label="Find earlier meetings"
-              className="w-full rounded-md border border-gray-300 pl-7 pr-2 py-1 text-xs"
+              className="w-full rounded-md border border-gray-300 bg-white pl-7 pr-2 py-1 text-xs text-gray-900 placeholder:text-gray-500"
               placeholder="Add earlier meetings: account, person, topic"
               value={query}
               onChange={(e) => setQuery(e.target.value)}

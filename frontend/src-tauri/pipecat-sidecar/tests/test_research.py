@@ -534,3 +534,57 @@ async def test_the_wait_is_one_shared_deadline(monkeypatch):
     started = loop.time()
     await r.close()
     assert loop.time() - started < 0.25, "three hanging servers must share one deadline, not wait in turn"
+
+
+async def test_closing_clients_shares_the_deadline(monkeypatch):
+    import meetily_sidecar.research as research_mod
+
+    monkeypatch.setattr(research_mod, "WARM_UP_CLOSE_WAIT_SECS", 0.1)
+
+    class SlowToClose(FakeTools):
+        async def close(self):
+            await asyncio.sleep(10)
+
+    class Hanging(FakeTools):
+        async def list(self):
+            await asyncio.sleep(10)
+
+    r = Research(lambda m: None)
+    await r.configure(tools=Hanging(), loop=loop_that("{}"), system_prompt="", limits=ResearchLimits(), config_key="a")
+    r._tools = SlowToClose()  # the current source is slow to close
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await asyncio.wait_for(r.close(), 2)
+    assert loop.time() - started < 0.25, "closing the clients must count against the one deadline"
+
+
+async def test_a_swap_still_closing_its_old_source_starts_no_warm_up_after_close():
+    gate = asyncio.Event()
+
+    class SlowOld(FakeTools):
+        async def close(self):
+            self.closed += 1
+            await gate.wait()
+
+    class Recording(FakeTools):
+        listed = 0
+
+        async def list(self):
+            Recording.listed += 1
+            return await super().list()
+
+    r = Research(lambda m: None)
+    old = SlowOld()
+    await r.configure(tools=old, loop=loop_that("{}"), system_prompt="", limits=ResearchLimits(), config_key="a")
+    await settle()
+    new = Recording()
+    swap = asyncio.create_task(
+        r.configure(tools=new, loop=loop_that("{}"), system_prompt="", limits=ResearchLimits(), config_key="b")
+    )
+    await settle()  # the swap is waiting on the old source's close
+    await r.close()
+    gate.set()
+    await swap
+    await settle()
+    assert Recording.listed == 0, "a warm-up started after close() returned"
+    assert new.closed == 1 and not r.has_tools

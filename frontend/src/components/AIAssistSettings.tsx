@@ -518,6 +518,11 @@ function ResearchSection({
         on={form.builtin.deepgramDocs}
         onChange={(v) => update({ builtin: { ...form.builtin, deepgramDocs: v } })}
       />
+      <BuiltinDocs
+        variant="pipecatDaily"
+        on={form.builtin.pipecatDailyDocs}
+        onChange={(v) => update({ builtin: { ...form.builtin, pipecatDailyDocs: v } })}
+      />
       <ul className="space-y-3">
         {servers.map((s, i) => (
           <McpServerEditor
@@ -728,12 +733,15 @@ function BuiltinOverview({
     <div className="rounded border border-blue-200 bg-blue-50/40 p-3 mb-4" data-testid="builtin-overview">
       <div className="flex items-center gap-3">
         <Switch checked={on} aria-label="Use the built-in Deepgram overview" onCheckedChange={onChange} />
-        <span className="flex-1 text-sm font-medium text-gray-900">Deepgram public overview (built in)</span>
+        <span className="flex-1 text-sm font-medium text-gray-900">
+          Deepgram, Pipecat and Daily public overview (built in)
+        </span>
         <span className="text-xs text-gray-500">{text ? `${[...text].length.toLocaleString()} chars` : ''}</span>
       </div>
       <p className="text-xs text-gray-600 mt-1 ml-12">
-        Products, models, pricing tiers, deployment and trust facts from deepgram.com/llms.txt. Ships with the app, so a
-        colleague gets Deepgram-aware cards with nothing to paste.
+        Deepgram&apos;s products, models, pricing tiers, deployment and trust facts (deepgram.com/llms.txt), plus what
+        Pipecat and Daily are and do (their docs&apos; llms.txt). Ships with the app, so a colleague gets aware cards
+        with nothing to paste.
       </p>
       {text && (
         <details className="mt-2 ml-12">
@@ -747,33 +755,52 @@ function BuiltinOverview({
   );
 }
 
-/** The built-in Deepgram docs research server, on by default. */
-function BuiltinDocs({ on, onChange }: { on: boolean; onChange: (v: boolean) => void }) {
+const BUILTIN_DOCS = {
+  deepgram: {
+    title: 'Deepgram docs (built in)',
+    command: 'ai_assist_test_builtin_docs',
+    help: "Deepgram's hosted docs search (developers.deepgram.com), signed in with the Deepgram API key saved for transcription. Lookups answer from the official docs.",
+  },
+  pipecatDaily: {
+    title: 'Pipecat and Daily docs (built in)',
+    command: 'ai_assist_test_builtin_pipecat_daily',
+    help: "Pipecat's and Daily's public docs search (docs.pipecat.ai, docs.daily.co). No sign-in; search only.",
+  },
+} as const;
+
+/** A built-in docs research server, on by default. */
+function BuiltinDocs({
+  on,
+  onChange,
+  variant = 'deepgram',
+}: {
+  on: boolean;
+  onChange: (v: boolean) => void;
+  variant?: keyof typeof BUILTIN_DOCS;
+}) {
+  const docs = BUILTIN_DOCS[variant];
   const [testing, setTesting] = useState(false);
   const test = async () => {
     setTesting(true);
     try {
-      const tools = await invoke<McpToolInfo[]>('ai_assist_test_builtin_docs');
-      toast.success(`Deepgram docs: ${tools.map((t) => t.name).join(', ') || 'no tools'}`);
+      const tools = await invoke<McpToolInfo[]>(docs.command);
+      toast.success(`${docs.title}: ${tools.map((t) => t.name).join(', ') || 'no tools'}`);
     } catch (e) {
-      toast.error('Deepgram docs did not connect', { description: String(e) });
+      toast.error(`${docs.title} did not connect`, { description: String(e) });
     } finally {
       setTesting(false);
     }
   };
   return (
-    <div className="rounded border border-blue-200 bg-blue-50/40 p-3 mb-3" data-testid="builtin-docs">
+    <div className="rounded border border-blue-200 bg-blue-50/40 p-3 mb-3" data-testid={`builtin-docs-${variant}`}>
       <div className="flex items-center gap-3">
-        <Switch checked={on} aria-label="Use the built-in Deepgram docs" onCheckedChange={onChange} />
-        <span className="flex-1 text-sm font-medium text-gray-900">Deepgram docs (built in)</span>
+        <Switch checked={on} aria-label={`Use the ${docs.title}`} onCheckedChange={onChange} />
+        <span className="flex-1 text-sm font-medium text-gray-900">{docs.title}</span>
         <Button variant="outline" size="sm" onClick={test} disabled={testing}>
           {testing ? 'Testing…' : 'Test'}
         </Button>
       </div>
-      <p className="text-xs text-gray-600 mt-1 ml-12">
-        Deepgram&apos;s hosted docs search (developers.deepgram.com), signed in with the Deepgram API key saved for
-        transcription. Lookups answer from the official docs.
-      </p>
+      <p className="text-xs text-gray-600 mt-1 ml-12">{docs.help}</p>
     </div>
   );
 }

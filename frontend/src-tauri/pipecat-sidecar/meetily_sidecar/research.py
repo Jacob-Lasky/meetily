@@ -223,6 +223,18 @@ def tool_name_for(tool: str, server: str, taken: set[str]) -> str:
     return candidate
 
 
+#: Most characters of one tool result handed to the model. Docs searches
+#: return 12-20k characters (measured 2026-11-18, Pipecat and Daily docs);
+#: every round re-sends them, so uncut they slow each lookup and grow its cost.
+MAX_TOOL_RESULT_CHARS = 8000
+
+
+def clip_tool_result(text: str) -> str:
+    if len(text) <= MAX_TOOL_RESULT_CHARS:
+        return text
+    return text[:MAX_TOOL_RESULT_CHARS] + f"\n[cut: {len(text) - MAX_TOOL_RESULT_CHARS} more characters]"
+
+
 #: The most session end spends on MCP connections. Rust gives the sidecar
 #: SHUTDOWN_TIMEOUT (5 s, `audio/pipecat.rs`) from closing its stdin to
 #: exiting before it kills it; 3 s here leaves 2 s of that for the rest of
@@ -232,9 +244,9 @@ def tool_name_for(tool: str, server: str, taken: set[str]) -> str:
 #: WARM_UP_CLOSE_WAIT_SECS, on one deadline, letting the cancelled lookup
 #: finish, closing the current MCP clients and waiting for every MCP server
 #: still connecting, and then returns. A lookup still unwinding, a client
-#: still closing or a server still connecting after that is abandoned: an HTTP or SSE connection is dropped, and a stdio server's
-#: stdin pipe closes when the sidecar exits. Whether that server then exits
-#: is up to the server.
+#: still closing or a server still connecting after that is abandoned: an
+#: HTTP or SSE connection is dropped, and a stdio server's stdin pipe closes
+#: when the sidecar exits. Whether that server then exits is up to the server.
 WARM_UP_CLOSE_WAIT_SECS = 3.0
 
 
@@ -371,7 +383,7 @@ class Research:
             spec = next((t for t in specs if t.name == name), None)
             if spec is not None:
                 lookup.sources.add(spec.server)
-            return await tools.call(name, arguments)
+            return clip_tool_result(await tools.call(name, arguments))
 
         error = None
         output = ""

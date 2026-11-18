@@ -381,7 +381,13 @@ async fn assist_target<R: Runtime>(
 }
 
 use settings::DEEPGRAM_PUBLIC;
-const DEEPGRAM_PUBLIC_NAME: &str = "Deepgram public overview (built in)";
+const DEEPGRAM_PUBLIC_NAME: &str = "Deepgram, Pipecat and Daily public overview (built in)";
+/// Pipecat's and Daily's public docs MCP servers (Mintlify; no sign-in).
+/// Only their search tools: each also lists `submit_feedback`, which writes.
+const PIPECAT_DOCS_MCP_URL: &str = "https://docs.pipecat.ai/mcp";
+const PIPECAT_DOCS_TOOL: &str = "search_pipecat";
+const DAILY_DOCS_MCP_URL: &str = "https://docs.daily.co/mcp";
+const DAILY_DOCS_TOOL: &str = "search_daily";
 /// Deepgram's hosted docs MCP server (developers.deepgram.com, "Agentic
 /// Developer Tools"); it takes `Authorization: Token <Deepgram API key>`.
 const DEEPGRAM_DOCS_MCP_URL: &str = "https://api.dx.deepgram.com/kapa/mcp";
@@ -392,7 +398,9 @@ const DEEPGRAM_DOCS_TOOL: &str = "search_deepgram_knowledge_sources";
 /// docs server can connect (a Deepgram key) is settled in `research_servers`.
 fn research_wanted(settings: &AssistSettings) -> bool {
     settings.research.enabled
-        && (!settings.research.active_servers().is_empty() || settings.builtin.deepgram_docs)
+        && (!settings.research.active_servers().is_empty()
+            || settings.builtin.deepgram_docs
+            || settings.builtin.pipecat_daily_docs)
         && (settings.card_kinds.answer || settings.card_kinds.fact)
 }
 
@@ -459,6 +467,9 @@ async fn research_servers<R: Runtime>(app: &AppHandle<R>, settings: &AssistSetti
             Some(docs) => servers.push(docs),
             None => info!("live assist: no Deepgram key saved; the built-in Deepgram docs server is skipped"),
         }
+    }
+    if settings.builtin.pipecat_daily_docs {
+        servers.extend(pipecat_daily_docs_servers());
     }
     servers
         .iter()
@@ -1319,6 +1330,45 @@ fn clip_chars(text: &str, max: usize) -> String {
     format!("{}…", text.chars().take(max).collect::<String>().trim_end())
 }
 
+/// The built-in Pipecat and Daily docs servers (public, no headers).
+fn pipecat_daily_docs_servers() -> [settings::McpServer; 2] {
+    let server = |id: &str, name: &str, url: &str, tool: &str| settings::McpServer {
+        id: id.into(),
+        name: name.into(),
+        enabled: true,
+        transport: McpTransport::Http,
+        command: String::new(),
+        args: Vec::new(),
+        env: Default::default(),
+        url: url.into(),
+        headers: Default::default(),
+        allowed_tools: vec![tool.into()],
+    };
+    [
+        server("builtin-pipecat-docs", settings::BUILTIN_PIPECAT_DOCS_NAME, PIPECAT_DOCS_MCP_URL, PIPECAT_DOCS_TOOL),
+        server("builtin-daily-docs", settings::BUILTIN_DAILY_DOCS_NAME, DAILY_DOCS_MCP_URL, DAILY_DOCS_TOOL),
+    ]
+}
+
+/// Test the built-in Pipecat and Daily docs servers: each must list its
+/// search tool. Returns the tools found, prefixed by server.
+#[tauri::command]
+pub async fn ai_assist_test_builtin_pipecat_daily() -> Result<Vec<mcp_probe::ToolInfo>, String> {
+    let mut found = Vec::new();
+    for server in pipecat_daily_docs_servers() {
+        let tools = mcp_probe::list_tools(&server).await.map_err(|e| format!("{}: {e}", server.name))?;
+        let wanted = &server.allowed_tools[0];
+        if !tools.iter().any(|t| &t.name == wanted) {
+            return Err(format!("{} does not list {wanted}, the tool lookups use", server.name));
+        }
+        found.extend(tools.into_iter().filter(|t| &t.name == wanted).map(|t| mcp_probe::ToolInfo {
+            name: format!("{}: {}", server.name, t.name),
+            description: t.description,
+        }));
+    }
+    Ok(found)
+}
+
 /// Test the built-in Deepgram docs server with the saved Deepgram key (the
 /// key stays in Rust; the UI never sees it).
 #[tauri::command]
@@ -1454,11 +1504,12 @@ mod tests {
     fn the_builtin_overview_is_in_the_prompt_unless_turned_off() {
         let mut settings = AssistSettings::default();
         let on = compose_prompt(&settings, "", false);
-        assert!(on.contains("<knowledge name=\"Deepgram public overview (built in)\">"));
+        assert!(on.contains("<knowledge name=\"Deepgram, Pipecat and Daily public overview (built in)\">"));
+        assert!(on.contains("# Pipecat") && on.contains("# Daily"), "the Pipecat and Daily sections are bundled");
         assert!(on.contains("Nova-3"), "the bundled text itself is sent");
         assert!(!DEEPGRAM_PUBLIC.contains("]("), "links are stripped from the bundled text");
         settings.builtin.deepgram_overview = false;
-        assert!(!compose_prompt(&settings, "", false).contains("Deepgram public overview"));
+        assert!(!compose_prompt(&settings, "", false).contains("public overview (built in)"));
     }
 
     #[test]
@@ -1466,6 +1517,8 @@ mod tests {
         let mut settings = AssistSettings::default();
         assert!(research_wanted(&settings), "default: research on with the built-in docs");
         settings.builtin.deepgram_docs = false;
+        assert!(research_wanted(&settings), "the Pipecat and Daily docs are still on");
+        settings.builtin.pipecat_daily_docs = false;
         assert!(!research_wanted(&settings), "no server at all");
         settings.builtin.deepgram_docs = true;
         settings.research.enabled = false;

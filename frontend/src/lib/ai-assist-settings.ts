@@ -39,7 +39,7 @@ export interface AssistSettings {
   cardKinds: CardKindFlags;
   research: { enabled: boolean; servers: McpServer[] };
   /** Knowledge and research that ship with the app (settings.rs `Builtin`). */
-  builtin: { deepgramOverview: boolean; deepgramDocs: boolean };
+  builtin: { deepgramOverview: boolean; deepgramDocs: boolean; pipecatDailyDocs: boolean };
 }
 
 export interface PromptPreview {
@@ -74,7 +74,7 @@ export const DEFAULT_SETTINGS: AssistSettings = {
   instructions: '',
   cardKinds: { answer: true, ask: true, fact: true, todo: true },
   research: { enabled: true, servers: [] },
-  builtin: { deepgramOverview: true, deepgramDocs: true },
+  builtin: { deepgramOverview: true, deepgramDocs: true, pipecatDailyDocs: true },
 };
 
 /** Same as settings.rs BUILTIN_DOCS_NAME: user servers cannot take it. */

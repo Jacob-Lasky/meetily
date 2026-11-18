@@ -141,6 +141,11 @@ pub const DEEPGRAM_PUBLIC: &str = include_str!("deepgram_public.md");
 /// Name of the built-in Deepgram docs research server; user servers cannot
 /// take it (the sidecar keys MCP clients by server name).
 pub const BUILTIN_DOCS_NAME: &str = "Deepgram docs";
+/// Names of the built-in Pipecat and Daily docs servers (also reserved).
+pub const BUILTIN_PIPECAT_DOCS_NAME: &str = "Pipecat docs";
+pub const BUILTIN_DAILY_DOCS_NAME: &str = "Daily docs";
+/// Every name user servers cannot take.
+pub const RESERVED_SERVER_NAMES: [&str; 3] = [BUILTIN_DOCS_NAME, BUILTIN_PIPECAT_DOCS_NAME, BUILTIN_DAILY_DOCS_NAME];
 
 /// Knowledge and research that ship with the app (WORK-581), so colleagues
 /// get Deepgram-grounded cards with nothing to paste or configure.
@@ -152,11 +157,14 @@ pub struct Builtin {
     /// Deepgram's hosted docs MCP server as a research server, authenticated
     /// with the Deepgram API key saved for transcription.
     pub deepgram_docs: bool,
+    /// Pipecat's and Daily's public docs MCP servers (docs.pipecat.ai/mcp,
+    /// docs.daily.co/mcp; no sign-in), search tools only.
+    pub pipecat_daily_docs: bool,
 }
 
 impl Default for Builtin {
     fn default() -> Self {
-        Self { deepgram_overview: true, deepgram_docs: true }
+        Self { deepgram_overview: true, deepgram_docs: true, pipecat_daily_docs: true }
     }
 }
 
@@ -259,8 +267,8 @@ impl AssistSettings {
             if s.name.trim().is_empty() {
                 return Err("every MCP server needs a name".into());
             }
-            if s.name.trim().eq_ignore_ascii_case(BUILTIN_DOCS_NAME) {
-                return Err(format!("{BUILTIN_DOCS_NAME} is the built-in server's name; pick another"));
+            if let Some(reserved) = RESERVED_SERVER_NAMES.iter().find(|n| s.name.trim().eq_ignore_ascii_case(n)) {
+                return Err(format!("{reserved} is a built-in server's name; pick another"));
             }
             if !names.insert(s.name.trim().to_lowercase()) {
                 return Err(format!("two MCP servers are named {}", s.name.trim()));
@@ -352,8 +360,10 @@ mod tests {
         assert!(s.validate(0).is_ok());
         s.research.servers.push(server("A", McpTransport::Http, "", "https://x"));
         assert!(s.validate(0).is_err(), "duplicate name");
-        s.research.servers[1].name = "deepgram DOCS".into();
-        assert!(s.validate(0).is_err(), "the built-in server's name is reserved");
+        for reserved in ["deepgram DOCS", "pipecat docs", "Daily Docs"] {
+            s.research.servers[1].name = reserved.into();
+            assert!(s.validate(0).is_err(), "{reserved}: a built-in server's name is reserved");
+        }
         s.research.servers[1].name = "b".into();
         s.research.servers[1].url = "ftp://x".into();
         assert!(s.validate(0).is_err(), "bad URL");

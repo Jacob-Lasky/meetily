@@ -883,6 +883,7 @@ pub fn run() {
             live_assist::ai_assist_find_meetings,
             live_assist::ai_assist_test_mcp,
             live_assist::ai_assist_test_builtin_docs,
+            live_assist::ai_assist_test_builtin_pipecat_daily,
             live_assist::ai_assist_builtin_knowledge,
             audio::pipecat::live_engine_get,
             audio::pipecat::live_engine_set,

@@ -610,3 +610,18 @@ async def test_a_lookup_slow_to_cancel_shares_the_deadline(monkeypatch):
     started = loop.time()
     await asyncio.wait_for(r.close(), 2)
     assert loop.time() - started < 0.25, "a lookup slow to cancel must count against the one deadline"
+
+
+async def test_long_tool_results_are_cut_before_the_model_sees_them():
+    from meetily_sidecar.research import MAX_TOOL_RESULT_CHARS
+
+    seen = []
+
+    async def loop(system, question, specs, call_tool):
+        seen.append(await call_tool("search_knowledge", {}))
+        return '{"cards":[]}'
+
+    r = await configured([], tools=FakeTools(answers={"search_knowledge": "x" * (MAX_TOOL_RESULT_CHARS + 500)}), loop=loop)
+    r.ask("q?", "t")
+    await settle()
+    assert len(seen[0]) < MAX_TOOL_RESULT_CHARS + 100 and seen[0].endswith("[cut: 500 more characters]")

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { type AssistCard, mergeSynced, withAdded, withCard, withoutIds } from '../../src/lib/live-assist';
+import { type AssistCard, briefSize, mergeSynced, withAdded, withCard, withoutIds } from '../../src/lib/live-assist';
 
 const card = (id: string, extra: Partial<AssistCard> = {}): AssistCard => ({
   id,
@@ -60,5 +60,13 @@ describe('live assist card list', () => {
     const backend = [card('a')];
     const current = [card('a', { pinned: true })];
     expect(mergeSynced(backend, current, new Set()).map((c) => c.pinned)).toEqual([true]);
+  });
+});
+
+describe('briefSize', () => {
+  test('short briefs in characters, long ones in thousands', () => {
+    expect(briefSize(640)).toBe('640 characters');
+    expect(briefSize(7731)).toBe('7.7k characters');
+    expect(briefSize(2000)).toBe('2k characters');
   });
 });

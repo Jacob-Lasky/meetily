@@ -54,6 +54,9 @@ pub const ASSIST_STATUS_EVENT: &str = "assist-status";
 /// The research lane (Pipecat engine): `{ "state": "started" | "done" | "error",
 /// "question": string, "message"?: string, "cards"?: number }`.
 pub const ASSIST_RESEARCH_EVENT: &str = "assist-research";
+/// Reading the meeting brief (WORK-559): `{ "state": "reading" | "done" |
+/// "error", "chars": number, "cards"?: number, "message"?: string }`.
+pub const ASSIST_BRIEF_EVENT: &str = "assist-brief";
 
 const SETTINGS_STORE: &str = "live_assist.json";
 const ENABLED_KEY: &str = "enabled";
@@ -66,6 +69,10 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 /// thinks anyway after the thinking-off retry.
 const CLAUDE_MAX_TOKENS: u32 = 1024;
 const TICK: Duration = Duration::from_millis(100);
+/// A brief edited mid-call is read again once it has stopped changing for
+/// this long: the box saves while Me types, and each save must not start a
+/// read.
+const BRIEF_SETTLE: Duration = Duration::from_secs(5);
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
@@ -99,6 +106,9 @@ enum Msg {
     Line { seq: u64, side: Side, text: String },
     Retract(u64),
     CallDone { call_id: u64, result: Result<String, String> },
+    /// The meeting-brief read numbered `read` finished; `chars` is the
+    /// length of the brief it read, for the status line.
+    BriefRead { read: u64, chars: usize, result: Result<String, String> },
     Dismiss(String),
     Pin { id: String, pinned: bool, reply: oneshot::Sender<Result<Card, String>> },
     Cards(oneshot::Sender<Vec<Card>>),
@@ -560,6 +570,14 @@ async fn run<R: Runtime>(
     let mut attached: Option<u64> = None;
     // What the sidecar was last told about calls being allowed.
     let mut sidecar_allowed: Option<bool> = None;
+    // Meeting-brief reads (WORK-559): when the next is due, the brief the
+    // last one started on (a brief equal to it is not read again), the number
+    // of the read in flight and its cancel token. A brief already filled in
+    // is read as the call opens.
+    let mut brief_due: Option<Instant> = (!load_brief(&app).trim().is_empty()).then(Instant::now);
+    let mut brief_read: Option<String> = None;
+    let mut brief_reads: u64 = 0;
+    let mut brief_cancel: Option<CancellationToken> = None;
 
     loop {
         tokio::select! {
@@ -624,6 +642,10 @@ async fn run<R: Runtime>(
                         }
                     }
                     Msg::Reconfigure => {
+                        let brief = load_brief(&app);
+                        if !brief.trim().is_empty() && brief_read.as_deref() != Some(brief.as_str()) {
+                            brief_due = Some(Instant::now() + BRIEF_SETTLE);
+                        }
                         if attached.is_some() {
                             info!("live assist: AI Assist settings changed; sending the sidecar the new config");
                             let allowed = calls_allowed(&calls_off);
@@ -643,6 +665,41 @@ async fn run<R: Runtime>(
                         }
                         let since_final = trigger.filter(|(id, _)| *id == call_id).map(|(_, at)| at.elapsed());
                         apply_result(&app, &mut engine, call_id, result, since_final);
+                    }
+                    Msg::BriefRead { read, chars, result } => {
+                        if read != brief_reads || !calls_allowed(&calls_off) {
+                            // Superseded by a newer read, or assist went off or
+                            // Stop was pressed meanwhile.
+                            continue;
+                        }
+                        brief_cancel = None;
+                        match result {
+                            Ok(output) => {
+                                let raw = parse_cards(&output).unwrap_or_else(|e| {
+                                    // DO NOT log the output: it can echo the brief.
+                                    warn!("live assist: brief read {read}: {e} ({} chars)", output.chars().count());
+                                    Vec::new()
+                                });
+                                let raw = keep_kinds(raw, &load_settings(&app).card_kinds.enabled());
+                                let applied = engine.on_brief_cards(raw, chrono::Utc::now().timestamp_millis());
+                                info!("live assist: brief read {read} added {} card(s)", applied.added.len());
+                                log_cards_for_test(&applied.added);
+                                if !applied.added.is_empty() {
+                                    if let Err(e) = app.emit(ASSIST_UPDATE_EVENT, serde_json::json!({ "cards": applied.added })) {
+                                        error!("live assist: failed to emit cards: {e}");
+                                    }
+                                }
+                                emit_withdraw(&app, applied.evicted, "evicted");
+                                emit_brief(&app, "done", chars, Some(applied.added.len()), None);
+                                if attached.is_some() {
+                                    send_shown(&engine);
+                                }
+                            }
+                            Err(e) => {
+                                warn!("live assist: brief read {read} failed: {e}");
+                                emit_brief(&app, "error", chars, None, Some(e));
+                            }
+                        }
                     }
                     Msg::Dismiss(id) => {
                         let was_pinned = engine.cards().iter().any(|c| c.id == id && c.pinned);
@@ -674,6 +731,9 @@ async fn run<R: Runtime>(
 
         let allowed = calls_allowed(&calls_off);
         if !allowed {
+            if let Some(token) = brief_cancel.take() {
+                token.cancel();
+            }
             if let Some(token) = cancel.take() {
                 token.cancel();
                 if let Some(id) = engine.in_flight() {
@@ -692,6 +752,37 @@ async fn run<R: Runtime>(
             // Turning assist off, or Stop, cancels the sidecar's call in flight.
             to_sidecar(serde_json::json!({ "type": "assist_enabled", "enabled": allowed }));
             sidecar_allowed = Some(allowed);
+        }
+        // The brief read runs on both engines, beside the card calls: it is
+        // one call, at the start of the call or after the brief changed.
+        if allowed && brief_due.is_some_and(|due| due <= Instant::now()) {
+            brief_due = None;
+            let brief = load_brief(&app);
+            if !brief.trim().is_empty() && brief_read.as_deref() != Some(brief.as_str()) {
+                if let Some(token) = brief_cancel.take() {
+                    token.cancel();
+                }
+                brief_reads += 1;
+                let read = brief_reads;
+                let chars = brief.trim().chars().count();
+                brief_read = Some(brief);
+                let token = calls_off.child_token();
+                brief_cancel = Some(token.clone());
+                info!("live assist: reading the meeting brief ({chars} chars), read {read}");
+                emit_brief(&app, "reading", chars, None, None);
+                let app = app.clone();
+                let tx = tx.clone();
+                tauri::async_runtime::spawn(async move {
+                    let started = Instant::now();
+                    let prompt = cards::brief_prompt();
+                    let result = match tokio::time::timeout(CALL_TIMEOUT, call_llm(&app, &prompt, &token)).await {
+                        Ok(result) => result,
+                        Err(_) => Err(format!("timed out after {} s", CALL_TIMEOUT.as_secs())),
+                    };
+                    info!("live assist: brief read {read} finished in {} ms (ok={})", started.elapsed().as_millis(), result.is_ok());
+                    let _ = tx.send(Msg::BriefRead { read, chars, result });
+                });
+            }
         }
         if let Some(request) = engine.poll(Instant::now(), allowed && attached.is_none()) {
             let token = calls_off.child_token();
@@ -724,6 +815,9 @@ async fn run<R: Runtime>(
     }
 
     if let Some(token) = cancel.take() {
+        token.cancel();
+    }
+    if let Some(token) = brief_cancel.take() {
         token.cancel();
     }
     // The brief was for this call: kept with the meeting, then cleared so it
@@ -873,6 +967,19 @@ fn emit_research<R: Runtime>(app: &AppHandle<R>, state: &str, question: &str, me
     }
     if let Err(e) = app.emit(ASSIST_RESEARCH_EVENT, payload) {
         error!("live assist: failed to emit research status: {e}");
+    }
+}
+
+fn emit_brief<R: Runtime>(app: &AppHandle<R>, state: &str, chars: usize, cards: Option<usize>, message: Option<String>) {
+    let mut payload = serde_json::json!({ "state": state, "chars": chars });
+    if let Some(n) = cards {
+        payload["cards"] = serde_json::json!(n);
+    }
+    if let Some(m) = message {
+        payload["message"] = serde_json::Value::String(m);
+    }
+    if let Err(e) = app.emit(ASSIST_BRIEF_EVENT, payload) {
+        error!("live assist: failed to emit brief status: {e}");
     }
 }
 
@@ -1667,9 +1774,10 @@ mod tests {
             })
         );
         let ts = include_str!("../../../src/lib/live-assist.ts");
-        for event in [ASSIST_UPDATE_EVENT, ASSIST_WITHDRAW_EVENT, ASSIST_STATUS_EVENT] {
+        for event in [ASSIST_UPDATE_EVENT, ASSIST_WITHDRAW_EVENT, ASSIST_STATUS_EVENT, ASSIST_RESEARCH_EVENT, ASSIST_BRIEF_EVENT] {
             assert!(ts.contains(&format!("'{event}'")), "frontend does not listen for {event}");
         }
+        assert!(ts.contains(&format!("BRIEF_ORIGIN = '{}'", engine::BRIEF_ORIGIN)), "frontend brief origin differs");
         for field in ["source_seq", "created_at_ms", "pinned", "quote"] {
             assert!(ts.contains(field), "frontend Card type lacks {field}");
         }

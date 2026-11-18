@@ -12,6 +12,10 @@ export const ASSIST_WITHDRAW_EVENT = 'assist-withdraw';
 export const ASSIST_STATUS_EVENT = 'assist-status';
 /** The research lane (Pipecat engine, WORK-581). */
 export const ASSIST_RESEARCH_EVENT = 'assist-research';
+/** Reading the meeting brief as the call opens, or after it changed (WORK-559). */
+export const ASSIST_BRIEF_EVENT = 'assist-brief';
+/** `AssistCard.origin` of the cards read from the meeting brief (engine::BRIEF_ORIGIN). */
+export const BRIEF_ORIGIN = 'brief';
 /** The meeting brief was saved with the meeting that stopped and cleared. */
 export const ASSIST_BRIEF_CLEARED_EVENT = 'assist-brief-cleared';
 
@@ -27,7 +31,10 @@ export interface AssistCard {
   source_seq: number;
   pinned: boolean;
   created_at_ms: number;
-  /** Research cards: the MCP servers the lookup used (e.g. "DeepHive"). */
+  /**
+   * Research cards: the MCP servers the lookup used (e.g. "DeepHive").
+   * Cards read from the meeting brief: BRIEF_ORIGIN.
+   */
   origin?: string;
 }
 
@@ -47,6 +54,20 @@ export interface AssistResearch {
   question: string;
   message?: string;
   cards?: number;
+}
+
+export interface AssistBriefRead {
+  state: 'reading' | 'done' | 'error';
+  /** Length of the brief that was read. */
+  chars: number;
+  /** Cards the read added (state 'done'). */
+  cards?: number;
+  message?: string;
+}
+
+/** "7.7k characters" / "640 characters", for the brief status line. */
+export function briefSize(chars: number): string {
+  return chars >= 1000 ? `${(chars / 1000).toFixed(1).replace(/\.0$/, '')}k characters` : `${chars} characters`;
 }
 
 export interface AssistStatus {

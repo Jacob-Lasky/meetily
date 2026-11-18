@@ -77,6 +77,12 @@ pub struct CallRequest {
 /// Most shown-card texts sent with a call; older cards have scrolled away.
 const MAX_SHOWN_IN_PROMPT: usize = 10;
 
+/// `Card::origin` of the cards read from the meeting brief (WORK-559).
+pub const BRIEF_ORIGIN: &str = "brief";
+/// `Card::source_seq` of a brief card: it answers no transcript line, and no
+/// real line has this sequence, so no retraction can withdraw it.
+pub const BRIEF_SOURCE_SEQ: u64 = u64::MAX;
+
 #[derive(Debug, Default)]
 pub struct Engine {
     cfg: Config,
@@ -230,6 +236,34 @@ impl Engine {
         applied
     }
 
+    /// Apply the cards read from the meeting brief as the call opens (or after
+    /// the brief changed mid-call). They quote the brief, not the transcript,
+    /// so they tie to no line (`BRIEF_SOURCE_SEQ`) and carry `BRIEF_ORIGIN`.
+    /// A newer read replaces the earlier brief cards Me did not pin: they
+    /// came from a brief that has since changed. Those ids are returned with
+    /// the evicted ones. Dismissed texts stay suppressed, as for any card.
+    pub fn on_brief_cards(&mut self, raw: Vec<RawCard>, created_at_ms: i64) -> Applied {
+        let mut replaced = Vec::new();
+        self.cards.retain(|c| {
+            let old = !c.pinned && c.origin.as_deref() == Some(BRIEF_ORIGIN);
+            if old {
+                replaced.push(c.id.clone());
+            }
+            !old
+        });
+        let mut applied = self.add_cards_with("assist-brief", |_| Some(BRIEF_SOURCE_SEQ), &[], raw, created_at_ms);
+        let ids: Vec<String> = applied.added.iter().map(|c| c.id.clone()).collect();
+        for card in self.cards.iter_mut().filter(|c| ids.contains(&c.id)) {
+            card.origin = Some(BRIEF_ORIGIN.into());
+        }
+        for card in &mut applied.added {
+            card.origin = Some(BRIEF_ORIGIN.into());
+        }
+        replaced.extend(applied.evicted);
+        applied.evicted = replaced;
+        applied
+    }
+
     /// Texts sent with a call so the model does not repeat itself: the cards
     /// on screen (newest first, at most MAX_SHOWN_IN_PROMPT), then the ones
     /// Me dismissed.
@@ -250,9 +284,22 @@ impl Engine {
         raw: Vec<RawCard>,
         created_at_ms: i64,
     ) -> Applied {
+        self.add_cards_with(id_prefix, |quote| source_line(lines, quote), retracted, raw, created_at_ms)
+    }
+
+    /// `add_cards` with the quote-to-line rule passed in: brief cards tie to
+    /// no transcript line.
+    fn add_cards_with(
+        &mut self,
+        id_prefix: &str,
+        source: impl Fn(&str) -> Option<u64>,
+        retracted: &[u64],
+        raw: Vec<RawCard>,
+        created_at_ms: i64,
+    ) -> Applied {
         let mut added = Vec::new();
         for card in raw {
-            let Some(source_seq) = source_line(lines, &card.quote) else { continue };
+            let Some(source_seq) = source(&card.quote) else { continue };
             if retracted.contains(&source_seq) {
                 continue;
             }
@@ -388,6 +435,52 @@ fn source_line(lines: &[Line], quote: &str) -> Option<u64> {
         }
     }
     lines.iter().rev().find(|l| l.side == Side::Them).or(lines.last()).map(|l| l.seq)
+}
+
+#[cfg(test)]
+mod brief_card_tests {
+    use super::*;
+    use crate::live_assist::cards::CardKind;
+
+    fn raw(kind: CardKind, text: &str, quote: &str) -> RawCard {
+        RawCard { kind, text: text.into(), quote: quote.into() }
+    }
+
+    #[test]
+    fn brief_cards_need_no_transcript_and_survive_retractions() {
+        let mut e = Engine::new(Config::default());
+        let applied = e.on_brief_cards(vec![raw(CardKind::Ask, "Confirm 40k calls/day", "Goal: confirm 40k calls/day")], 1);
+        assert_eq!(applied.added.len(), 1);
+        let card = &applied.added[0];
+        assert_eq!(card.origin.as_deref(), Some(BRIEF_ORIGIN));
+        assert_eq!(card.source_seq, BRIEF_SOURCE_SEQ);
+        assert!(card.id.starts_with("assist-brief-"));
+        assert_eq!(e.cards()[0].origin.as_deref(), Some(BRIEF_ORIGIN), "the engine's copy is marked too");
+        e.on_line(0, Side::Them, "hello", Instant::now());
+        assert!(e.on_retract(0).is_empty(), "no transcript retraction reaches a brief card");
+        assert_eq!(e.cards().len(), 1);
+    }
+
+    #[test]
+    fn a_new_read_replaces_unpinned_brief_cards_but_keeps_pins() {
+        let mut e = Engine::new(Config::default());
+        let first = e.on_brief_cards(vec![raw(CardKind::Ask, "old ask", ""), raw(CardKind::Fact, "old fact", "")], 1);
+        let pinned_id = first.added[1].id.clone();
+        e.set_pinned(&pinned_id, true).unwrap();
+        let second = e.on_brief_cards(vec![raw(CardKind::Todo, "new todo", "")], 2);
+        assert_eq!(second.evicted, vec![first.added[0].id.clone()], "the unpinned old card is replaced");
+        let texts: Vec<&str> = e.cards().iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["old fact", "new todo"], "pin stays on top, new card under it");
+    }
+
+    #[test]
+    fn dismissed_brief_text_is_not_brought_back() {
+        let mut e = Engine::new(Config::default());
+        let first = e.on_brief_cards(vec![raw(CardKind::Ask, "Ask about PCI scope", "")], 1);
+        assert!(e.dismiss(&first.added[0].id));
+        let again = e.on_brief_cards(vec![raw(CardKind::Ask, "Ask about PCI scope", "")], 2);
+        assert!(again.added.is_empty());
+    }
 }
 
 #[cfg(test)]

@@ -10,6 +10,7 @@ import { RecordingStatusBar } from "./RecordingStatusBar";
 import { motion, AnimatePresence } from "framer-motion";
 import { TranscriptSegmentData } from "@/types";
 import { speakerLabelClass } from '@/lib/transcript-speakers';
+import type { InterimLine } from '@/lib/transcript-interim';
 
 export interface VirtualizedTranscriptViewProps {
     /** Transcript segments to display */
@@ -28,6 +29,8 @@ export interface VirtualizedTranscriptViewProps {
     showConfidence?: boolean;
     /** Completely disable auto-scroll behavior (for meeting details page) */
     disableAutoScroll?: boolean;
+    /** Each live channel's not-yet-final words, shown greyed after the transcript */
+    interimLines?: InterimLine[];
 
     // Pagination props (infinite scroll)
     hasMore?: boolean;
@@ -121,6 +124,36 @@ const TranscriptSegment = memo(function TranscriptSegment({
     );
 });
 
+/**
+ * The words Deepgram has heard but not finalized yet, one greyed line per
+ * channel. They show at once (no typewriter) and are replaced by the
+ * channel's next final; nothing here is stored.
+ */
+const InterimTranscriptLines = memo(function InterimTranscriptLines({ lines }: { lines: InterimLine[] }) {
+    return (
+        <div aria-live="off" data-testid="transcript-interim-lines">
+            {lines.map((line) => (
+                <div key={line.speaker ?? 'unlabelled'} className="mb-3" data-testid="transcript-interim">
+                    <div className="flex items-start gap-2">
+                        {/* Same width as a final's timestamp, so the text lines up. */}
+                        <span className="flex-shrink-0" aria-hidden="true">
+                            <span className="text-xs invisible">[00:00]</span>
+                        </span>
+                        <div className="flex-1">
+                            {line.speaker && (
+                                <span className={`text-xs font-medium opacity-60 ${speakerLabelClass(line.speaker)}`}>
+                                    {line.speaker}
+                                </span>
+                            )}
+                            <p className="text-base text-gray-400 italic leading-relaxed">{line.text}</p>
+                        </div>
+                    </div>
+                </div>
+            ))}
+        </div>
+    );
+});
+
 export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps> = ({
     segments,
     isRecording = false,
@@ -130,6 +163,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
     enableStreaming = false,
     showConfidence = true,
     disableAutoScroll = false,
+    interimLines = [],
     hasMore = false,
     isLoadingMore = false,
     totalCount = 0,
@@ -174,6 +208,8 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
         isRecording,
         enableStreaming
     );
+
+    const showInterim = isRecording && interimLines.length > 0;
 
     // Infinite scroll: IntersectionObserver to trigger loading more
     useEffect(() => {
@@ -247,7 +283,10 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
 
             {/* Content - add padding when recording to prevent overlap */}
             <div className={isRecording ? 'pt-2' : ''}>
-            {segments.length === 0 ? (
+            {segments.length === 0 && showInterim ? (
+                // First words of the recording, before any final
+                <InterimTranscriptLines lines={interimLines} />
+            ) : segments.length === 0 ? (
                 // Empty state
                 <motion.div
                     initial={{ opacity: 0 }}
@@ -330,6 +369,8 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                         </div>
                     )}
 
+                    {showInterim && <InterimTranscriptLines lines={interimLines} />}
+
                     {/* Listening indicator when recording */}
                     {!isStopping && isRecording && !isPaused && !isProcessing && segments.length > 0 && (
                         <motion.div
@@ -386,6 +427,8 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                             ) : null}
                         </div>
                     )}
+
+                    {showInterim && <InterimTranscriptLines lines={interimLines} />}
 
                     {/* Listening indicator when recording */}
                     {!isStopping && isRecording && !isPaused && !isProcessing && segments.length > 0 && (

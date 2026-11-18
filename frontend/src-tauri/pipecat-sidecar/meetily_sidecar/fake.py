@@ -3,13 +3,14 @@
 Selected by MEETILY_SIDECAR_FAKE_FLUX=1 (the Rust process tests set it), so the
 whole sidecar can be exercised end to end without a Deepgram key or network.
 Every 0.1 s of audio (3200 bytes) is one committed turn, reported the way the
-real service reports it: a TranscriptionFrame whose `result` is a Flux
-TurnInfo, then the on_end_of_turn event.
+real service reports it: an InterimTranscriptionFrame for the turn's Update,
+then a TranscriptionFrame whose `result` is a Flux TurnInfo, then the
+on_end_of_turn event.
 """
 
 from __future__ import annotations
 
-from pipecat.frames.frames import InputAudioRawFrame, TranscriptionFrame
+from pipecat.frames.frames import InputAudioRawFrame, InterimTranscriptionFrame, TranscriptionFrame
 from pipecat.processors.frame_processor import FrameProcessor
 
 BYTES_PER_TURN = 3200
@@ -49,5 +50,7 @@ class FakeFlux(FrameProcessor):
                     {"word": str(self._turns), "confidence": 0.9, "start": start + 0.05, "end": start + 0.1},
                 ],
             }
+            update = {**result, "event": "Update", "transcript": "turn"}
+            await self.push_frame(InterimTranscriptionFrame("turn", "", "", result=update))
             await self.push_frame(TranscriptionFrame(text, "", "", result=result, finalized=True))
             await self._call_event_handler("on_end_of_turn", text)

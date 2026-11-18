@@ -6,7 +6,9 @@ token>` (a fresh random token per recording, handed over on stdin):
 - `/v2/listen?side=me|them|unknown&model=...&keyterm=...` - one per audio
   channel. Rust streams 16 kHz mono linear16 as binary messages; the sidecar
   runs a Pipecat pipeline (DeepgramFluxSTTService -> TurnRelay) and sends back
-  each committed turn as the raw Flux `TurnInfo` JSON (`TranscriptionFrame.result`).
+  each committed turn as the raw Flux `TurnInfo` JSON (`TranscriptionFrame.result`),
+  and each in-progress `Update` the same way (`InterimTranscriptionFrame.result`)
+  for the greyed live line.
   So Rust's existing Flux lane code reads it unchanged: time mapping, trailing
   silence, bleed matching, error handling. `{"type":"CloseStream"}` ends the
   pipeline; a `{"type":"Error"}` message means the channel failed.
@@ -340,7 +342,12 @@ def build_flux_service(api_key: str, query: dict[str, list[str]], *, eager: bool
 
 
 class TurnRelay(FrameProcessor):
-    """Sends each committed Flux turn back to Rust as its raw TurnInfo JSON."""
+    """Sends each Flux turn back to Rust as its raw TurnInfo JSON.
+
+    Updates (the turn so far) go out as they arrive, so Meetily can show the
+    words greyed before the turn commits; Rust tells them from the committed
+    turn by `event`.
+    """
 
     def __init__(self, ws: ServerConnection, **kwargs):
         super().__init__(**kwargs)
@@ -352,6 +359,7 @@ class TurnRelay(FrameProcessor):
         await super().process_frame(frame, direction)
         if isinstance(frame, InterimTranscriptionFrame) and isinstance(frame.result, dict):
             self._last_update = frame.result
+            await _send_quietly(self._ws, json.dumps(frame.result))
         elif isinstance(frame, TranscriptionFrame):
             await _send_quietly(self._ws, json.dumps(turn_info_for(frame, self._last_update)))
             self._last_update = None

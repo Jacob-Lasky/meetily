@@ -69,8 +69,14 @@ async def test_channel_relays_turninfo_and_drains_on_close_stream(sidecar):
             await ws.send(b"\0" * 3200)
         await ws.send(json.dumps({"type": "CloseStream"}))
         got = [json.loads(m) async for m in ws]
-    assert [m["transcript"] for m in got] == ["turn 1", "turn 2"]
-    assert got[0]["words"][0]["start"] == 0.0, "word timings reach Rust"
+    # Each turn's Update (the greyed live line, WORK-580) arrives before it commits.
+    assert [(m["event"], m["transcript"]) for m in got] == [
+        ("Update", "turn"),
+        ("EndOfTurn", "turn 1"),
+        ("Update", "turn"),
+        ("EndOfTurn", "turn 2"),
+    ]
+    assert got[1]["words"][0]["start"] == 0.0, "word timings reach Rust"
     query, eager = made["queries"][0]
     assert query["keyterm"] == ["Deepgram"] and eager is False
 

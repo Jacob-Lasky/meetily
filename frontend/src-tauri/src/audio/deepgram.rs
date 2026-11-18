@@ -439,6 +439,42 @@ fn flux_turn_to_final(m: &FluxTurnInfo) -> Option<FinalSeg> {
     })
 }
 
+/// The in-progress text of a Flux turn: every TurnInfo except EndOfTurn
+/// (Update, StartOfTurn, EagerEndOfTurn, TurnResumed) carries the turn so
+/// far. None when it has no words yet.
+fn flux_turn_to_interim(m: &FluxTurnInfo) -> Option<String> {
+    if m.event.as_deref() == Some("EndOfTurn") {
+        return None;
+    }
+    let transcript = m.transcript.trim();
+    (!transcript.is_empty()).then(|| transcript.to_string())
+}
+
+/// A nova interim `Results` message (`is_final: false`): the channel it
+/// covers, its text and its words. Empty text is a revision to nothing and
+/// clears the channel's greyed line. None for finals and other messages.
+fn nova_interim(m: &RealtimeMessage) -> Option<(Option<(usize, usize)>, String, Vec<DeepgramWord>)> {
+    if m.msg_type.as_deref() != Some("Results") || m.is_final {
+        return None;
+    }
+    let alt = m.channel.as_ref()?.alternatives.first()?;
+    Some((parse_channel_index(&m.channel_index), alt.transcript.trim().to_string(), alt.words.clone()))
+}
+
+/// The interim words a nova final did not cover. A final can end mid-way
+/// through the last interim (an interim over 0-4.3 s, then a final over
+/// 0-3.3 s), and the rest is still being heard: keep it greyed instead of
+/// blanking it until the next interim. Times are stream seconds.
+fn interim_after(words: &[DeepgramWord], final_end_s: f64) -> Vec<DeepgramWord> {
+    // By midpoint: interim and final word boundaries can differ by a few ms,
+    // and a word the final already holds ends by its end.
+    words.iter().filter(|w| (w.start + w.end) / 2.0 >= final_end_s).cloned().collect()
+}
+
+fn words_line(words: &[DeepgramWord]) -> String {
+    words.iter().map(word_display).collect::<Vec<_>>().join(" ")
+}
+
 /// Maps realtime-stream time onto original recording time. The pipeline feeds a
 /// continuous mixed stream while carrying each chunk's recording-relative
 /// timestamp, so realtime word times (stream-relative) are remapped back.
@@ -936,6 +972,11 @@ pub(crate) struct LabeledSegment {
 }
 
 fn word_tokens(text: &str) -> std::collections::HashSet<String> {
+    word_list(text).into_iter().collect()
+}
+
+/// The lowercase words of `text`, in order.
+fn word_list(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric() && c != '\'')
         .filter(|w| !w.is_empty())
         .map(|w| w.to_lowercase())
@@ -1222,6 +1263,80 @@ pub(crate) enum RealtimeOutput {
     Show { key: u64, seg: LabeledSegment },
     /// A shown Mic-In line turned out to be Speaker-Out bleed.
     Retract { key: u64 },
+    /// The not-yet-final words on one channel, shown greyed until its next
+    /// final replaces them. Empty `text` clears the channel. Never stored:
+    /// it goes out as `transcript-interim`, not `transcript-update`.
+    Interim { speaker: Option<&'static str>, text: String },
+}
+
+/// Hides greyed Mic-In words that are Speaker-Out bleed (the far side heard
+/// through the mic), which would otherwise flash on every far-side sentence
+/// when the user is on speakers. Interims carry no reliable word timing to
+/// match on, so this compares words against what Speaker-Out said in the last
+/// INTERIM_BLEED_WINDOW_MS. Display only: a wrong guess just hides a grey
+/// line until its final, which still goes through `BleedSuppressor`.
+#[derive(Default)]
+struct InterimBleedFilter {
+    /// Each far-side word and when it was last newly said.
+    far: std::collections::HashMap<String, f64>,
+    /// The far side's last update, as ordered words. Flux and nova resend the
+    /// whole utterance on every update; only words past what this already
+    /// held are new, so an utterance's first words do not stay "recent" for
+    /// as long as the far side keeps talking.
+    last_far: Vec<String>,
+}
+
+/// How far back Speaker-Out words count as the source of Mic-In bleed.
+/// Short: bleed reaches the mic as the far side speaks, so its interims come
+/// within a second of the far side's; a longer window would hide the user
+/// repeating the far side's words back to them.
+const INTERIM_BLEED_WINDOW_MS: f64 = 3_000.0;
+/// Share of a Mic-In interim's words the far side said for it to be bleed.
+const INTERIM_BLEED_MIN_SHARE: f64 = 0.7;
+/// Shorter interims ("yeah", "okay so") are always shown: too little to judge.
+const INTERIM_BLEED_MIN_TOKENS: usize = 3;
+
+impl InterimBleedFilter {
+    /// Remember far-side words (its interims and finals).
+    fn heard_far(&mut self, text: &str, now_ms: f64) {
+        self.far.retain(|_, at| now_ms - *at <= INTERIM_BLEED_WINDOW_MS);
+        let words = word_list(text);
+        let kept = words.iter().zip(&self.last_far).take_while(|(a, b)| a == b).count();
+        for word in &words[kept..] {
+            self.far.insert(word.clone(), now_ms);
+        }
+        self.last_far = words;
+    }
+
+    /// Whether a Mic-In interim is mostly words the far side just said.
+    fn is_bleed(&mut self, text: &str, now_ms: f64) -> bool {
+        self.far.retain(|_, at| now_ms - *at <= INTERIM_BLEED_WINDOW_MS);
+        let mic = word_tokens(text);
+        if mic.len() < INTERIM_BLEED_MIN_TOKENS {
+            return false;
+        }
+        let echoed = mic.iter().filter(|t| self.far.contains_key(*t)).count();
+        echoed as f64 >= INTERIM_BLEED_MIN_SHARE * mic.len() as f64
+    }
+
+    /// The interim to show: a Mic-In line found to be bleed becomes a clear.
+    fn filter(&mut self, speaker: Option<&'static str>, text: String, now_ms: f64) -> RealtimeOutput {
+        match speaker {
+            Some(SPEAKER_OUT_LABEL) => self.heard_far(&text, now_ms),
+            Some(MIC_IN_LABEL) if self.is_bleed(&text, now_ms) => {
+                return RealtimeOutput::Interim { speaker, text: String::new() };
+            }
+            _ => {}
+        }
+        RealtimeOutput::Interim { speaker, text }
+    }
+}
+
+/// What a lane reader hands the emitter, in arrival order, so a channel's
+/// interim clear always follows the final that replaced it.
+enum LaneEvent {
+    Final(LabeledSegment),
+    Interim { speaker: Option<&'static str>, text: String },
 }
 
 /// The transcript rows (sequence ids) behind each shown Mic-In line, kept as
@@ -1473,6 +1588,7 @@ pub(crate) fn realtime_emitter<R: Runtime>(
                 emit_transcript_retract(&app, sequence_id);
             }
         }
+        RealtimeOutput::Interim { speaker, text } => emit_transcript_interim(&app, speaker, text),
     }
 }
 
@@ -1550,7 +1666,7 @@ where
     }
 
     let shutdown = Arc::new(AtomicBool::new(false));
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<LabeledSegment>();
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<LaneEvent>();
     let mut lane_senders = Vec::with_capacity(lanes.len());
     let mut writer_handles = Vec::with_capacity(lanes.len());
     let mut reader_handles = Vec::with_capacity(lanes.len());
@@ -1620,6 +1736,8 @@ where
         let reader_shutdown = shutdown.clone();
         let reader_events = event_tx.clone();
         reader_handles.push(tokio::spawn(async move {
+            // nova only: each channel's last interim words (see interim_after).
+            let mut interim_words: std::collections::HashMap<Option<usize>, Vec<DeepgramWord>> = Default::default();
             while let Some(message) = read.next().await {
                 let message = match message {
                     Ok(message) => message,
@@ -1635,9 +1753,10 @@ where
                     continue;
                 };
 
-                // Reduce per protocol to (global channel, optional final).
-                // Both report `type:"Error"` on failure.
-                let (channel, final_seg) = if flux {
+                // Reduce per protocol to (global channel, optional final,
+                // where a nova final's audio ends), or send the interim text of
+                // the words not final yet. Both report `type:"Error"` on failure.
+                let (channel, final_seg, covered_until_s) = if flux {
                     let m = match serde_json::from_str::<FluxTurnInfo>(&text) {
                         Ok(m) => m,
                         Err(e) => {
@@ -1653,7 +1772,18 @@ where
                     if m.msg_type.as_deref() != Some("TurnInfo") {
                         continue;
                     }
-                    (resolve_channel(lane, None), flux_turn_to_final(&m))
+                    let channel = resolve_channel(lane, None);
+                    if let Some(text) = flux_turn_to_interim(&m) {
+                        let speaker = channel.and_then(|c| channel_label(layout, c));
+                        let _ = reader_events.send(LaneEvent::Interim { speaker, text });
+                        continue;
+                    }
+                    if m.event.as_deref() != Some("EndOfTurn") {
+                        // An empty Update (Flux sends ~4/s through silence)
+                        // is neither a final nor anything to clear.
+                        continue;
+                    }
+                    (channel, flux_turn_to_final(&m), None)
                 } else {
                     let m = match serde_json::from_str::<RealtimeMessage>(&text) {
                         Ok(m) => m,
@@ -1667,6 +1797,14 @@ where
                         reader_shutdown.store(true, Ordering::SeqCst);
                         return Err(anyhow!("Deepgram realtime error: {}", err));
                     }
+                    if let Some((reported, text, words)) = nova_interim(&m) {
+                        let channel = resolve_channel(lane, reported);
+                        interim_words.insert(channel, words);
+                        let speaker = channel.and_then(|c| channel_label(layout, c));
+                        let _ = reader_events.send(LaneEvent::Interim { speaker, text });
+                        continue;
+                    }
+                    let covered_until_s = m.start + m.duration;
                     let Some(fin) = nova_final(m) else { continue };
                     let channel = resolve_channel(lane, fin.channel_index);
                     if channel.is_none() {
@@ -1675,9 +1813,10 @@ where
                             lane.channels, fin.channel_index
                         );
                     }
-                    (channel, fin.seg)
+                    (channel, fin.seg, Some(covered_until_s))
                 };
 
+                let speaker = channel.and_then(|c| channel_label(layout, c));
                 let entries = reader_time_map.lock().await.clone();
                 if let Some(seg) = final_seg {
                     let to_original = |stream_start: f64, stream_end: f64| {
@@ -1701,16 +1840,26 @@ where
                             TimedWord { start_ms, end_ms, ..w }
                         })
                         .collect();
-                    let _ = reader_events.send(LabeledSegment {
+                    let _ = reader_events.send(LaneEvent::Final(LabeledSegment {
                         text: seg.transcript,
                         start_ms,
                         end_ms,
                         confidence: seg.confidence,
-                        speaker: channel.and_then(|c| channel_label(layout, c)),
+                        speaker,
                         turns,
                         words,
-                    });
+                    }));
                 }
+                // A final (even an empty one) replaces the channel's interim
+                // words it covers; sent after it so the line never blinks out
+                // first. A Flux EndOfTurn covers its whole turn.
+                let rest = match covered_until_s {
+                    Some(end_s) => interim_after(interim_words.get(&channel).map_or(&[][..], Vec::as_slice), end_s),
+                    None => Vec::new(),
+                };
+                let text = words_line(&rest);
+                interim_words.insert(channel, rest);
+                let _ = reader_events.send(LaneEvent::Interim { speaker, text });
             }
 
             reader_shutdown.store(true, Ordering::SeqCst);
@@ -1725,10 +1874,37 @@ where
     let emitter_handle = tokio::spawn(async move {
         let started = std::time::Instant::now();
         let mut suppressor = BleedSuppressor::default();
-        while let Some(seg) = event_rx.recv().await {
-            for out in suppressor.push(seg, started.elapsed().as_secs_f64() * 1000.0) {
-                emit(out);
+        let mut interim_bleed = InterimBleedFilter::default();
+        // Channels with greyed words on screen.
+        let mut greyed: std::collections::HashSet<Option<&'static str>> = Default::default();
+        while let Some(event) = event_rx.recv().await {
+            let now_ms = started.elapsed().as_secs_f64() * 1000.0;
+            match event {
+                LaneEvent::Final(seg) => {
+                    if seg.speaker == Some(SPEAKER_OUT_LABEL) {
+                        interim_bleed.heard_far(&seg.text, now_ms);
+                    }
+                    for out in suppressor.push(seg, now_ms) {
+                        emit(out);
+                    }
+                }
+                LaneEvent::Interim { speaker, text } => {
+                    let out = interim_bleed.filter(speaker, text, now_ms);
+                    if let RealtimeOutput::Interim { speaker, text } = &out {
+                        if text.is_empty() {
+                            greyed.remove(speaker);
+                        } else {
+                            greyed.insert(*speaker);
+                        }
+                    }
+                    emit(out);
+                }
             }
+        }
+        // The session is over (stop, error, or a Pipecat failure handing over
+        // to Direct): no final will replace what is still greyed, so clear it.
+        for speaker in greyed {
+            emit(RealtimeOutput::Interim { speaker, text: String::new() });
         }
     });
 
@@ -1882,6 +2058,26 @@ fn emit_transcript_retract<R: Runtime>(app: &AppHandle<R>, sequence_id: u64) {
     }
 }
 
+/// Event carrying a channel's not-yet-final words (payload
+/// `{ "speaker": "Mic-In" | "Speaker-Out" | null, "text": "..." }`, empty
+/// text clears that channel). Display only: nothing stores it. DO NOT rename
+/// without frontend src/lib/transcript-interim.ts
+/// (`ts_listens_for_transcript_interim` checks).
+pub const TRANSCRIPT_INTERIM_EVENT: &str = "transcript-interim";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptInterim {
+    pub speaker: Option<String>,
+    pub text: String,
+}
+
+fn emit_transcript_interim<R: Runtime>(app: &AppHandle<R>, speaker: Option<&'static str>, text: String) {
+    let payload = TranscriptInterim { speaker: speaker.map(str::to_string), text };
+    if let Err(e) = app.emit(TRANSCRIPT_INTERIM_EVENT, payload) {
+        error!("Failed to emit interim transcript: {}", e);
+    }
+}
+
 /// One stored transcript row.
 #[derive(Debug, PartialEq)]
 struct TranscriptLine {
@@ -1968,9 +2164,12 @@ fn build_realtime_url(base: &str, options: &DeepgramOptions, language: Option<St
         ("model".to_string(), options.model.clone()),
         ("smart_format".to_string(), "true".to_string()),
         ("punctuate".to_string(), "true".to_string()),
-        // Finals only: the transcript UI buffers by sequence id with no
-        // partial-replace path, so interim results would duplicate segments.
-        ("interim_results".to_string(), "false".to_string()),
+        // Interims feed only the greyed live line (`transcript-interim`).
+        // DO NOT route them through `transcript-update`: the transcript buffers
+        // rows by sequence id with no partial-replace path, so every interim
+        // would become a duplicate saved row. Finals are unchanged by this
+        // flag (same `is_final` results, same billing).
+        ("interim_results".to_string(), "true".to_string()),
         ("endpointing".to_string(), "300".to_string()),
     ];
     if channels > 1 {
@@ -2409,7 +2608,7 @@ mod tests {
         assert!(url.contains("diarize_model=latest"));
         assert!(!url.contains("diarize=true")); // diarize_model replaces diarize (400 if both)
         assert!(url.contains("mip_opt_out=true")); // privacy-first: opt out by default
-        assert!(url.contains("interim_results=false"));
+        assert!(url.contains("interim_results=true"));
         assert!(url.contains("keyterm=Meetily"));
         assert!(url.contains("language=en"));
         // Mono socket: one channel and no multichannel split.
@@ -2566,6 +2765,93 @@ mod tests {
     }
 
     // --- Flux (v2) contract + reduction ---
+
+    #[test]
+    fn flux_interim_is_every_turn_event_but_end_of_turn() {
+        let mk = |event: &str, transcript: &str| FluxTurnInfo {
+            msg_type: Some("TurnInfo".to_string()),
+            event: Some(event.to_string()),
+            transcript: transcript.to_string(),
+            audio_window_start: 0.0,
+            audio_window_end: 1.0,
+            words: Vec::new(),
+            description: None,
+            message: None,
+        };
+        for event in ["Update", "StartOfTurn", "EagerEndOfTurn", "TurnResumed"] {
+            assert_eq!(flux_turn_to_interim(&mk(event, " so the ")).as_deref(), Some("so the"), "{event}");
+        }
+        assert_eq!(flux_turn_to_interim(&mk("EndOfTurn", "So the plan.")), None);
+        assert_eq!(flux_turn_to_interim(&mk("StartOfTurn", "  ")), None, "no words yet: nothing to show");
+    }
+
+    #[test]
+    fn nova_interim_is_a_non_final_result_with_text() {
+        let msg = |is_final: bool, transcript: &str, channel_index: &str| -> RealtimeMessage {
+            serde_json::from_str(&format!(
+                r#"{{ "type": "Results", "is_final": {is_final}, "channel_index": {channel_index},
+                    "channel": {{ "alternatives": [ {{ "transcript": "{transcript}", "words": [] }} ] }} }}"#
+            ))
+            .unwrap()
+        };
+        let text = |m: RealtimeMessage| nova_interim(&m).map(|(c, t, _)| (c, t));
+        assert_eq!(text(msg(false, "we handle about", "[1, 2]")), Some((Some((1, 2)), "we handle about".to_string())));
+        assert_eq!(text(msg(true, "We handle about forty.", "[1, 2]")), None, "finals take the final path");
+        assert_eq!(text(msg(false, "", "[0, 2]")), Some((Some((0, 2)), String::new())), "a revision to nothing clears");
+        let meta: RealtimeMessage = serde_json::from_str(r#"{ "type": "Metadata" }"#).unwrap();
+        assert!(nova_interim(&meta).is_none());
+    }
+
+    /// Deepgram's documented case: an interim over 0-4.3 s, then a final
+    /// over 0-3.26 s. The uncovered words stay greyed.
+    #[test]
+    fn a_nova_final_keeps_the_interim_words_it_did_not_cover() {
+        let w = |word: &str, start: f64, end: f64| DeepgramWord {
+            word: word.to_lowercase(),
+            punctuated_word: Some(word.to_string()),
+            start,
+            end,
+            confidence: None,
+            speaker: None,
+        };
+        let interim = vec![w("Another", 0.1, 0.5), w("big", 0.6, 3.2), w("problem", 3.27, 3.8), w("in", 3.9, 4.3)];
+        assert_eq!(words_line(&interim_after(&interim, 3.26)), "problem in");
+        assert_eq!(words_line(&interim_after(&interim, 4.3)), "", "a final over all of it clears");
+        // A word the final holds stays out even if the interim timed it a
+        // few ms earlier or later than the final's end.
+        // The final's "go" ends at 3.26; the interim timed it 3.25-3.262.
+        let edge = vec![w("go", 3.25, 3.262), w("now", 3.3, 3.6)];
+        assert_eq!(words_line(&interim_after(&edge, 3.26)), "now");
+        assert_eq!(words_line(&interim_after(&edge, 3.27)), "now");
+        assert!(interim_after(&[], 1.0).is_empty());
+    }
+
+    #[test]
+    fn greyed_mic_bleed_is_hidden_and_real_mic_words_are_not() {
+        let mut f = InterimBleedFilter::default();
+        let clear = |speaker| RealtimeOutput::Interim { speaker, text: String::new() };
+        let shown = |speaker, text: &str| RealtimeOutput::Interim { speaker, text: text.to_string() };
+        let far = Some(SPEAKER_OUT_LABEL);
+        let mic = Some(MIC_IN_LABEL);
+        assert_eq!(f.filter(far, "let us review the quarterly".into(), 0.0), shown(far, "let us review the quarterly"));
+        // The far side's words through the mic, a beat later: hidden.
+        assert_eq!(f.filter(mic, "review the quarterly".into(), 400.0), clear(mic));
+        // The user's own words, said over the far side: shown.
+        assert_eq!(f.filter(mic, "I am taking notes now".into(), 600.0), shown(mic, "I am taking notes now"));
+        // Too short to judge: shown even though "the" was said.
+        assert_eq!(f.filter(mic, "the review".into(), 700.0), shown(mic, "the review"));
+        // The far side resending its utterance does not make its first words new.
+        let mut g = InterimBleedFilter::default();
+        g.filter(far, "approve the budget".into(), 0.0);
+        g.filter(far, "approve the budget and then the hiring plan".into(), INTERIM_BLEED_WINDOW_MS - 100.0);
+        assert_eq!(
+            g.filter(far, "approve the budget and then the hiring plan for next year".into(), INTERIM_BLEED_WINDOW_MS + 500.0),
+            shown(far, "approve the budget and then the hiring plan for next year")
+        );
+        assert_eq!(g.filter(mic, "approve the budget".into(), INTERIM_BLEED_WINDOW_MS + 600.0), shown(mic, "approve the budget"));
+        // Old far-side words no longer count.
+        assert_eq!(f.filter(mic, "review the quarterly".into(), 400.0 + INTERIM_BLEED_WINDOW_MS + 1.0), shown(mic, "review the quarterly"));
+    }
 
     #[test]
     fn flux_reduction_only_on_end_of_turn() {
@@ -2792,9 +3078,15 @@ mod tests {
         let (outer_tx, outer_rx) = mpsc::unbounded_channel::<AudioChunk>();
         let (inner_tx, inner_rx) = mpsc::unbounded_channel::<AudioChunk>();
         let (seen_tx, mut seen_rx) = mpsc::unbounded_channel::<LabeledSegment>();
+        let interims: Arc<std::sync::Mutex<Vec<(Option<&'static str>, String)>>> = Arc::default();
+        let interim_sink = interims.clone();
         let core = run_realtime_core(sidecar.endpoints(), sidecar.token.clone(), options, None, inner_rx, move |out: RealtimeOutput| {
-            if let RealtimeOutput::Show { seg, .. } = out {
-                let _ = seen_tx.send(seg);
+            match out {
+                RealtimeOutput::Show { seg, .. } => {
+                    let _ = seen_tx.send(seg);
+                }
+                RealtimeOutput::Interim { speaker, text } => interim_sink.lock().unwrap().push((speaker, text)),
+                RealtimeOutput::Retract { .. } => {}
             }
         });
         // 0.1 s stereo chunks; the fake Flux commits one turn per 0.1 s per lane.
@@ -2825,6 +3117,15 @@ mod tests {
                 labels.insert(seg.speaker);
             }
             assert_eq!(labels, [Some(MIC_IN_LABEL), Some(SPEAKER_OUT_LABEL)].into_iter().collect());
+            // WORK-580: each side's Flux Update reached the core as greyed
+            // interim text, and each committed turn cleared it.
+            {
+                let interims = interims.lock().unwrap();
+                for side in [MIC_IN_LABEL, SPEAKER_OUT_LABEL] {
+                    assert!(interims.iter().any(|(s, t)| *s == Some(side) && t == "turn"), "{side}: {interims:?}");
+                    assert!(interims.iter().any(|(s, t)| *s == Some(side) && t.is_empty()), "{side} never cleared: {interims:?}");
+                }
+            }
             // Crash the sidecar mid-recording.
             assert!(std::process::Command::new("kill").args(["-9", &pid.to_string()]).status().unwrap().success());
             for i in 10..60 {
@@ -2935,6 +3236,20 @@ mod tests {
         assert_eq!(value.trim_end_matches(';').trim_matches('\''), TRANSCRIPT_RETRACT_EVENT);
         let service = include_str!("../../../src/services/transcriptService.ts");
         assert!(service.contains("listen<TranscriptRetract>(TRANSCRIPT_RETRACT_EVENT"));
+    }
+
+    /// Same contract for the greyed live line: a renamed event would leave the
+    /// interim words silently invisible.
+    #[test]
+    fn ts_listens_for_transcript_interim() {
+        let ts = include_str!("../../../src/lib/transcript-interim.ts");
+        let value = ts
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("export const TRANSCRIPT_INTERIM_EVENT = "))
+            .expect("TRANSCRIPT_INTERIM_EVENT not found in transcript-interim.ts");
+        assert_eq!(value.trim_end_matches(';').trim_matches('\''), TRANSCRIPT_INTERIM_EVENT);
+        let service = include_str!("../../../src/services/transcriptService.ts");
+        assert!(service.contains("listen<TranscriptInterim>(TRANSCRIPT_INTERIM_EVENT"));
     }
 
     /// The frontend skips its local-model check for these providers, so each
@@ -3250,6 +3565,7 @@ mod tests {
             match out {
                 RealtimeOutput::Show { key, seg } => lines.push((*key, seg.clone())),
                 RealtimeOutput::Retract { key } => lines.retain(|(k, _)| k != key),
+                RealtimeOutput::Interim { .. } => {}
             }
         }
         lines.into_iter().map(|(_, seg)| seg).collect()
@@ -3393,6 +3709,7 @@ mod tests {
             .map(|o| match o {
                 RealtimeOutput::Show { seg, .. } => format!("show {:?}: {}", seg.speaker, seg.text),
                 RealtimeOutput::Retract { key } => format!("retract {key}"),
+                RealtimeOutput::Interim { speaker, text } => format!("interim {speaker:?}: {text}"),
             })
             .collect()
     }
@@ -3955,6 +4272,14 @@ mod tests {
                     RealtimeOutput::Retract { key } => {
                         println!("[live {:?}] #{:<3} RETRACTED at {:>5.1}s", layout, key, started.elapsed().as_secs_f64())
                     }
+                    RealtimeOutput::Interim { speaker, text } if !text.is_empty() => println!(
+                        "[live {:?}]  ~   at {:>5.1}s  {:<11} {}",
+                        layout,
+                        started.elapsed().as_secs_f64(),
+                        speaker.unwrap_or("-"),
+                        text
+                    ),
+                    RealtimeOutput::Interim { .. } => {}
                 }
                 sink.lock().unwrap().push(out)
             },

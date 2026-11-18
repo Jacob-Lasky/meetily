@@ -17,6 +17,8 @@ interface TranscriptContextType {
   copyTranscript: () => void;
   flushBuffer: () => void;
   transcriptContainerRef: React.RefObject<HTMLDivElement>;
+  /** Scroll the transcript to the bottom if the user was following it (live line growth). */
+  followBottom: () => void;
   meetingTitle: string;
   setMeetingTitle: (title: string) => void;
   clearTranscripts: () => void;
@@ -62,6 +64,16 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     if (container) {
       container.addEventListener('scroll', handleScroll);
       return () => container.removeEventListener('scroll', handleScroll);
+    }
+  }, []);
+
+  // Content below the rows (the greyed live line) grew: keep up with it
+  // only if the user was at the bottom before it did. Growth fires no
+  // scroll event, so isUserAtBottomRef still holds the pre-update answer.
+  const followBottom = useCallback(() => {
+    const container = transcriptContainerRef.current;
+    if (isUserAtBottomRef.current && container) {
+      container.scrollTop = container.scrollHeight;
     }
   }, []);
 
@@ -536,6 +548,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     copyTranscript,
     flushBuffer,
     transcriptContainerRef,
+    followBottom,
     meetingTitle,
     setMeetingTitle,
     clearTranscripts,

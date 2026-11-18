@@ -9,6 +9,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { TranscriptUpdate, Transcript } from '@/types';
 import { TRANSCRIPT_RETRACT_EVENT, type TranscriptRetract } from '@/lib/transcript-retract';
+import { TRANSCRIPT_INTERIM_EVENT, type TranscriptInterim } from '@/lib/transcript-interim';
 
 export interface TranscriptionStatus {
   chunks_in_queue: number;
@@ -67,6 +68,16 @@ export class TranscriptService {
    */
   async onTranscriptRetract(callback: (retract: TranscriptRetract) => void): Promise<UnlistenFn> {
     return listen<TranscriptRetract>(TRANSCRIPT_RETRACT_EVENT, (event) => {
+      callback(event.payload);
+    });
+  }
+
+  /**
+   * Listen for each channel's not-yet-final words (greyed live line).
+   * Display only: these never become transcript rows.
+   */
+  async onTranscriptInterim(callback: (interim: TranscriptInterim) => void): Promise<UnlistenFn> {
+    return listen<TranscriptInterim>(TRANSCRIPT_INTERIM_EVENT, (event) => {
       callback(event.payload);
     });
   }

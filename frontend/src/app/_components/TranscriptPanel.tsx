@@ -7,9 +7,10 @@ import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useConfig } from '@/contexts/ConfigContext';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import { usePermissionCheck } from '@/hooks/usePermissionCheck';
+import { useInterimTranscripts } from '@/hooks/useInterimTranscripts';
 import { ModalType } from '@/hooks/useModalState';
 import { useIsLinux } from '@/hooks/usePlatform';
-import { useMemo } from 'react';
+import { useEffect, useMemo } from 'react';
 
 /**
  * TranscriptPanel Component
@@ -31,11 +32,17 @@ export function TranscriptPanel({
   showModal
 }: TranscriptPanelProps) {
   // Contexts
-  const { transcripts, transcriptContainerRef, copyTranscript } = useTranscripts();
+  const { transcripts, transcriptContainerRef, copyTranscript, followBottom } = useTranscripts();
   const { transcriptModelConfig } = useConfig();
   const { isRecording, isPaused } = useRecordingState();
   const { checkPermissions, isChecking, hasSystemAudio, hasMicrophone } = usePermissionCheck();
   const isLinux = useIsLinux();
+  const { lines: interimLines, receiving: interimReceiving } = useInterimTranscripts(isRecording, isPaused);
+  // This panel is the scroller: keep the growing live line in view.
+  const interimText = interimLines.map((line) => line.text).join('\n');
+  useEffect(() => {
+    if (interimText) followBottom();
+  }, [interimText, followBottom]);
 
   // Convert transcripts to segments for virtualized view
   const segments = useMemo(() =>
@@ -112,8 +119,9 @@ export function TranscriptPanel({
               isPaused={isPaused}
               isProcessing={isProcessingStop}
               isStopping={isStopping}
-              enableStreaming={isRecording}
+              enableStreaming={isRecording && !interimReceiving}
               showConfidence={true}
+              interimLines={interimLines}
             />
           </div>
         </div>

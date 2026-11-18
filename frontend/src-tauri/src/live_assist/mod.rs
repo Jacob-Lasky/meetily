@@ -380,9 +380,7 @@ async fn assist_target<R: Runtime>(
     Ok((provider, model, target))
 }
 
-/// The built-in Deepgram knowledge (`scripts/refresh-deepgram-knowledge.py`
-/// regenerates it from deepgram.com/llms.txt).
-pub const DEEPGRAM_PUBLIC: &str = include_str!("deepgram_public.md");
+use settings::DEEPGRAM_PUBLIC;
 const DEEPGRAM_PUBLIC_NAME: &str = "Deepgram public overview (built in)";
 /// Deepgram's hosted docs MCP server (developers.deepgram.com, "Agentic
 /// Developer Tools"); it takes `Authorization: Token <Deepgram API key>`.
@@ -644,7 +642,13 @@ async fn run<R: Runtime>(
                         }
                     }
                     Msg::Pin { id, pinned, reply } => {
-                        let _ = reply.send(pin_and_save(&mut engine, folder.as_deref(), &id, pinned));
+                        let result = pin_and_save(&mut engine, folder.as_deref(), &id, pinned);
+                        let unpinned = result.as_ref().is_ok_and(|c| !c.pinned);
+                        let _ = reply.send(result);
+                        if unpinned {
+                            // An unpinned card counts toward the limit again.
+                            emit_withdraw(&app, engine.evict_overflow(), "evicted");
+                        }
                     }
                     Msg::Cards(reply) => {
                         let _ = reply.send(engine.cards().to_vec());
@@ -974,7 +978,7 @@ pub fn load_settings<R: Runtime>(app: &AppHandle<R>) -> AssistSettings {
     let Ok(store) = app.store(SETTINGS_STORE) else { return AssistSettings::default() };
     match store.get(SETTINGS_KEY) {
         None => AssistSettings::default(),
-        Some(v) => serde_json::from_value(v).unwrap_or_else(|e| {
+        Some(v) => AssistSettings::from_stored(v).unwrap_or_else(|e| {
             warn!("live assist: AI Assist settings unreadable ({e}); using the defaults");
             AssistSettings::default()
         }),
@@ -1093,7 +1097,8 @@ struct PinsFile {
 /// pin is undone and the error returned, so the UI never shows a pin that
 /// will not be kept with the meeting.
 fn pin_and_save(engine: &mut Engine, folder: Option<&Path>, id: &str, pinned: bool) -> Result<Card, String> {
-    let before = engine.cards().iter().find(|c| c.id == id).map(|c| c.pinned).ok_or("card not found")?;
+    // The whole list, not just the flag: pinning also moves the card.
+    let before = engine.cards().to_vec();
     let card = engine.set_pinned(id, pinned).ok_or("card not found")?;
     let saved = match folder {
         Some(folder) => write_pins(folder, &engine.pinned(), None)
@@ -1102,7 +1107,7 @@ fn pin_and_save(engine: &mut Engine, folder: Option<&Path>, id: &str, pinned: bo
         None => Ok(()),
     };
     if let Err(e) = saved {
-        engine.set_pinned(id, before);
+        engine.restore_cards(before);
         error!("live assist: {e}");
         return Err(e);
     }
@@ -1318,7 +1323,17 @@ pub async fn ai_assist_test_builtin_docs<R: Runtime>(app: AppHandle<R>) -> Resul
     let server = builtin_docs_server(&app)
         .await
         .ok_or("no Deepgram API key is saved (Settings › Transcription › Deepgram)")?;
-    mcp_probe::list_tools(&server).await
+    let key = deepgram_key(&app).await.unwrap_or_default();
+    // An error body could echo the request's headers: never hand the key to the UI.
+    let redact = |e: String| if key.trim().is_empty() { e } else { e.replace(key.trim(), "***") };
+    let tools = mcp_probe::list_tools(&server).await.map_err(redact)?;
+    if !tools.iter().any(|t| t.name == DEEPGRAM_DOCS_TOOL) {
+        return Err(format!(
+            "connected, but the server does not list {DEEPGRAM_DOCS_TOOL}, the tool lookups use (it lists {})",
+            if tools.is_empty() { "no tools".to_string() } else { tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ") }
+        ));
+    }
+    Ok(tools)
 }
 
 /// The built-in Deepgram knowledge text, for the Knowledge section.
@@ -1495,7 +1510,15 @@ mod tests {
     #[test]
     fn a_pin_that_cannot_be_saved_is_undone_and_reported() {
         let (mut engine, id) = engine_with_one_card();
+        let t0 = std::time::Instant::now();
+        engine.on_line(2, Side::Them, "and the SLA?", t0);
+        let raw = vec![super::cards::RawCard { kind: CardKind::Ask, text: "Which SLA?".into(), quote: String::new() }];
+        engine.on_external_cards(9, raw, None, 1);
+        let order_before: Vec<String> = engine.cards().iter().map(|c| c.id.clone()).collect();
+        assert_eq!(order_before.last(), Some(&id), "the card to pin is not on top");
         assert!(pin_and_save(&mut engine, None, &id, true).is_err(), "no meeting folder");
+        let order_after: Vec<String> = engine.cards().iter().map(|c| c.id.clone()).collect();
+        assert_eq!(order_after, order_before, "a failed pin puts the card back where it was");
         assert!(engine.pinned().is_empty());
         let missing = std::path::Path::new("/nonexistent/w524/folder");
         assert!(pin_and_save(&mut engine, Some(missing), &id, true).is_err(), "write failure");

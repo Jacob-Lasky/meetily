@@ -134,6 +134,10 @@ impl Default for Research {
     }
 }
 
+/// The built-in Deepgram knowledge (`scripts/refresh-deepgram-knowledge.py`
+/// regenerates it from deepgram.com/llms.txt).
+pub const DEEPGRAM_PUBLIC: &str = include_str!("deepgram_public.md");
+
 /// Name of the built-in Deepgram docs research server; user servers cannot
 /// take it (the sidecar keys MCP clients by server name).
 pub const BUILTIN_DOCS_NAME: &str = "Deepgram docs";
@@ -185,10 +189,26 @@ fn yes() -> bool {
 }
 
 impl AssistSettings {
-    /// About me + enabled knowledge, in characters.
+    /// About me + enabled knowledge, the built-in overview included when it
+    /// is on, in characters.
     pub fn context_chars(&self) -> usize {
-        self.about_me.chars().count()
+        let builtin = if self.builtin.deepgram_overview { DEEPGRAM_PUBLIC.chars().count() } else { 0 };
+        builtin
+            + self.about_me.chars().count()
             + self.knowledge.iter().filter(|k| k.enabled).map(|k| k.text.chars().count()).sum::<usize>()
+    }
+
+    /// Settings read from the store. An object saved before the built-ins
+    /// existed (no `builtin` key) gets research on, the new default: it was
+    /// saved off only because off was the old default, and the built-in
+    /// docs server needs it.
+    pub fn from_stored(value: serde_json::Value) -> Result<Self, serde_json::Error> {
+        let had_builtin = value.get("builtin").is_some();
+        let mut settings: Self = serde_json::from_value(value)?;
+        if !had_builtin {
+            settings.research.enabled = true;
+        }
+        Ok(settings)
     }
 
     /// Check a settings object before it is saved. `brief_chars` is the
@@ -288,6 +308,7 @@ mod tests {
         assert!(s.validate(0).is_ok());
 
         let mut s = AssistSettings::default();
+        s.builtin.deepgram_overview = false;
         s.knowledge.push(KnowledgeItem { id: "a".into(), name: "big".into(), text: "x".repeat(MAX_CONTEXT_CHARS + 1), enabled: true });
         assert!(s.validate(0).is_err());
         s.knowledge[0].enabled = false;
@@ -321,6 +342,27 @@ mod tests {
         s.research.servers[1].name = "b".into();
         s.research.servers[1].url = "ftp://x".into();
         assert!(s.validate(0).is_err(), "bad URL");
+    }
+
+    #[test]
+    fn the_builtin_overview_counts_toward_the_context_limit() {
+        let mut s = AssistSettings::default();
+        let overview = DEEPGRAM_PUBLIC.chars().count();
+        assert_eq!(s.context_chars(), overview);
+        s.knowledge.push(KnowledgeItem { id: "a".into(), name: "n".into(), text: "x".repeat(MAX_CONTEXT_CHARS - overview), enabled: true });
+        assert!(s.validate(0).is_ok());
+        assert!(s.validate(1).is_err(), "at the limit with the overview on");
+        s.builtin.deepgram_overview = false;
+        assert!(s.validate(1).is_ok());
+    }
+
+    #[test]
+    fn settings_saved_before_the_builtins_get_research_on() {
+        let old = serde_json::json!({ "research": { "enabled": false, "servers": [] }, "aboutMe": "x" });
+        let s = AssistSettings::from_stored(old).unwrap();
+        assert!(s.research.enabled && s.builtin.deepgram_docs);
+        let new = serde_json::json!({ "research": { "enabled": false, "servers": [] }, "builtin": { "deepgramDocs": true } });
+        assert!(!AssistSettings::from_stored(new).unwrap().research.enabled, "a choice made with the built-ins present stands");
     }
 
     #[test]

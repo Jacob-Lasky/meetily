@@ -96,7 +96,14 @@ export function mergeSynced(
 ): AssistCard[] {
   const currentById = new Map(current.map((c) => [c.id, c]));
   const synced = backend.map((c) => currentById.get(c.id) ?? c);
-  return withAdded(synced, current).filter((c) => !withdrawn.has(c.id));
+  const merged = withAdded(synced, current).filter((c) => !withdrawn.has(c.id));
+  // Pins made after the snapshot (in `current`) are the newest: they go on
+  // top, in the order the panel already shows them, as in the engine.
+  const mergedById = new Map(merged.map((c) => [c.id, c]));
+  const recent = current.filter((c) => c.pinned && mergedById.has(c.id)).map((c) => mergedById.get(c.id)!);
+  const recentIds = new Set(recent.map((c) => c.id));
+  const otherPins = merged.filter((c) => c.pinned && !recentIds.has(c.id));
+  return [...recent, ...otherPins, ...merged.filter((c) => !c.pinned)];
 }
 
 export const KIND_LABEL: Record<AssistCardKind, string> = {

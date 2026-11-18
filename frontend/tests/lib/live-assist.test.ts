@@ -50,6 +50,12 @@ describe('live assist card list', () => {
     expect(mergeSynced(backend, current, new Set(['a'])).map((c) => c.id)).toEqual(['c', 'b']);
   });
 
+  test('remount sync puts a pin made during the fetch on top', () => {
+    const backend = [card('p', { pinned: true })];
+    const current = [card('a', { pinned: true }), card('p', { pinned: true })];
+    expect(mergeSynced(backend, current, new Set()).map((c) => c.id)).toEqual(['a', 'p']);
+  });
+
   test('remount sync keeps a pin made after the snapshot was taken', () => {
     const backend = [card('a')];
     const current = [card('a', { pinned: true })];

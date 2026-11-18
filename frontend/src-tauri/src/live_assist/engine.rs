@@ -281,21 +281,35 @@ impl Engine {
         let mut list: Vec<Card> = pinned;
         list.extend(added.iter().cloned());
         list.extend(older);
+        self.cards = list;
+        let evicted = self.evict_overflow();
+        Applied { added, evicted }
+    }
+
+    /// Drop the oldest unpinned cards beyond `max_unpinned_cards`; returns
+    /// their ids. Run after adding cards and after an unpin.
+    pub fn evict_overflow(&mut self) -> Vec<String> {
         let mut evicted = Vec::new();
         let mut unpinned = 0;
-        list.retain(|c| {
+        let max = self.cfg.max_unpinned_cards;
+        self.cards.retain(|c| {
             if c.pinned {
                 return true;
             }
             unpinned += 1;
-            if unpinned > self.cfg.max_unpinned_cards {
+            if unpinned > max {
                 evicted.push(c.id.clone());
                 return false;
             }
             true
         });
-        self.cards = list;
-        Applied { added, evicted }
+        evicted
+    }
+
+    /// Put back a card list taken with `cards().to_vec()` (undoing a pin
+    /// that could not be saved, order included).
+    pub fn restore_cards(&mut self, cards: Vec<Card>) {
+        self.cards = cards;
     }
 
     pub fn dismiss(&mut self, id: &str) -> bool {
@@ -404,6 +418,21 @@ mod tests {
         e.set_pinned(&ids[1], false).unwrap();
         assert_eq!(e.cards()[0].text, "Send pricing", "unpinned, it heads the unpinned cards");
         assert!(!e.cards()[0].pinned);
+    }
+
+    #[test]
+    fn unpinning_past_the_limit_evicts_the_oldest_unpinned_card() {
+        let t0 = Instant::now();
+        let mut e = Engine::new(Config { max_unpinned_cards: 2, ..Config::default() });
+        e.on_line(1, Side::Them, "Question?", t0);
+        let first = e.on_external_cards(1, vec![raw(CardKind::Ask, "P", "")], None, 1);
+        e.set_pinned(&first.added[0].id, true).unwrap();
+        e.on_external_cards(2, vec![raw(CardKind::Ask, "B", "")], None, 2);
+        e.on_external_cards(3, vec![raw(CardKind::Ask, "C", "")], None, 3);
+        e.set_pinned(&first.added[0].id, false).unwrap();
+        let evicted = e.evict_overflow();
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(e.cards().iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["P", "C"], "B, the oldest, went");
     }
 
     // ---- cards from the Pipecat sidecar (WORK-559) -----------------------

@@ -80,9 +80,17 @@ export const DEFAULT_SETTINGS: AssistSettings = {
 /** Same as settings.rs BUILTIN_DOCS_NAME: user servers cannot take it. */
 export const BUILTIN_DOCS_NAME = 'Deepgram docs';
 
-/** Characters of standing context the backend counts against MAX_CONTEXT_CHARS. */
-export function contextChars(s: AssistSettings): number {
-  return [...s.aboutMe].length + s.knowledge.filter((k) => k.enabled).reduce((n, k) => n + [...k.text].length, 0);
+/**
+ * Characters of standing context the backend counts against
+ * MAX_CONTEXT_CHARS (settings.rs `context_chars`): the built-in overview when
+ * it is on (`builtinChars`, its length), about me and enabled knowledge.
+ */
+export function contextChars(s: AssistSettings, builtinChars = 0): number {
+  return (
+    (s.builtin.deepgramOverview ? builtinChars : 0) +
+    [...s.aboutMe].length +
+    s.knowledge.filter((k) => k.enabled).reduce((n, k) => n + [...k.text].length, 0)
+  );
 }
 
 export function newId(prefix: string): string {

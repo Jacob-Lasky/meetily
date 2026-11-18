@@ -72,6 +72,7 @@ export function AIAssistSettings() {
   const [engine, setEngine] = useState<LiveEngine | null>(null);
   const [preview, setPreview] = useState<PromptPreview | null>(null);
   const [saving, setSaving] = useState(false);
+  const [builtinText, setBuiltinText] = useState<string | null>(null);
   // Bumped when the form is replaced wholesale (Discard), so editors that
   // keep their own text (command line, env/header pairs) start over from it.
   const [revision, setRevision] = useState(0);
@@ -91,6 +92,9 @@ export function AIAssistSettings() {
       .then((c) => setSummaryModel(c ? `${c.provider} / ${c.model}` : 'not set'))
       .catch(() => setSummaryModel('not set'));
     invoke<LiveEngine>('live_engine_get').then(setEngine).catch(() => setEngine('direct'));
+    invoke<string>('ai_assist_builtin_knowledge')
+      .then(setBuiltinText)
+      .catch(() => setBuiltinText(''));
   }, []);
 
   // The prompt as it would be with the unsaved form.
@@ -123,7 +127,7 @@ export function AIAssistSettings() {
     return <p className="text-sm text-gray-500 p-6">Loading…</p>;
   }
 
-  const chars = contextChars(form);
+  const chars = contextChars(form, builtinText ? [...builtinText].length : 0);
 
   return (
     <div className="space-y-6 mt-6 pb-24" data-testid="ai-assist-settings">
@@ -147,7 +151,7 @@ export function AIAssistSettings() {
         />
       </div>
 
-      <KnowledgeSection form={form} update={update} chars={chars} />
+      <KnowledgeSection form={form} update={update} chars={chars} builtinText={builtinText} />
 
       <div className={section}>
         <h3 className={heading}>
@@ -330,7 +334,12 @@ function ModelSection({ form, update, summaryModel }: SectionProps & { summaryMo
   );
 }
 
-function KnowledgeSection({ form, update, chars }: SectionProps & { chars: number }) {
+function KnowledgeSection({
+  form,
+  update,
+  chars,
+  builtinText,
+}: SectionProps & { chars: number; builtinText: string | null }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const [draftName, setDraftName] = useState('');
   const [draftText, setDraftText] = useState('');
@@ -373,6 +382,7 @@ function KnowledgeSection({ form, update, chars }: SectionProps & { chars: numbe
         in full each time. Text files only (.txt, .md, .csv, .json…); for a PDF, paste its text.
       </p>
       <BuiltinOverview
+        text={builtinText}
         on={form.builtin.deepgramOverview}
         onChange={(v) => update({ builtin: { ...form.builtin, deepgramOverview: v } })}
       />
@@ -448,7 +458,7 @@ function KnowledgeSection({ form, update, chars }: SectionProps & { chars: numbe
         </div>
       </div>
       <p className={`text-xs mt-2 ${over ? 'text-red-600' : 'text-gray-500'}`}>
-        About me + enabled knowledge: {chars.toLocaleString()} / {MAX_CONTEXT_CHARS.toLocaleString()} characters
+        Built-in overview, about me and enabled knowledge: {chars.toLocaleString()} / {MAX_CONTEXT_CHARS.toLocaleString()} characters
         {over && ' — over the limit; turn some off to save'}
       </p>
     </div>
@@ -705,13 +715,15 @@ function McpServerEditor({
 }
 
 /** The built-in Deepgram overview (deepgram.com/llms.txt), on by default. */
-function BuiltinOverview({ on, onChange }: { on: boolean; onChange: (v: boolean) => void }) {
-  const [text, setText] = useState<string | null>(null);
-  useEffect(() => {
-    invoke<string>('ai_assist_builtin_knowledge')
-      .then(setText)
-      .catch(() => setText(''));
-  }, []);
+function BuiltinOverview({
+  text,
+  on,
+  onChange,
+}: {
+  text: string | null;
+  on: boolean;
+  onChange: (v: boolean) => void;
+}) {
   return (
     <div className="rounded border border-blue-200 bg-blue-50/40 p-3 mb-4" data-testid="builtin-overview">
       <div className="flex items-center gap-3">

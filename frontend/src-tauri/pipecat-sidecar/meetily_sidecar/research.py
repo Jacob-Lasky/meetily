@@ -223,9 +223,19 @@ def tool_name_for(tool: str, server: str, taken: set[str]) -> str:
     return candidate
 
 
-#: How long session end waits for a connecting MCP server to finish and be
-#: closed.
-WARM_UP_CLOSE_WAIT_SECS = 5.0
+#: How long session end waits, in total, for MCP servers still connecting.
+#: Rust gives the sidecar SHUTDOWN_TIMEOUT (5 s, `audio/pipecat.rs`) from
+#: closing its stdin to exiting before it kills it; 3 s here leaves the rest
+#: of shutdown (closing clients, the server) inside that, so the sidecar
+#: exits on its own.
+#:
+#: Contract limit (WORK-581): at session end, close() waits up to
+#: WARM_UP_CLOSE_WAIT_SECS for every MCP server still connecting, all on one
+#: deadline, and then the sidecar exits. A server still connecting after that
+#: is abandoned: an HTTP or SSE connection is dropped, and a stdio server's
+#: stdin pipe closes when the sidecar exits. Whether that server then exits is
+#: up to the server.
+WARM_UP_CLOSE_WAIT_SECS = 3.0
 
 
 @dataclass
@@ -249,7 +259,8 @@ class Research:
         self._current: _Lookup | None = None
         self._waiting: tuple[str, str] | None = None
         self._next_id = 0
-        self._warm: asyncio.Task | None = None
+        #: Warm-ups still running; each removes itself when done.
+        self._warming: set[asyncio.Task] = set()
         self._config_key: Any = None
         self._configure_lock = asyncio.Lock()
         #: Bumped by close(): a config queued before it is stale and opens nothing.
@@ -306,7 +317,9 @@ class Research:
             await old.close()
         if tools is not None:
             # Connect now so the first lookup does not wait on a server start.
-            self._warm = asyncio.get_running_loop().create_task(self._warm_up(tools))
+            warm = asyncio.get_running_loop().create_task(self._warm_up(tools))
+            self._warming.add(warm)
+            warm.add_done_callback(self._warming.discard)
 
     async def _warm_up(self, tools: Tools):
         try:
@@ -422,18 +435,18 @@ class Research:
                 await lookup.task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
-        # A warm-up still connecting is not cancelled (that could strand the
-        # MCP server it is starting): the tool source is closed below, and
-        # the warm-up, seeing that, closes its own client when it connects.
-        # Wait a little for that, so the sidecar does not exit first and
-        # cancel it before the client is closed.
-        warm = self._warm
+        # Warm-ups still connecting are not cancelled (that could strand the
+        # MCP server one is starting): every tool source is closed by now
+        # (replaced ones on reconfigure, the current one below), and a
+        # warm-up that sees its source closed closes its own client when it
+        # connects. Wait for all of them on one deadline; see the contract
+        # limit at WARM_UP_CLOSE_WAIT_SECS for what happens after it.
         if self._tools is not None:
             await self._tools.close()
             self._tools = None
             self._config_key = None
-        if warm is not None and not warm.done():
-            try:
-                await asyncio.wait_for(asyncio.shield(warm), WARM_UP_CLOSE_WAIT_SECS)
-            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):  # noqa: BLE001
-                logger.warning("research: an MCP server was still connecting at shutdown")
+        pending = {t for t in self._warming if not t.done()}
+        if pending:
+            _, still = await asyncio.wait(pending, timeout=WARM_UP_CLOSE_WAIT_SECS)
+            if still:
+                logger.warning(f"research: {len(still)} MCP server(s) still connecting at shutdown; abandoned")

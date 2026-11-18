@@ -237,15 +237,30 @@ pub fn start_session<R: Runtime>(app: &AppHandle<R>, meeting_folder: Option<Path
 /// after it returns, even if the session task has not run yet. Also notes
 /// the brief this call ran with (see `Session::brief_at_stop`).
 pub fn stop_calls<R: Runtime>(app: &AppHandle<R>) {
-    // Cancel first, read the brief after: no call may start in between.
-    let brief_at_stop = {
-        let session = SESSION.lock().unwrap();
-        let Some(session) = session.as_ref() else { return };
-        session.calls_off.cancel();
-        session.brief_at_stop.clone()
-    };
-    let brief = load_brief(app);
-    brief_at_stop.lock().unwrap().get_or_insert(brief);
+    let stopped = stop_then_read(
+        || {
+            let session = SESSION.lock().unwrap();
+            let session = session.as_ref()?;
+            session.calls_off.cancel();
+            Some(session.brief_at_stop.clone())
+        },
+        || load_brief(app),
+    );
+    if let Some((brief_at_stop, brief)) = stopped {
+        brief_at_stop.lock().unwrap().get_or_insert(brief);
+    }
+}
+
+/// Under `CONTEXT_SAVE`, from before `stop` (which cancels the calls)
+/// through `read` (the brief): a brief saved before Stop was already sent to
+/// the running call, so it is that call's brief; one saved after waits until
+/// the read is done and belongs to the next call. Lock order is the one
+/// `set_brief` and `save_settings` use: `CONTEXT_SAVE`, then `SESSION`.
+/// `stop` returning None (no session) skips the read.
+fn stop_then_read<T>(stop: impl FnOnce() -> Option<T>, read: impl FnOnce() -> String) -> Option<(T, String)> {
+    let _guard = CONTEXT_SAVE.lock().unwrap();
+    let stopped = stop()?;
+    Some((stopped, read()))
 }
 
 /// End the session: listeners removed, pins written. Called after the
@@ -963,18 +978,36 @@ static CONTEXT_SAVE: Mutex<()> = Mutex::new(());
 /// Clear the brief if it is still `expected`.
 fn clear_brief_if<R: Runtime>(app: &AppHandle<R>, expected: &str) {
     let Ok(store) = app.store(SETTINGS_STORE) else { return };
-    if store.get(BRIEF_KEY).and_then(|v| v.as_str().map(str::to_string)).as_deref() != Some(expected) {
+    let cleared = clear_if_still(
+        expected,
+        || store.get(BRIEF_KEY).and_then(|v| v.as_str().map(str::to_string)),
+        || {
+            store.delete(BRIEF_KEY);
+            if let Err(e) = store.save() {
+                warn!("live assist: could not clear the meeting brief: {e}");
+            }
+        },
+    );
+    if !cleared {
         return;
-    }
-    store.delete(BRIEF_KEY);
-    if let Err(e) = store.save() {
-        warn!("live assist: could not clear the meeting brief: {e}");
     }
     // The cleared text goes with the event: a box holding anything else (a
     // brief already typed for the next call) keeps it.
     if let Err(e) = app.emit(BRIEF_CLEARED_EVENT, serde_json::json!({ "brief": expected })) {
         error!("live assist: failed to emit brief-cleared: {e}");
     }
+}
+
+/// Under `CONTEXT_SAVE`, across the read, the delete and the save: a
+/// `set_brief` (which holds the same lock) cannot land between them and be
+/// deleted. The only caller, the end of the session task, holds no lock.
+fn clear_if_still(expected: &str, read: impl FnOnce() -> Option<String>, delete: impl FnOnce()) -> bool {
+    let _guard = CONTEXT_SAVE.lock().unwrap();
+    if read().as_deref() != Some(expected) {
+        return false;
+    }
+    delete();
+    true
 }
 
 /// The brief was kept with the meeting that just stopped and cleared:
@@ -1260,6 +1293,74 @@ mod tests {
             origin: None,
         }
     }
+
+    /// A `set_brief` stand-in: the store write under `CONTEXT_SAVE`.
+    fn save_brief_under_lock(store: &std::sync::Arc<Mutex<String>>, brief: &str) {
+        let _guard = CONTEXT_SAVE.lock().unwrap();
+        *store.lock().unwrap() = brief.to_string();
+    }
+
+    /// Runs `body` with a second thread that saves brief "B" as soon as
+    /// `go` is signalled; returns after both finish.
+    fn race_a_save(
+        store: &std::sync::Arc<Mutex<String>>,
+        body: impl FnOnce(&std::sync::mpsc::Sender<()>),
+    ) {
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let saver = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                wait.recv().unwrap();
+                save_brief_under_lock(&store, "B");
+            })
+        };
+        body(&go);
+        saver.join().unwrap();
+    }
+
+    #[test]
+    fn a_brief_saved_while_stop_runs_is_not_taken_for_the_stopped_calls() {
+        let _serial = LOCK_TESTS.lock().unwrap();
+        let store = std::sync::Arc::new(Mutex::new("A".to_string()));
+        let mut read = None;
+        race_a_save(&store, |go| {
+            read = stop_then_read(
+                || {
+                    go.send(()).unwrap();
+                    // Give the save every chance to land before the read.
+                    std::thread::sleep(Duration::from_millis(150));
+                    Some(())
+                },
+                || store.lock().unwrap().clone(),
+            );
+        });
+        assert_eq!(read.map(|(_, b)| b).as_deref(), Some("A"), "Stop read the next call's brief");
+        assert_eq!(*store.lock().unwrap(), "B", "the next call's brief is still saved");
+    }
+
+    #[test]
+    fn a_brief_saved_while_the_old_one_is_cleared_survives() {
+        let _serial = LOCK_TESTS.lock().unwrap();
+        let store = std::sync::Arc::new(Mutex::new("A".to_string()));
+        let mut cleared = false;
+        race_a_save(&store, |go| {
+            cleared = clear_if_still(
+                "A",
+                || {
+                    let current = store.lock().unwrap().clone();
+                    go.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(150));
+                    Some(current)
+                },
+                || store.lock().unwrap().clear(),
+            );
+        });
+        assert!(cleared);
+        assert_eq!(*store.lock().unwrap(), "B", "the clear deleted a brief saved for the next call");
+    }
+
+    /// The two lock tests share the global CONTEXT_SAVE: run them one at a time.
+    static LOCK_TESTS: Mutex<()> = Mutex::new(());
 
     #[test]
     fn pins_round_trip_through_the_meeting_folder() {

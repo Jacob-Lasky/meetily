@@ -499,3 +499,38 @@ async def test_session_end_waits_for_a_connecting_server_and_closes_it(monkeypat
     await asyncio.sleep(0.01)  # the warm-up is connecting
     await r.close()
     assert [c.closed for c in SlowClient.instances] == [True], "closed before close() returned"
+
+
+async def test_session_end_waits_for_every_connecting_server_after_a_swap(monkeypatch):
+    import pipecat.services.mcp_service as mcp_service
+
+    SlowClient.instances = []
+    monkeypatch.setattr(mcp_service, "MCPClient", SlowClient)
+    monkeypatch.setattr(MCPTools, "server_params", staticmethod(lambda cfg: None))
+    r = Research(lambda m: None)
+    a = MCPTools([{"name": "A", "transport": "stdio", "command": "x"}], lambda e: None)
+    b = MCPTools([{"name": "B", "transport": "stdio", "command": "y"}], lambda e: None)
+    await r.configure(tools=a, loop=loop_that("{}"), system_prompt="", limits=ResearchLimits(), config_key="a")
+    await asyncio.sleep(0.01)  # A is connecting
+    await r.configure(tools=b, loop=loop_that("{}"), system_prompt="", limits=ResearchLimits(), config_key="b")
+    await asyncio.sleep(0.01)  # so is B
+    await r.close()
+    assert [c.closed for c in SlowClient.instances] == [True, True], "A, swapped out mid-connect, was not waited for"
+
+
+async def test_the_wait_is_one_shared_deadline(monkeypatch):
+    import meetily_sidecar.research as research_mod
+
+    monkeypatch.setattr(research_mod, "WARM_UP_CLOSE_WAIT_SECS", 0.1)
+
+    class Hanging(FakeTools):
+        async def list(self):
+            await asyncio.sleep(10)
+
+    r = Research(lambda m: None)
+    for key in ("a", "b", "c"):
+        await r.configure(tools=Hanging(), loop=loop_that("{}"), system_prompt="", limits=ResearchLimits(), config_key=key)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await r.close()
+    assert loop.time() - started < 0.25, "three hanging servers must share one deadline, not wait in turn"

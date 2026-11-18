@@ -4,16 +4,20 @@ import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
-import { ChevronLeft, ChevronRight, Loader2, Pin, PinOff, Search, Sparkles, TriangleAlert, X } from 'lucide-react';
+import { CheckCircle2, ChevronLeft, ChevronRight, ClipboardList, Loader2, Pin, PinOff, Search, Sparkles, TriangleAlert, X } from 'lucide-react';
 import { MeetingBrief } from './MeetingBrief';
 import {
+  ASSIST_BRIEF_EVENT,
   ASSIST_RESEARCH_EVENT,
   ASSIST_STATUS_EVENT,
   ASSIST_UPDATE_EVENT,
   ASSIST_WITHDRAW_EVENT,
   AssistCard,
+  AssistBriefRead,
   AssistCardKind,
   AssistResearch,
+  BRIEF_ORIGIN,
+  briefSize,
   AssistStatus,
   AssistUpdate,
   AssistWithdraw,
@@ -45,6 +49,7 @@ export function LiveAssistPanel({ isRecording }: { isRecording: boolean }) {
   const [status, setStatus] = useState<AssistStatus>({ state: 'idle' });
   const [collapsed, setCollapsed] = useState(false);
   const [research, setResearch] = useState<AssistResearch | null>(null);
+  const [briefRead, setBriefRead] = useState<AssistBriefRead | null>(null);
   const withdrawnRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
@@ -62,6 +67,7 @@ export function LiveAssistPanel({ isRecording }: { isRecording: boolean }) {
         setCards((prev) => withoutIds(prev, e.payload.ids));
       }),
       listen<AssistResearch>(ASSIST_RESEARCH_EVENT, (e) => setResearch(e.payload)),
+      listen<AssistBriefRead>(ASSIST_BRIEF_EVENT, (e) => setBriefRead(e.payload)),
       listen<AssistStatus>(ASSIST_STATUS_EVENT, (e) => {
         setStatus(e.payload);
         if (e.payload.state === 'off') setEnabled(false);
@@ -82,6 +88,7 @@ export function LiveAssistPanel({ isRecording }: { isRecording: boolean }) {
     withdrawnRef.current = new Set();
     setStatus({ state: 'idle' });
     setResearch(null);
+    setBriefRead(null);
     invoke<AssistCard[]>('live_assist_get_cards')
       .then((backend) => {
         if (current) setCards((prev) => mergeSynced(backend, prev, withdrawnRef.current));
@@ -92,6 +99,14 @@ export function LiveAssistPanel({ isRecording }: { isRecording: boolean }) {
       setCards([]);
     };
   }, [isRecording]);
+
+  // The "brief read" confirmation is a moment, not a state: it fades after a
+  // while. "Reading" and errors stay until the next event replaces them.
+  useEffect(() => {
+    if (briefRead?.state !== 'done') return;
+    const t = setTimeout(() => setBriefRead((b) => (b?.state === 'done' ? null : b)), 12_000);
+    return () => clearTimeout(t);
+  }, [briefRead]);
 
   if (!enabled) return null;
 
@@ -153,6 +168,27 @@ export function LiveAssistPanel({ isRecording }: { isRecording: boolean }) {
       {status.state === 'error' && status.message && (
         <p className="px-3 py-2 text-xs text-red-700 bg-red-50 border-b border-red-100">{status.message}</p>
       )}
+      {isRecording && briefRead?.state === 'reading' && (
+        <p className="px-3 py-2 text-xs text-blue-800 bg-blue-50 border-b border-blue-100 flex items-center gap-2" data-testid="assist-brief">
+          <ClipboardList className="w-3.5 h-3.5 flex-shrink-0" />
+          <span className="flex-1">Reading your brief ({briefSize(briefRead.chars)})…</span>
+          <Loader2 className="w-3.5 h-3.5 animate-spin flex-shrink-0" />
+        </p>
+      )}
+      {isRecording && briefRead?.state === 'done' && (
+        <p className="px-3 py-2 text-xs text-green-800 bg-green-50 border-b border-green-100 flex items-center gap-2" data-testid="assist-brief">
+          <CheckCircle2 className="w-3.5 h-3.5 flex-shrink-0" />
+          <span>
+            Brief read{briefRead.cards ? ` · ${briefRead.cards} opening card${briefRead.cards === 1 ? '' : 's'} below` : ''}. It goes
+            with every card this call.
+          </span>
+        </p>
+      )}
+      {isRecording && briefRead?.state === 'error' && (
+        <p className="px-3 py-2 text-xs text-amber-800 bg-amber-50 border-b border-amber-100" data-testid="assist-brief" title={briefRead.message}>
+          Could not read your brief ({briefRead.message}). It still goes with every card.
+        </p>
+      )}
       {isRecording && research?.state === 'started' && (
         <p className="px-3 py-2 text-xs text-blue-800 bg-blue-50 border-b border-blue-100 flex items-center gap-2" data-testid="assist-research">
           <Search className="w-3.5 h-3.5 flex-shrink-0" />
@@ -170,7 +206,9 @@ export function LiveAssistPanel({ isRecording }: { isRecording: boolean }) {
           <p className="text-xs text-gray-500 text-center mt-6">Cards appear here during a recording.</p>
         ) : cards.length === 0 ? (
           <p className="text-xs text-gray-500 text-center mt-6">
-            Suggestions appear here after the other side speaks.
+            {briefRead?.state === 'reading'
+              ? 'Opening cards from your brief appear here in a moment.'
+              : 'Suggestions appear here after the other side speaks.'}
           </p>
         ) : (
           cards.map((card) => (
@@ -183,10 +221,17 @@ export function LiveAssistPanel({ isRecording }: { isRecording: boolean }) {
                 <span className={`text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded ${KIND_STYLE[card.kind]}`}>
                   {KIND_LABEL[card.kind]}
                 </span>
-                {card.origin && (
-                  <span className="text-[10px] text-gray-500" title="Looked up with MCP tools">
-                    via {card.origin}
+                {card.origin === BRIEF_ORIGIN ? (
+                  <span className="text-[10px] text-gray-500 flex items-center gap-1" title="Read from your meeting brief">
+                    <ClipboardList className="w-3 h-3" />
+                    From your brief
                   </span>
+                ) : (
+                  card.origin && (
+                    <span className="text-[10px] text-gray-500" title="Looked up with MCP tools">
+                      via {card.origin}
+                    </span>
+                  )
                 )}
                 <span className="flex-1" />
                 <button

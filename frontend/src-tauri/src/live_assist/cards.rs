@@ -362,6 +362,21 @@ pub fn keep_kinds(cards: Vec<RawCard>, kinds: &[CardKind]) -> Vec<RawCard> {
     cards.into_iter().filter(|c| kinds.contains(&c.kind)).collect()
 }
 
+/// User prompt for reading the meeting brief before the transcript has
+/// anything (WORK-559: Jake filled in the brief, pressed record and saw no
+/// sign it was read). Sent with the normal card system prompt, which holds
+/// the brief; this only redirects the quote to the brief, as there is no
+/// transcript to quote.
+pub fn brief_prompt() -> String {
+    format!(
+        "The call is starting and there is no transcript yet. Read the meeting brief in Me's background and give Me \
+up to {MAX_CARDS_PER_CALL} cards to have in front of them as the call opens: the outcome to steer toward, the most \
+useful question to ask early, and a fact, risk or commitment from the brief to keep in mind. For quote, copy word \
+for word the line of the meeting brief the card comes from. Use only what the brief and Me's background say. If \
+the brief holds nothing worth a card, return no cards."
+    )
+}
+
 /// User prompt: the context window, oldest line first, one line each, then
 /// the cards Me already has or dismissed (`shown`, newest first). Without that list
 /// each call re-suggested the same follow-ups: the 2026-11-17 live run showed
@@ -514,6 +529,14 @@ mod tests {
         assert!(r.contains("Never guess") && r.contains("<about_me>\nAppEng\n</about_me>") && r.contains("<meeting_brief>\nAcme"));
         let fact_only = research_prompt(&PromptParts { kinds: vec![CardKind::Fact, CardKind::Ask], ..Default::default() });
         assert!(fact_only.contains("kind fact.") || fact_only.contains("kind fact "), "{fact_only}");
+    }
+
+    #[test]
+    fn brief_prompt_points_the_quote_at_the_brief() {
+        let p = brief_prompt();
+        assert!(p.contains("no transcript yet"));
+        assert!(p.contains("line of the meeting brief"));
+        assert!(p.contains(&format!("up to {MAX_CARDS_PER_CALL} cards")));
     }
 
     #[test]

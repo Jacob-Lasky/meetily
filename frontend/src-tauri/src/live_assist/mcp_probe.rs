@@ -27,18 +27,14 @@ pub struct ToolInfo {
 }
 
 pub async fn list_tools(server: &McpServer) -> Result<Vec<ToolInfo>, String> {
-    let probe = async {
-        match server.transport {
-            McpTransport::Stdio => stdio(server).await,
-            McpTransport::Http => http(server).await,
-            McpTransport::Sse => Err("Test only covers local and streamable-HTTP servers; an SSE server is \
-                                      checked when the first lookup runs"
-                .to_string()),
-        }
-    };
-    tokio::time::timeout(PROBE_TIMEOUT, probe)
-        .await
-        .map_err(|_| format!("{} did not answer within {} s", server.name, PROBE_TIMEOUT.as_secs()))?
+    let timed_out = || format!("{} did not answer within {} s", server.name, PROBE_TIMEOUT.as_secs());
+    match server.transport {
+        McpTransport::Stdio => stdio(server).await,
+        McpTransport::Http => tokio::time::timeout(PROBE_TIMEOUT, http(server)).await.map_err(|_| timed_out())?,
+        McpTransport::Sse => Err("Test only covers local and streamable-HTTP servers; an SSE server is \
+                                  checked when the first lookup runs"
+            .to_string()),
+    }
 }
 
 fn initialize() -> serde_json::Value {
@@ -92,20 +88,43 @@ async fn stdio(server: &McpServer) -> Result<Vec<ToolInfo>, String> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        // Its own process group, so the whole tree goes at the end: a
+        // shell, `npx` or relay often starts the real server as a child,
+        // which killing the direct child alone would leave running.
+        .process_group(0)
         .kill_on_drop(true);
     let mut child = cmd.spawn().map_err(|e| format!("could not start {}: {e}", server.command.trim()))?;
+    let group = child.id();
     let mut stdin = child.stdin.take().ok_or("no stdin")?;
     let mut lines = BufReader::new(child.stdout.take().ok_or("no stdout")?).lines();
 
-    let send = |msg: serde_json::Value| format!("{msg}\n");
-    stdin.write_all(send(initialize()).as_bytes()).await.map_err(|e| format!("write failed: {e}"))?;
-    read_reply(&mut lines, 1).await?;
-    stdin.write_all(send(initialized()).as_bytes()).await.map_err(|e| format!("write failed: {e}"))?;
-    stdin.write_all(send(tools_list()).as_bytes()).await.map_err(|e| format!("write failed: {e}"))?;
-    let reply = read_reply(&mut lines, 2).await?;
+    let talk = async {
+        let send = |msg: serde_json::Value| format!("{msg}\n");
+        stdin.write_all(send(initialize()).as_bytes()).await.map_err(|e| format!("write failed: {e}"))?;
+        read_reply(&mut lines, 1).await?;
+        stdin.write_all(send(initialized()).as_bytes()).await.map_err(|e| format!("write failed: {e}"))?;
+        stdin.write_all(send(tools_list()).as_bytes()).await.map_err(|e| format!("write failed: {e}"))?;
+        read_reply(&mut lines, 2).await
+    };
+    let reply = tokio::time::timeout(PROBE_TIMEOUT, talk)
+        .await
+        .map_err(|_| format!("{} did not answer within {} s", server.name, PROBE_TIMEOUT.as_secs()));
     drop(stdin);
+    if let Some(pgid) = group {
+        kill_group(pgid);
+    }
     let _ = child.kill().await;
-    tools_from(&reply)
+    tools_from(&reply??)
+}
+
+/// SIGKILL a process group (tokio has no group kill; `kill(1)` does).
+fn kill_group(pgid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", "--", &format!("-{pgid}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// The JSON-RPC response with `id`, skipping notifications and log lines.
@@ -225,5 +244,39 @@ done"#;
 
         let missing = McpServer { command: "/nonexistent/mcp".into(), ..server };
         assert!(list_tools(&missing).await.unwrap_err().contains("could not start"));
+    }
+
+    /// A server that starts its real worker as a child and then answers:
+    /// the worker must not outlive the Test.
+    #[tokio::test]
+    async fn the_whole_process_tree_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("grandchild.pid");
+        let script = format!(
+            r#"sleep 300 & echo $! > {m}
+while IFS= read -r line; do
+  case "$line" in
+    *'"id":1'*) echo '{{"jsonrpc":"2.0","id":1,"result":{{}}}}' ;;
+    *'"id":2'*) echo '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[]}}}}' ;;
+  esac
+done"#,
+            m = marker.display()
+        );
+        let server = McpServer {
+            id: "t".into(),
+            name: "t".into(),
+            enabled: true,
+            transport: McpTransport::Stdio,
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), script],
+            env: Default::default(),
+            url: String::new(),
+            headers: Default::default(),
+            allowed_tools: vec![],
+        };
+        assert_eq!(list_tools(&server).await.unwrap(), vec![]);
+        let pid = std::fs::read_to_string(&marker).unwrap().trim().to_string();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists(), "grandchild {pid} survived the Test");
     }
 }

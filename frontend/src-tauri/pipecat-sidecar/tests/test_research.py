@@ -366,3 +366,122 @@ async def test_mcp_tools_over_stdio_honour_the_allowlist(tmp_path):
     bad = MCPTools([{"name": "Bad", "transport": "stdio", "command": "/nonexistent/x", "args": []}], errors.append)
     assert await bad.list() == []
     assert errors and "Bad" in errors[-1]
+
+
+# ---- review round 1 (WORK-581) ----------------------------------------------
+
+
+def test_tool_names_are_provider_valid_and_unique():
+    from meetily_sidecar.research import tool_name_for
+
+    taken: set[str] = set()
+    names = []
+    for tool, server in [("search", "A"), ("search", "Deep Hive"), ("search", "Deep Hive"), ("bad name!", "X"), ("x" * 80, "Y")]:
+        n = tool_name_for(tool, server, taken)
+        taken.add(n)
+        names.append(n)
+    assert names[:4] == ["search", "Deep_Hive__search", "Deep_Hive__search_2", "bad_name_"]
+    assert len(names[4]) == 64
+    assert len(set(names)) == len(names)
+    import re
+
+    assert all(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", n) for n in names)
+
+
+class SlowClient:
+    """Stands in for MCPClient: connecting takes a while, closing is counted."""
+
+    instances: list["SlowClient"] = []
+
+    def __init__(self, server_params=None, tools_filter=None):
+        self.closed = False
+        SlowClient.instances.append(self)
+
+    async def tools(self):
+        await asyncio.sleep(0.05)
+        from pipecat.adapters.llm.schemas.tools_schema import ToolsSchema
+
+        return ToolsSchema(standard_tools=[])
+
+    async def close(self):
+        self.closed = True
+
+
+async def test_a_tool_source_closed_while_connecting_closes_the_late_client(monkeypatch):
+    import pipecat.services.mcp_service as mcp_service
+
+    SlowClient.instances = []
+    monkeypatch.setattr(mcp_service, "MCPClient", SlowClient)
+    monkeypatch.setattr(MCPTools, "server_params", staticmethod(lambda cfg: None))
+    tools = MCPTools([{"name": "A", "transport": "stdio", "command": "x"}], lambda e: None)
+    listing = asyncio.create_task(tools.list())
+    await asyncio.sleep(0.01)
+    await tools.close()
+    assert await listing == []
+    assert [c.closed for c in SlowClient.instances] == [True], "the client that finished connecting after close is closed"
+
+
+async def test_a_client_whose_tool_list_fails_is_closed(monkeypatch):
+    import pipecat.services.mcp_service as mcp_service
+
+    class Failing(SlowClient):
+        async def tools(self):
+            raise RuntimeError("tools/list failed")
+
+    SlowClient.instances = []
+    monkeypatch.setattr(mcp_service, "MCPClient", Failing)
+    monkeypatch.setattr(MCPTools, "server_params", staticmethod(lambda cfg: None))
+    errors = []
+    tools = MCPTools([{"name": "A", "transport": "stdio", "command": "x"}], errors.append)
+    assert await tools.list() == []
+    assert SlowClient.instances[0].closed and "tools/list failed" in errors[0]
+
+
+async def test_on_then_off_leaves_research_off_and_closed():
+    from meetily_sidecar.server import handle_control
+
+    a = Assist(emit=lambda m: None)
+    opened: list[FakeTools] = []
+
+    import meetily_sidecar.research as research_mod
+
+    orig = research_mod.MCPTools
+
+    class Recording(FakeTools):
+        def __init__(self, servers, on_error):
+            super().__init__()
+            opened.append(self)
+
+    research_mod.MCPTools = Recording
+    try:
+        on = {
+            "type": "assist_config",
+            "enabled": True,
+            "system_prompt": "S",
+            "llm": {"provider": "claude", "model": "m", "api_key": "k"},
+            "research": {"enabled": True, "servers": [{"name": "A", "transport": "stdio", "command": "x"}]},
+        }
+        off = {**on, "research": {"enabled": False, "servers": []}}
+        handle_control(a, on)
+        handle_control(a, off)  # before the first config's task has run
+        await settle()
+        assert not a.research.enabled and not a.research.has_tools
+        assert opened and all(t.closed == 1 for t in opened)
+
+        # A config queued just before the session ends opens nothing.
+        handle_control(a, on)
+        await a.close()
+        await settle()
+        assert not a.research.has_tools
+        assert all(t.closed == 1 for t in opened)
+    finally:
+        research_mod.MCPTools = orig
+
+
+def test_mcp_tool_results_never_reach_the_log_even_at_debug():
+    from meetily_sidecar.__main__ import keep_record
+
+    level = lambda no: SimpleNamespace(no=no)
+    assert not keep_record({"name": "pipecat.services.mcp_service", "level": level(10)})
+    assert keep_record({"name": "pipecat.services.mcp_service", "level": level(20)}), "INFO lines stay"
+    assert keep_record({"name": "meetily_sidecar.research", "level": level(10)})

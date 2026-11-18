@@ -72,6 +72,9 @@ export function AIAssistSettings() {
   const [engine, setEngine] = useState<LiveEngine | null>(null);
   const [preview, setPreview] = useState<PromptPreview | null>(null);
   const [saving, setSaving] = useState(false);
+  // Bumped when the form is replaced wholesale (Discard), so editors that
+  // keep their own text (command line, env/header pairs) start over from it.
+  const [revision, setRevision] = useState(0);
 
   useEffect(() => {
     invoke<AssistSettings>('ai_assist_get_settings')
@@ -79,7 +82,11 @@ export function AIAssistSettings() {
         setSaved(s);
         setForm(s);
       })
-      .catch((e) => toast.error('Could not load the AI Assist settings', { description: String(e) }));
+      .catch((e) => {
+        toast.error('Could not load the AI Assist settings', { description: String(e) });
+        setSaved(DEFAULT_SETTINGS);
+        setForm(DEFAULT_SETTINGS);
+      });
     invoke<{ provider: string; model: string } | null>('api_get_model_config')
       .then((c) => setSummaryModel(c ? `${c.provider} / ${c.model}` : 'not set'))
       .catch(() => setSummaryModel('not set'));
@@ -215,12 +222,19 @@ export function AIAssistSettings() {
         </div>
       </div>
 
-      <ResearchSection form={form} update={update} engine={engine} />
+      <ResearchSection form={form} update={update} engine={engine} revision={revision} />
 
       <div className="fixed bottom-0 left-0 right-0 z-20 border-t border-gray-200 bg-white/95 backdrop-blur">
         <div className="max-w-6xl mx-auto px-8 py-3 flex items-center justify-end gap-3">
           {dirty && <span className="text-sm text-amber-700">Unsaved changes</span>}
-          <Button variant="outline" onClick={() => setForm(saved)} disabled={!dirty || saving}>
+          <Button
+            variant="outline"
+            onClick={() => {
+              setForm(saved);
+              setRevision((r) => r + 1);
+            }}
+            disabled={!dirty || saving}
+          >
             Discard
           </Button>
           <Button onClick={save} disabled={!dirty || saving}>
@@ -237,9 +251,11 @@ type SectionProps = { form: AssistSettings; update: (p: Partial<AssistSettings>)
 function ModelSection({ form, update, summaryModel }: SectionProps & { summaryModel: string }) {
   const [models, setModels] = useState<string[]>([]);
   const provider = form.model?.provider ?? 'claude';
+  const own = form.model !== null;
 
+  // Per provider, not per keystroke: the list command calls the provider's API.
   useEffect(() => {
-    if (!form.model) return;
+    if (!own) return;
     const command = MODEL_COMMANDS[provider];
     if (!command) {
       setModels([]);
@@ -256,7 +272,7 @@ function ModelSection({ form, update, summaryModel }: SectionProps & { summaryMo
     return () => {
       current = false;
     };
-  }, [form.model, provider]);
+  }, [own, provider]);
 
   return (
     <div className={section}>
@@ -435,7 +451,12 @@ function KnowledgeSection({ form, update, chars }: SectionProps & { chars: numbe
   );
 }
 
-function ResearchSection({ form, update, engine }: SectionProps & { engine: LiveEngine | null }) {
+function ResearchSection({
+  form,
+  update,
+  engine,
+  revision,
+}: SectionProps & { engine: LiveEngine | null; revision: number }) {
   const servers = form.research.servers;
   const setServers = (next: McpServer[]) => update({ research: { ...form.research, servers: next } });
   const setServer = (i: number, patch: Partial<McpServer>) =>
@@ -461,6 +482,11 @@ function ResearchSection({ form, update, engine }: SectionProps & { engine: Live
             servers&apos; tools and adds a follow-up card a few seconds later. The fast cards never wait for it. Pipecat
             live engine only (Settings › Transcription).
           </p>
+          {form.research.enabled && !form.cardKinds.answer && !form.cardKinds.fact && (
+            <p className="text-xs text-amber-700 mb-3">
+              Lookups answer as Answer or Fact cards, so research stays off while both are turned off.
+            </p>
+          )}
           {engine === 'direct' && (
             <p className="text-xs text-amber-700 mb-3">
               The live engine is Direct, so research does not run until it is switched to Pipecat.
@@ -477,7 +503,7 @@ function ResearchSection({ form, update, engine }: SectionProps & { engine: Live
       <ul className="space-y-3">
         {servers.map((s, i) => (
           <McpServerEditor
-            key={s.id}
+            key={`${s.id}-${revision}`}
             server={s}
             onChange={(patch) => setServer(i, patch)}
             onRemove={() => setServers(servers.filter((_, j) => j !== i))}
@@ -552,10 +578,13 @@ function McpServerEditor({
     }
   };
 
+  // An empty allowlist means every tool the server lists, so unchecking
+  // the last allowed tool must not empty it: that would grant everything.
+  // The last box stays checked; "Allow all tools" is the explicit way to [].
   const toggleTool = (name: string, on: boolean) => {
     const current = new Set(server.allowedTools);
     if (on) current.add(name);
-    else current.delete(name);
+    else if (current.size > 1) current.delete(name);
     onChange({ allowedTools: [...current] });
   };
 
@@ -636,6 +665,11 @@ function McpServerEditor({
       <div className="text-xs text-gray-600">
         <span className="font-medium">Allowed tools:</span>{' '}
         {server.allowedTools.length ? server.allowedTools.join(', ') : 'all tools the server lists'}
+        {server.allowedTools.length > 0 && (
+          <button className="ml-2 text-blue-600 hover:underline" onClick={() => onChange({ allowedTools: [] })}>
+            Allow all tools
+          </button>
+        )}
         {tools && tools.length > 0 && (
           <div className="mt-2 grid grid-cols-2 gap-1">
             {tools.map((t) => (
@@ -643,6 +677,12 @@ function McpServerEditor({
                 <input
                   type="checkbox"
                   checked={server.allowedTools.includes(t.name)}
+                  disabled={server.allowedTools.length === 1 && server.allowedTools[0] === t.name}
+                  title={
+                    server.allowedTools.length === 1 && server.allowedTools[0] === t.name
+                      ? 'At least one tool stays allowed; turn the server off to use none'
+                      : undefined
+                  }
                   onChange={(e) => toggleTool(t.name, e.target.checked)}
                 />
                 <span className="font-mono">{t.name}</span>

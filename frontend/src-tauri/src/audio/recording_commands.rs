@@ -719,7 +719,7 @@ pub async fn stop_recording<R: Runtime>(
     // No live-assist calls once Stop is pressed: suggestions are for the
     // call, not for the transcript drain below. The session itself keeps
     // following retractions until the drain ends (stop_session below).
-    crate::live_assist::stop_calls();
+    crate::live_assist::stop_calls(&app);
 
     // Emit shutdown progress to frontend
     let _ = app.emit(

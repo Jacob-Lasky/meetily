@@ -67,12 +67,24 @@ async def _main(handshake_fd: int) -> int:
     return 0
 
 
+#: Loggers whose DEBUG lines carry MCP tool results (Pipecat's MCPClient logs
+#: each response chunk): a lookup's results are meeting-derived and private,
+#: and these lines land in Meetily's log, so they are dropped even when
+#: MEETILY_SIDECAR_LOG=DEBUG.
+PRIVATE_DEBUG_LOGGERS = ("pipecat.services.mcp_service",)
+
+
+def keep_record(record) -> bool:
+    name = record["name"] or ""
+    return not (record["level"].no < 20 and name.startswith(PRIVATE_DEBUG_LOGGERS))
+
+
 def main() -> int:
     handshake_fd = _take_stdout()
     from loguru import logger
 
     logger.remove()
-    logger.add(sys.stderr, level=os.environ.get("MEETILY_SIDECAR_LOG", "INFO"))
+    logger.add(sys.stderr, level=os.environ.get("MEETILY_SIDECAR_LOG", "INFO"), filter=keep_record)
     return asyncio.run(_main(handshake_fd))
 
 

@@ -89,6 +89,10 @@ struct Session {
     /// the one in flight is cancelled and its result dropped, while the
     /// session keeps following retractions through the transcript drain.
     calls_off: CancellationToken,
+    /// The brief as it was when Stop was pressed: the one this call ran
+    /// with. Teardown keeps that copy with the meeting, not whatever the box
+    /// holds by then (a brief typed for the next call during the drain).
+    brief_at_stop: std::sync::Arc<Mutex<Option<String>>>,
 }
 
 enum Msg {
@@ -215,16 +219,28 @@ pub fn start_session<R: Runtime>(app: &AppHandle<R>, meeting_folder: Option<Path
     if let Some((generation, _)) = SIDECAR.lock().unwrap().as_ref() {
         let _ = tx.send(Msg::SidecarAttached(*generation));
     }
-    tauri::async_runtime::spawn(run(app.clone(), rx, tx.clone(), meeting_folder, calls_off.clone()));
-    *SESSION.lock().unwrap() = Some(Session { tx, listeners: vec![update_id, retract_id], calls_off });
+    let brief_at_stop = std::sync::Arc::new(Mutex::new(None));
+    tauri::async_runtime::spawn(run(
+        app.clone(),
+        rx,
+        tx.clone(),
+        meeting_folder,
+        calls_off.clone(),
+        brief_at_stop.clone(),
+    ));
+    *SESSION.lock().unwrap() =
+        Some(Session { tx, listeners: vec![update_id, retract_id], calls_off, brief_at_stop });
     info!("live assist: session started (enabled={})", ENABLED.load(Ordering::SeqCst));
 }
 
 /// Stop making calls (Stop was pressed). Synchronous, so no call can start
-/// after it returns, even if the session task has not run yet.
-pub fn stop_calls() {
+/// after it returns, even if the session task has not run yet. Also notes
+/// the brief this call ran with (see `Session::brief_at_stop`).
+pub fn stop_calls<R: Runtime>(app: &AppHandle<R>) {
+    let brief = load_brief(app);
     if let Some(session) = SESSION.lock().unwrap().as_ref() {
         session.calls_off.cancel();
+        session.brief_at_stop.lock().unwrap().get_or_insert(brief);
     }
 }
 
@@ -443,6 +459,7 @@ async fn run<R: Runtime>(
     tx: mpsc::UnboundedSender<Msg>,
     folder: Option<PathBuf>,
     calls_off: CancellationToken,
+    brief_at_stop: std::sync::Arc<Mutex<Option<String>>>,
 ) {
     let mut engine = Engine::new(Config::default());
     let mut cancel: Option<CancellationToken> = None;
@@ -619,17 +636,25 @@ async fn run<R: Runtime>(
     }
     // The brief was for this call: kept with the meeting, then cleared so it
     // does not leak into the next one. Compare-and-clear: a brief typed for
-    // the next call while this session wound down is left alone.
-    let brief = load_brief(&app);
-    let kept_brief = (!brief.trim().is_empty() && folder.is_some()).then_some(brief.as_str());
-    if let Some(folder) = folder.as_deref() {
-        if let Err(e) = write_pins(folder, &engine.pinned(), kept_brief) {
-            error!("live assist: failed to save pinned cards in {}: {e}", folder.display());
+    // the next call while this session wound down is left alone. It is
+    // cleared only once it is safely with the meeting: with no folder, or a
+    // failed write, it stays in the box rather than being lost.
+    let brief = brief_at_stop.lock().unwrap().take().unwrap_or_else(|| load_brief(&app));
+    let has_brief = !brief.trim().is_empty();
+    let kept = match folder.as_deref() {
+        Some(folder) => match write_pins(folder, &engine.pinned(), has_brief.then_some(brief.as_str())) {
+            Ok(()) => true,
+            Err(e) => {
+                error!("live assist: failed to save pinned cards and the brief in {}: {e}", folder.display());
+                false
+            }
+        },
+        None => {
+            save_pins(None, &engine.pinned());
+            false
         }
-    } else {
-        save_pins(None, &engine.pinned());
-    }
-    if !brief.is_empty() {
+    };
+    if has_brief && kept {
         clear_brief_if(&app, &brief);
     }
     emit_status(&app, "stopped", None);
@@ -884,8 +909,13 @@ pub fn load_settings<R: Runtime>(app: &AppHandle<R>) -> AssistSettings {
 
 /// Validate and save Settings › AI Assist; a running call picks them up at
 /// once (the Direct engine reads them per call, the sidecar is re-sent its config).
-pub fn save_settings<R: Runtime>(app: &AppHandle<R>, settings: &AssistSettings) -> Result<(), String> {
-    settings.validate()?;
+pub async fn save_settings<R: Runtime>(app: &AppHandle<R>, settings: &AssistSettings) -> Result<(), String> {
+    settings.validate(load_brief(app).chars().count())?;
+    if settings.model.is_some() {
+        // A model of its own must be callable: same key and endpoint rules
+        // as the calls themselves, checked now instead of on every turn.
+        assist_target(app, settings).await.map_err(|e| format!("the AI Assist model cannot be used: {e}"))?;
+    }
     let store = app.store(SETTINGS_STORE).map_err(|e| format!("settings store unavailable: {e}"))?;
     store.set(SETTINGS_KEY, serde_json::to_value(settings).map_err(|e| e.to_string())?);
     store.save().map_err(|e| format!("could not save the AI Assist settings: {e}"))?;
@@ -903,9 +933,12 @@ pub fn load_brief<R: Runtime>(app: &AppHandle<R>) -> String {
 }
 
 pub fn set_brief<R: Runtime>(app: &AppHandle<R>, brief: &str) -> Result<(), String> {
-    let total = brief.chars().count();
+    let total = brief.chars().count() + load_settings(app).context_chars();
     if total > settings::MAX_CONTEXT_CHARS {
-        return Err(format!("the meeting brief is {total} characters; the limit is {}", settings::MAX_CONTEXT_CHARS));
+        return Err(format!(
+            "about me, the enabled knowledge and the meeting brief come to {total} characters; the limit is {}",
+            settings::MAX_CONTEXT_CHARS
+        ));
     }
     let store = app.store(SETTINGS_STORE).map_err(|e| format!("settings store unavailable: {e}"))?;
     store.set(BRIEF_KEY, serde_json::Value::String(brief.to_string()));
@@ -1067,7 +1100,7 @@ pub async fn ai_assist_get_settings<R: Runtime>(app: AppHandle<R>) -> AssistSett
 
 #[tauri::command]
 pub async fn ai_assist_save_settings<R: Runtime>(app: AppHandle<R>, settings: AssistSettings) -> Result<(), String> {
-    save_settings(&app, &settings)
+    save_settings(&app, &settings).await
 }
 
 #[tauri::command]

@@ -275,17 +275,24 @@ def _configure_research(assist: Assist, raw: Any, llm: dict | None):
 
             tools = MCPTools(servers, on_error)
     research = assist.research
-    if tools is None and not research.has_tools:
-        # Off, and nothing to tear down.
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if running is None:
+        # Only a direct call outside the server (tests): nothing to connect.
         research.set_prompt(str(raw.get("system_prompt") or ""), limits)
         return
-    task = asyncio.get_running_loop().create_task(
+    # Always queued, never short-cut: configs apply in arrival order, so an
+    # "off" right after an "on" still tears down what the "on" opens.
+    task = running.create_task(
         research.configure(
             tools=tools,
             loop=loop,
             system_prompt=str(raw.get("system_prompt") or ""),
             limits=limits,
             config_key=key,
+            epoch=research.epoch,
         )
     )
     _BACKGROUND.add(task)

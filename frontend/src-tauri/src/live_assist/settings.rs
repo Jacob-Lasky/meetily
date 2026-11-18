@@ -160,8 +160,16 @@ fn yes() -> bool {
 }
 
 impl AssistSettings {
-    /// Check a settings object before it is saved. Errors are shown as-is.
-    pub fn validate(&self) -> Result<(), String> {
+    /// About me + enabled knowledge, in characters.
+    pub fn context_chars(&self) -> usize {
+        self.about_me.chars().count()
+            + self.knowledge.iter().filter(|k| k.enabled).map(|k| k.text.chars().count()).sum::<usize>()
+    }
+
+    /// Check a settings object before it is saved. `brief_chars` is the
+    /// meeting brief's length, which shares the context limit. Errors are
+    /// shown as-is.
+    pub fn validate(&self, brief_chars: usize) -> Result<(), String> {
         if self.card_kinds.enabled().is_empty() {
             return Err("turn on at least one card kind".into());
         }
@@ -177,11 +185,10 @@ impl AssistSettings {
         if self.instructions.chars().count() > MAX_INSTRUCTIONS_CHARS {
             return Err(format!("instructions are limited to {MAX_INSTRUCTIONS_CHARS} characters"));
         }
-        let context = self.about_me.chars().count()
-            + self.knowledge.iter().filter(|k| k.enabled).map(|k| k.text.chars().count()).sum::<usize>();
+        let context = self.context_chars() + brief_chars;
         if context > MAX_CONTEXT_CHARS {
             return Err(format!(
-                "about me and the enabled knowledge come to {context} characters; the limit is {MAX_CONTEXT_CHARS}"
+                "about me, the enabled knowledge and the meeting brief come to {context} characters; the limit is {MAX_CONTEXT_CHARS}"
             ));
         }
         if self.research.servers.len() > MAX_MCP_SERVERS {
@@ -222,7 +229,7 @@ mod tests {
         assert_eq!(s, AssistSettings::default());
         assert!(s.card_kinds.answer && s.card_kinds.todo);
         assert!(s.model.is_none());
-        assert!(s.validate().is_ok());
+        assert!(s.validate(0).is_ok());
     }
 
     #[test]
@@ -241,21 +248,25 @@ mod tests {
     fn validation_catches_what_the_ui_should_not_save() {
         let mut s = AssistSettings::default();
         s.card_kinds = CardKinds { answer: false, ask: false, fact: false, todo: false };
-        assert!(s.validate().is_err());
+        assert!(s.validate(0).is_err());
 
         let mut s = AssistSettings::default();
         s.model = Some(ModelOverride { provider: "claude".into(), model: "".into() });
-        assert!(s.validate().is_err());
+        assert!(s.validate(0).is_err());
         s.model = Some(ModelOverride { provider: "nope".into(), model: "m".into() });
-        assert!(s.validate().is_err());
+        assert!(s.validate(0).is_err());
         s.model = Some(ModelOverride { provider: "claude".into(), model: "claude-haiku-5-5".into() });
-        assert!(s.validate().is_ok());
+        assert!(s.validate(0).is_ok());
 
         let mut s = AssistSettings::default();
         s.knowledge.push(KnowledgeItem { id: "a".into(), name: "big".into(), text: "x".repeat(MAX_CONTEXT_CHARS + 1), enabled: true });
-        assert!(s.validate().is_err());
+        assert!(s.validate(0).is_err());
         s.knowledge[0].enabled = false;
-        assert!(s.validate().is_ok(), "disabled knowledge does not count");
+        assert!(s.validate(0).is_ok(), "disabled knowledge does not count");
+        s.knowledge[0].enabled = true;
+        s.knowledge[0].text = "x".repeat(MAX_CONTEXT_CHARS - 10);
+        assert!(s.validate(10).is_ok());
+        assert!(s.validate(11).is_err(), "the brief shares the limit");
 
         let server = |name: &str, transport, command: &str, url: &str| McpServer {
             id: name.into(),
@@ -271,14 +282,14 @@ mod tests {
         };
         let mut s = AssistSettings::default();
         s.research.servers.push(server("a", McpTransport::Stdio, "", ""));
-        assert!(s.validate().is_err(), "stdio without a command");
+        assert!(s.validate(0).is_err(), "stdio without a command");
         s.research.servers[0].command = "/bin/true".into();
-        assert!(s.validate().is_ok());
+        assert!(s.validate(0).is_ok());
         s.research.servers.push(server("A", McpTransport::Http, "", "https://x"));
-        assert!(s.validate().is_err(), "duplicate name");
+        assert!(s.validate(0).is_err(), "duplicate name");
         s.research.servers[1].name = "b".into();
         s.research.servers[1].url = "ftp://x".into();
-        assert!(s.validate().is_err(), "bad URL");
+        assert!(s.validate(0).is_err(), "bad URL");
     }
 
     #[test]

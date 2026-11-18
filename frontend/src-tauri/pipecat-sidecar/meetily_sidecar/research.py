@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Protocol
@@ -103,6 +104,7 @@ class MCPTools:
         self._route: dict[str, tuple[str, str]] = {}  # model name -> (server, tool)
         self._specs: list[ToolSpec] | None = None
         self._lock = asyncio.Lock()
+        self._closed = False
 
     @staticmethod
     def server_params(cfg: dict):
@@ -139,15 +141,22 @@ class MCPTools:
             for cfg in self._servers:
                 name = str(cfg.get("name") or "MCP")
                 allowed = [t for t in (cfg.get("allowed_tools") or []) if isinstance(t, str)] or None
+                client = None
                 try:
                     client = MCPClient(server_params=self.server_params(cfg), tools_filter=allowed)
                     schema = await client.tools()
                 except Exception as e:  # noqa: BLE001 - one bad server must not stop the others
                     self._on_error(f"could not connect to MCP server {name}: {e}")
+                    if client is not None:
+                        await _close_quietly(client)
                     continue
+                if self._closed:
+                    # Closed while this server was connecting: nobody owns it.
+                    await _close_quietly(client)
+                    return []
                 self._clients[name] = client
                 for fn in schema.standard_tools:
-                    model_name = fn.name if fn.name not in seen else f"{name}__{fn.name}"[:64]
+                    model_name = tool_name_for(fn.name, name, seen)
                     seen.add(model_name)
                     self._route[model_name] = (name, fn.name)
                     specs.append(
@@ -178,12 +187,40 @@ class MCPTools:
         return await client._call_tool_text(tool, arguments or {})
 
     async def close(self) -> None:
-        for client in self._clients.values():
-            try:
-                await client.close()
-            except Exception as e:  # noqa: BLE001
-                logger.warning(f"research: closing an MCP client failed: {e}")
+        # Set first: a connect still in progress closes its own client.
+        self._closed = True
+        clients = list(self._clients.values())
         self._clients.clear()
+        for client in clients:
+            await _close_quietly(client)
+
+
+async def _close_quietly(client) -> None:
+    try:
+        await client.close()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"research: closing an MCP client failed: {e}")
+
+
+#: What provider tool APIs accept as a function name.
+_TOOL_NAME_BAD = re.compile(r"[^A-Za-z0-9_-]")
+_TOOL_NAME_MAX = 64
+
+
+def tool_name_for(tool: str, server: str, taken: set[str]) -> str:
+    """A provider-valid, unique function name for `tool` of `server`:
+    [A-Za-z0-9_-], at most 64 characters; a name already taken (two servers
+    with a `search`) gets the server's name in front, then a number."""
+    base = _TOOL_NAME_BAD.sub("_", tool)[:_TOOL_NAME_MAX] or "tool"
+    if base not in taken:
+        return base
+    prefixed = f"{_TOOL_NAME_BAD.sub('_', server)}__{base}"[:_TOOL_NAME_MAX]
+    candidate, n = prefixed, 2
+    while candidate in taken:
+        suffix = f"_{n}"
+        candidate = prefixed[: _TOOL_NAME_MAX - len(suffix)] + suffix
+        n += 1
+    return candidate
 
 
 @dataclass
@@ -210,6 +247,8 @@ class Research:
         self._warm: asyncio.Task | None = None
         self._config_key: Any = None
         self._configure_lock = asyncio.Lock()
+        #: Bumped by close(): a config queued before it is stale and opens nothing.
+        self.epoch = 0
         self.lookups_started = 0
 
     @property
@@ -232,12 +271,18 @@ class Research:
         system_prompt: str,
         limits: ResearchLimits,
         config_key: Any = None,
+        epoch: int | None = None,
     ):
         """Swap in a new tool source and loop. The same `config_key` as last
         time keeps the open MCP connections (a re-sent config after a brief
         edit must not restart a stdio server). Serialized: configs apply in
         the order they arrived."""
         async with self._configure_lock:
+            if epoch is not None and epoch != self.epoch:
+                # Queued before the session ended (control disconnected).
+                if tools is not None:
+                    await tools.close()
+                return
             await self._configure(tools, loop, system_prompt, limits, config_key)
 
     async def _configure(self, tools, loop, system_prompt, limits, config_key):
@@ -363,6 +408,7 @@ class Research:
         logger.info(f"research: lookup {lookup.research_id} cancelled ({reason})")
 
     async def close(self):
+        self.epoch += 1
         self._waiting = None
         lookup = self._current
         self._cancel_current("session ended")
@@ -371,8 +417,9 @@ class Research:
                 await lookup.task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
-        if self._warm is not None and not self._warm.done():
-            self._warm.cancel()
+        # A warm-up still connecting is left to finish: it sees the tool
+        # source closed and closes its own client. Cancelling it mid-connect
+        # could strand the MCP server process it started.
         if self._tools is not None:
             await self._tools.close()
             self._tools = None

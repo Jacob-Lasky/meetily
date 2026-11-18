@@ -2,6 +2,8 @@
 mod ffmpeg;
 #[path = "build/onnxruntime.rs"]
 mod onnxruntime;
+#[path = "build/uv.rs"]
+mod uv;
 
 fn main() {
     // GPU Acceleration Detection and Build Guidance
@@ -20,6 +22,8 @@ fn main() {
     // Download and bundle FFmpeg binary at build-time to eliminate runtime download delays
     ffmpeg::ensure_ffmpeg_binary();
     onnxruntime::ensure_onnxruntime_runtime();
+    // uv for the Pipecat sidecar's environment (see build/uv.rs).
+    uv::ensure_uv_binary();
 
     tauri_build::build()
 }

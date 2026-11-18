@@ -287,7 +287,7 @@ impl SidecarCommand {
             .join(".venv");
         if sync {
             let uv = find_uv()
-                .ok_or("uv is not installed (https://docs.astral.sh/uv/), so the Pipecat engine cannot be set up")?;
+                .ok_or("uv was not found (it ships with Meetily; this build lacks it), so the Pipecat engine cannot be set up")?;
             Ok(Self::sync(uv, dir, venv))
         } else {
             Self::run(dir, &venv)
@@ -378,9 +378,22 @@ fn project_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
         .ok_or_else(|| "the Pipecat sidecar is not bundled with this build".to_string())
 }
 
+/// uv for `uv sync`: `MEETILY_UV`, else the copy bundled next to Meetily's
+/// executable (Tauri `externalBin`, build/uv.rs; WORK-559: Meetily stays one
+/// app to launch, with no uv to install), else one on PATH or in the usual
+/// install folders (development builds).
 fn find_uv() -> Option<PathBuf> {
     if let Ok(uv) = std::env::var("MEETILY_UV") {
         return Some(PathBuf::from(uv)).filter(|p| p.is_file());
+    }
+    let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf));
+    find_uv_in(exe_dir.as_deref())
+}
+
+fn find_uv_in(exe_dir: Option<&Path>) -> Option<PathBuf> {
+    let name = if cfg!(windows) { "uv.exe" } else { "uv" };
+    if let Some(bundled) = exe_dir.map(|d| d.join(name)).filter(|p| p.is_file()) {
+        return Some(bundled);
     }
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
@@ -388,7 +401,7 @@ fn find_uv() -> Option<PathBuf> {
         dirs.push(home.join(".cargo/bin"));
     }
     dirs.extend(["/usr/local/bin", "/usr/bin"].map(PathBuf::from));
-    dirs.into_iter().map(|d| d.join("uv")).find(|p| p.is_file())
+    dirs.into_iter().map(|d| d.join(name)).find(|p| p.is_file())
 }
 
 /// A running sidecar. Dropping it kills the process (`kill_on_drop`);
@@ -612,6 +625,8 @@ pub async fn prepare<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let _ = app.emit(PREPARE_EVENT, PrepareStatus { state: "preparing", message: None });
     let result = async {
         let command = SidecarCommand::resolve(app, true)?;
+        // Which uv: the bundled one (next to the executable) or a fallback.
+        info!("Pipecat live engine: preparing the environment with {}", command.program.display());
         let started = std::time::Instant::now();
         let output = command
             .command()
@@ -685,6 +700,16 @@ pub async fn live_engine_prepare<R: Runtime>(app: AppHandle<R>) -> Result<(), St
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn bundled_uv_next_to_the_executable_wins() {
+        let dir = std::env::temp_dir().join(format!("meetily-uv-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = if cfg!(windows) { "uv.exe" } else { "uv" };
+        std::fs::write(dir.join(name), b"").unwrap();
+        assert_eq!(super::find_uv_in(Some(&dir)), Some(dir.join(name)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     use super::*;
 
     #[tokio::test]

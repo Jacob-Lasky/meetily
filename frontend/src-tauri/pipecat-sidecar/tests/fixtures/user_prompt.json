@@ -1,0 +1,20 @@
+{
+  "_comment": "Shared by tests/test_prompt.py and src/live_assist/cards.rs: both user-prompt builders must produce exactly `expected`.",
+  "cases": [
+    {
+      "lines": [["them", "What does  pricing\nlook like?"], ["me", "Good question."], ["unknown", "beep"]],
+      "shown": [],
+      "expected": "Transcript, oldest first:\nThem: What does pricing look like?\nMe: Good question.\nSpeaker: beep\n"
+    },
+    {
+      "lines": [["them", "Can you send the deck?"]],
+      "shown": ["Send the deck today", "Ask about  timeline"],
+      "expected": "Transcript, oldest first:\nThem: Can you send the deck?\n\nCards Me already has or dismissed (do not repeat or rephrase these):\n- Send the deck today\n- Ask about timeline\n"
+    },
+    {
+      "lines": [],
+      "shown": [],
+      "expected": "Transcript, oldest first:\n"
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+[project]
+name = "meetily-pipecat-sidecar"
+version = "0.1.0"
+description = "Meetily live engine: Deepgram Flux STT per channel and turn-triggered live assist on Pipecat"
+requires-python = ">=3.12"
+dependencies = [
+    # 1.16.0 is the newest pipecat-ai on PyPI as of 2026-11-18 (WORK-559).
+    "pipecat-ai[deepgram,anthropic,openai,groq]==1.16.0",
+    # Imported directly by server.py (also a pipecat-ai dependency).
+    "websockets>=17.4",
+]
+
+[dependency-groups]
+dev = ["pytest>=9", "pytest-asyncio>=1"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["."]

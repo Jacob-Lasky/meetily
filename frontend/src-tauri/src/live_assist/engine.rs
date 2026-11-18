@@ -243,14 +243,7 @@ impl Engine {
     /// came from a brief that has since changed. Those ids are returned with
     /// the evicted ones. Dismissed texts stay suppressed, as for any card.
     pub fn on_brief_cards(&mut self, raw: Vec<RawCard>, created_at_ms: i64) -> Applied {
-        let mut replaced = Vec::new();
-        self.cards.retain(|c| {
-            let old = !c.pinned && c.origin.as_deref() == Some(BRIEF_ORIGIN);
-            if old {
-                replaced.push(c.id.clone());
-            }
-            !old
-        });
+        let mut replaced = self.withdraw_brief_cards();
         let mut applied = self.add_cards_with("assist-brief", |_| Some(BRIEF_SOURCE_SEQ), &[], raw, created_at_ms);
         let ids: Vec<String> = applied.added.iter().map(|c| c.id.clone()).collect();
         for card in self.cards.iter_mut().filter(|c| ids.contains(&c.id)) {
@@ -262,6 +255,20 @@ impl Engine {
         replaced.extend(applied.evicted);
         applied.evicted = replaced;
         applied
+    }
+
+    /// Remove the brief cards Me did not pin (the brief they came from was
+    /// replaced or cleared); returns their ids.
+    pub fn withdraw_brief_cards(&mut self) -> Vec<String> {
+        let mut removed = Vec::new();
+        self.cards.retain(|c| {
+            let old = !c.pinned && c.origin.as_deref() == Some(BRIEF_ORIGIN);
+            if old {
+                removed.push(c.id.clone());
+            }
+            !old
+        });
+        removed
     }
 
     /// Texts sent with a call so the model does not repeat itself: the cards
@@ -471,6 +478,18 @@ mod brief_card_tests {
         assert_eq!(second.evicted, vec![first.added[0].id.clone()], "the unpinned old card is replaced");
         let texts: Vec<&str> = e.cards().iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts, vec!["old fact", "new todo"], "pin stays on top, new card under it");
+    }
+
+    #[test]
+    fn withdrawing_brief_cards_keeps_pins_and_other_cards() {
+        let mut e = Engine::new(Config::default());
+        let first = e.on_brief_cards(vec![raw(CardKind::Ask, "a", ""), raw(CardKind::Fact, "b", "")], 1);
+        e.set_pinned(&first.added[1].id, true).unwrap();
+        e.on_line(3, Side::Them, "pricing for forty thousand calls", Instant::now());
+        e.on_external_cards(1, vec![raw(CardKind::Todo, "send pricing", "pricing")], None, 2);
+        assert_eq!(e.withdraw_brief_cards(), vec![first.added[0].id.clone()]);
+        let texts: Vec<&str> = e.cards().iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["b", "send pricing"]);
     }
 
     #[test]

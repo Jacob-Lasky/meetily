@@ -666,6 +666,24 @@ async fn run<R: Runtime>(
                     }
                     Msg::Reconfigure => {
                         let brief = load_brief(&app);
+                        if brief_read.is_some() && brief_read.as_deref() != Some(brief.as_str()) {
+                            // The brief changed after a read started: that read's
+                            // result is about the old text, so drop it (a newer
+                            // read number), and a cleared brief takes its cards
+                            // with it.
+                            if let Some(token) = brief_cancel.take() {
+                                token.cancel();
+                            }
+                            brief_reads += 1;
+                            brief_read = None;
+                            if brief.trim().is_empty() {
+                                brief_due = None;
+                                emit_withdraw(&app, engine.withdraw_brief_cards(), "evicted");
+                                if attached.is_some() {
+                                    send_shown(&engine);
+                                }
+                            }
+                        }
                         if !brief.trim().is_empty() && brief_read.as_deref() != Some(brief.as_str()) {
                             brief_due = Some(Instant::now() + BRIEF_SETTLE);
                         }
@@ -755,7 +773,12 @@ async fn run<R: Runtime>(
         let allowed = calls_allowed(&calls_off);
         if !allowed {
             if let Some(token) = brief_cancel.take() {
+                // Read again when calls are allowed again (assist back on);
+                // after Stop they never are, so this does nothing then.
                 token.cancel();
+                brief_reads += 1;
+                brief_read = None;
+                brief_due = Some(Instant::now());
             }
             if let Some(token) = cancel.take() {
                 token.cancel();

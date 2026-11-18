@@ -313,7 +313,7 @@ impl SidecarCommand {
     /// The sidecar itself on `venv`'s python. Fails at once when the
     /// environment has not been built: a recording never waits on a download.
     pub(crate) fn run(dir: PathBuf, venv: &Path) -> Result<Self, String> {
-        let python = venv.join("bin").join("python");
+        let python = venv_python(venv);
         if !python.exists() {
             return Err("the Pipecat engine is still being set up (its Python environment is not built yet)".to_string());
         }
@@ -376,6 +376,16 @@ fn project_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
         .into_iter()
         .find(|d| d.join("pyproject.toml").is_file() && d.join("uv.lock").is_file())
         .ok_or_else(|| "the Pipecat sidecar is not bundled with this build".to_string())
+}
+
+/// The environment's interpreter: `bin/python` on Unix, `Scripts\python.exe`
+/// in a Windows venv (where the bundled uv also builds it).
+fn venv_python(venv: &Path) -> PathBuf {
+    if cfg!(windows) {
+        venv.join("Scripts").join("python.exe")
+    } else {
+        venv.join("bin").join("python")
+    }
 }
 
 /// uv for `uv sync`: `MEETILY_UV`, else the copy bundled next to Meetily's
@@ -700,6 +710,16 @@ pub async fn live_engine_prepare<R: Runtime>(app: AppHandle<R>) -> Result<(), St
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn venv_python_follows_the_platform_layout() {
+        let p = super::venv_python(std::path::Path::new("/v"));
+        if cfg!(windows) {
+            assert!(p.ends_with("Scripts/python.exe"));
+        } else {
+            assert_eq!(p, std::path::Path::new("/v/bin/python"));
+        }
+    }
+
     #[test]
     fn bundled_uv_next_to_the_executable_wins() {
         let dir = std::env::temp_dir().join(format!("meetily-uv-test-{}", std::process::id()));

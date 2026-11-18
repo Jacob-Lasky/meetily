@@ -100,10 +100,10 @@ async def test_fresh_cache_loads_without_network(tmp_path, monkeypatch):
 
 
 async def test_failed_refresh_keeps_the_stale_cache(tmp_path, monkeypatch):
-    async def offline(self, sources):
+    async def offline(self, http, source):
         raise OSError("offline")
 
-    monkeypatch.setattr(DocsKB, "_download", offline)
+    monkeypatch.setattr(DocsKB, "_download_one", offline)
     _cache(tmp_path, "pipecat", [{"url": "", "text": PIPECAT_DUMP}], age_secs=docs_kb.REFRESH_SECS + 60)
     kb = DocsKB(tmp_path, ["pipecat"])
     kb.ensure()
@@ -112,15 +112,50 @@ async def test_failed_refresh_keeps_the_stale_cache(tmp_path, monkeypatch):
 
 
 async def test_no_cache_and_offline_means_no_excerpts(tmp_path, monkeypatch):
-    async def offline(self, sources):
+    async def offline(self, http, source):
         raise OSError("offline")
 
-    monkeypatch.setattr(DocsKB, "_download", offline)
+    monkeypatch.setattr(DocsKB, "_download_one", offline)
     kb = DocsKB(tmp_path, ["daily"])
     kb.ensure()
     await kb._task
     assert kb.status == "unavailable"
     assert kb.search("anything at all here") == ([], 0.0)
+
+
+async def test_one_failing_source_does_not_block_the_others(tmp_path, monkeypatch):
+    async def one(self, http, source):
+        if source == "deepgram":
+            raise OSError("deepgram is down")
+        (tmp_path / f"{source}.json").write_text(json.dumps([{"url": "", "text": PIPECAT_DUMP + FILLER}]))
+
+    monkeypatch.setattr(DocsKB, "_download_one", one)
+    kb = DocsKB(tmp_path, ["deepgram", "pipecat", "daily"])
+    kb.ensure()
+    await kb._task
+    assert kb.status == "ready"
+    assert not (tmp_path / "deepgram.json").exists()
+    assert (tmp_path / "pipecat.json").exists() and (tmp_path / "daily.json").exists()
+
+
+async def test_a_partial_page_refresh_keeps_the_cached_copies(tmp_path, monkeypatch):
+    _cache(tmp_path, "deepgram", [
+        {"url": "https://developers.deepgram.com/a", "text": "old a"},
+        {"url": "https://developers.deepgram.com/b", "text": "old b"},
+    ])
+    index = "- [A](https://developers.deepgram.com/a.md)\n- [B](https://developers.deepgram.com/b.md)\n"
+
+    async def fake_get(http, url):
+        if url.endswith("llms.txt"):
+            return index
+        if url.endswith("/b.md"):
+            raise OSError("timeout")
+        return "new a"
+
+    monkeypatch.setattr(docs_kb, "_get", fake_get)
+    await DocsKB(tmp_path, ["deepgram"])._download_one(None, "deepgram")
+    docs = {d["url"]: d["text"] for d in json.loads((tmp_path / "deepgram.json").read_text())}
+    assert docs == {"https://developers.deepgram.com/a": "new a", "https://developers.deepgram.com/b": "old b"}
 
 
 class StubKB:

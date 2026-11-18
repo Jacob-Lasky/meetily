@@ -278,10 +278,7 @@ class DocsKB:
         if cached:
             await self._build(cached)
         if stale:
-            try:
-                await self._download(stale)
-            except Exception as e:  # noqa: BLE001 - offline: keep what is cached
-                logger.warning(f"docs kb: download failed ({e}); using the cached docs")
+            await self._download(stale)
             await self._build([s for s in self.sources if self._age(s) is not None])
         self.status = "ready" if self.index is not None else "unavailable"
 
@@ -319,20 +316,42 @@ class DocsKB:
         timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT_SECS)
         headers = {"User-Agent": "Meetily live assist (docs index)"}
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as http:
+            # One source failing (offline, a 5xx) leaves its cache as it was and
+            # does not stop the others.
             for s in sources:
-                started = time.perf_counter()
-                spec = SOURCES[s]
-                if "full" in spec:
-                    docs = [{"url": "", "text": await _get(http, spec["full"])}]
-                else:
-                    docs = await _pages(http, await _get(http, spec["index"]))
-                if not any(d["text"].strip() for d in docs):
-                    raise RuntimeError(f"{s}: nothing downloaded")
-                tmp = self._path(s).with_suffix(".tmp")
-                tmp.write_text(json.dumps(docs), encoding="utf-8")
-                tmp.replace(self._path(s))
-                size = sum(len(d["text"]) for d in docs)
-                logger.info(f"docs kb: downloaded {s} docs ({len(docs)} page(s), {size:,} chars) in {time.perf_counter() - started:.1f} s")
+                try:
+                    await self._download_one(http, s)
+                except Exception as e:  # noqa: BLE001 - keep what is cached for this source
+                    logger.warning(f"docs kb: {s} download failed ({type(e).__name__}); using its cached docs, if any")
+
+    async def _download_one(self, http, s: str) -> None:
+        started = time.perf_counter()
+        spec = SOURCES[s]
+        if "full" in spec:
+            docs = [{"url": "", "text": await _get(http, spec["full"])}]
+            failed: list[str] = []
+        else:
+            docs, failed = await _pages(http, await _get(http, spec["index"]))
+            if failed:
+                # A page that failed this time keeps its cached copy: a partial
+                # refresh must not drop pages for the next week.
+                docs += [d for d in self._cached(s) if d.get("url") in set(failed)]
+        if not any(d["text"].strip() for d in docs):
+            raise RuntimeError(f"{s}: nothing downloaded")
+        tmp = self._path(s).with_suffix(".tmp")
+        tmp.write_text(json.dumps(docs), encoding="utf-8")
+        tmp.replace(self._path(s))
+        size = sum(len(d["text"]) for d in docs)
+        logger.info(
+            f"docs kb: downloaded {s} docs ({len(docs)} page(s), {size:,} chars, {len(failed)} kept from the cache) "
+            f"in {time.perf_counter() - started:.1f} s"
+        )
+
+    def _cached(self, source: str) -> list[dict]:
+        try:
+            return json.loads(self._path(source).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
 
 
 async def _get(http, url: str) -> str:
@@ -344,11 +363,14 @@ async def _get(http, url: str) -> str:
 _LINK = re.compile(r"\]\((https://developers\.deepgram\.com/[^)\s]+\.md)\)")
 
 
-async def _pages(http, index_text: str) -> list[dict]:
+async def _pages(http, index_text: str) -> tuple[list[dict], list[str]]:
     """Every `.md` page an llms.txt index links to (section `/llms.txt` indexes
-    such as the changelog are left out: release notes date fast)."""
+    such as the changelog are left out: release notes date fast), and the page
+    URLs (without `.md`) that failed to download."""
     urls = list(dict.fromkeys(_LINK.findall(index_text)))
     sem = asyncio.Semaphore(FETCH_CONCURRENCY)
+
+    failed: list[str] = []
 
     async def one(url: str):
         async with sem:
@@ -356,7 +378,8 @@ async def _pages(http, index_text: str) -> list[dict]:
                 return {"url": url[: -len(".md")], "text": await _get(http, url)}
             except Exception as e:  # noqa: BLE001 - one missing page is not the whole source
                 logger.warning(f"docs kb: skipped a page ({type(e).__name__})")
+                failed.append(url[: -len(".md")])
                 return None
 
     pages = await asyncio.gather(*(one(u) for u in urls))
-    return [p for p in pages if p is not None]
+    return [p for p in pages if p is not None], failed

@@ -90,7 +90,7 @@ class Sidecar:
                     continue
                 try:
                     handle_control(self.assist, json.loads(raw))
-                except (ValueError, KeyError, TypeError) as e:
+                except Exception as e:  # noqa: BLE001 - the boundary: never let one message end the connection
                     # One bad message must not drop the connection (and with
                     # it every later card).
                     logger.warning(f"control: dropped an unusable message ({type(e).__name__})")
@@ -193,7 +193,10 @@ class Sidecar:
         while True:
             recv = asyncio.ensure_future(ws.recv())
             done, _ = await asyncio.wait({recv, run_task}, return_when=asyncio.FIRST_COMPLETED)
-            if recv not in done:
+            if run_task in done:
+                # The pipeline only ends by itself on a failure (it is ended
+                # on purpose only after CloseStream), so this wins even when a
+                # CloseStream arrived at the same moment.
                 recv.cancel()
                 return True
             try:

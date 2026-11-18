@@ -96,7 +96,9 @@ pub(crate) enum Outcome {
 
 /// Most recent audio kept for replay on a fallback. It covers an unfinished
 /// turn (Flux commits a turn only at its end, so a crash loses the turn in
-/// progress); a longer replay would also be sent to Deepgram in one burst.
+/// progress). Limit: a turn already longer than this when the sidecar dies
+/// loses its start. The cap bounds memory and the burst replayed to Deepgram
+/// (30 s was accepted live on 2026-11-18).
 const REPLAY_SECS: f64 = 30.0;
 
 pub(crate) async fn run<R: Runtime>(
@@ -128,6 +130,10 @@ pub(crate) async fn run<R: Runtime>(
         }
     };
     crate::live_assist::attach_sidecar(generation, control.tx.clone());
+    if control.ended.load(Ordering::SeqCst) {
+        // Closed before the attach: the reader's own detach found nothing.
+        crate::live_assist::detach_sidecar(generation);
+    }
 
     let mut flux_options = options.clone();
     if !flux_options.model.starts_with("flux") {
@@ -495,12 +501,15 @@ impl Sidecar {
             let _ = write.close().await;
         });
         let reader_closing = closing.clone();
+        let ended = Arc::new(AtomicBool::new(false));
+        let reader_ended = ended.clone();
         tokio::spawn(async move {
             while let Some(Ok(message)) = read.next().await {
                 if let Message::Text(text) = message {
                     crate::live_assist::on_sidecar_message(generation, &text);
                 }
             }
+            reader_ended.store(true, Ordering::SeqCst);
             if !reader_closing.load(Ordering::SeqCst) {
                 // The sidecar still transcribes, but nothing can reach assist
                 // any more (and it turns its own calls off): hand assist back
@@ -513,7 +522,7 @@ impl Sidecar {
                 );
             }
         });
-        Ok(Control { tx, closing })
+        Ok(Control { tx, closing, ended })
     }
 
     /// Close stdin (the sidecar exits on EOF), wait, kill if it lingers.
@@ -537,6 +546,8 @@ impl Sidecar {
 struct Control {
     tx: mpsc::UnboundedSender<String>,
     closing: Arc<AtomicBool>,
+    /// The reader saw the connection end.
+    ended: Arc<AtomicBool>,
 }
 
 impl Control {

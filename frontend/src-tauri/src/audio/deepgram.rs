@@ -1042,27 +1042,7 @@ fn trim_bleed(mic: &LabeledSegment, speakers: &[&LabeledSegment]) -> Option<Labe
     }
     let first_src = mic.words.first()?.src;
     let last_src = mic.words.last()?.src;
-    let part = |from: usize, to: usize| -> Option<LabeledSegment> {
-        let words: Vec<TimedWord> = mic.words.iter().filter(|w| w.src >= from && w.src <= to).cloned().collect();
-        let (first, last) = (words.first()?, words.last()?);
-        let mut text: Vec<&str> = Vec::new();
-        let mut prev = None;
-        for w in &words {
-            if prev != Some(w.src) {
-                text.push(&w.word);
-                prev = Some(w.src);
-            }
-        }
-        Some(LabeledSegment {
-            text: text.join(" "),
-            start_ms: first.start_ms,
-            end_ms: last.end_ms,
-            confidence: mic.confidence,
-            speaker: mic.speaker,
-            turns: Vec::new(),
-            words,
-        })
-    };
+    let part = |from: usize, to: usize| with_words(mic, |w| w.src >= from && w.src <= to);
     let is_trimmable_bleed = |seg: &LabeledSegment| seg.words.len() >= BLEED_TRIM_MIN_TOKENS && is_bleed_of(seg, speakers);
     // A source word the far side said at the same moment. The run test above
     // tolerates 20% misses, so without this edge check the cut would swallow
@@ -1098,6 +1078,31 @@ fn trim_bleed(mic: &LabeledSegment, speakers: &[&LabeledSegment]) -> Option<Labe
     None
 }
 
+/// `seg` cut down to the words `keep` selects, its text rebuilt from those
+/// words as displayed and its time from their span. None when no word is
+/// kept. Diarized runs are dropped (callers only cut undiarized lines).
+fn with_words(seg: &LabeledSegment, keep: impl Fn(&TimedWord) -> bool) -> Option<LabeledSegment> {
+    let words: Vec<TimedWord> = seg.words.iter().filter(|w| keep(w)).cloned().collect();
+    let (first, last) = (words.first()?, words.last()?);
+    let mut text: Vec<&str> = Vec::new();
+    let mut prev = None;
+    for w in &words {
+        if prev != Some(w.src) {
+            text.push(&w.word);
+            prev = Some(w.src);
+        }
+    }
+    Some(LabeledSegment {
+        text: text.join(" "),
+        start_ms: first.start_ms,
+        end_ms: last.end_ms,
+        confidence: seg.confidence,
+        speaker: seg.speaker,
+        turns: Vec::new(),
+        words,
+    })
+}
+
 /// A mic token the far side said around the same moment: same token, start
 /// within BLEED_WORD_WINDOW_MS (the window `is_bleed_of` matches in, so a cut
 /// is placed with the same timing tolerance the match was made with).
@@ -1120,15 +1125,18 @@ enum MicVerdict {
 /// the whole-line rule (80% of its words echoed) and still begin or end with
 /// the user's own words (two words of reply, then eight of bleed), so a trim
 /// is tried first. On a line that is bleed as a whole, the trim is accepted
-/// only if NONE of the kept words was said by the far side around then; that
-/// keeps a misheard echo ("40,000" for "forty thousand") from surviving as a
-/// fragment.
+/// only if at most half of the kept words were said by the far side around
+/// then: "yes absolutely" survives a nearby far-side "yes", while a misheard
+/// echo ("we handle about 40 000" for "...forty thousand") is mostly echoed
+/// words and is dropped with the rest.
 fn judge_mic(mic: &LabeledSegment, far: &[&LabeledSegment]) -> MicVerdict {
     let trimmed = trim_bleed(mic, far);
     if is_bleed_of(mic, far) {
         let far_words: Vec<&TimedWord> = far.iter().flat_map(|s| s.words.iter()).collect();
         return match trimmed {
-            Some(keep) if keep.words.iter().all(|w| !is_echoed(w, &far_words)) => MicVerdict::Trim(keep),
+            Some(keep) if keep.words.iter().filter(|w| is_echoed(w, &far_words)).count() * 2 <= keep.words.len() => {
+                MicVerdict::Trim(keep)
+            }
             _ => MicVerdict::Drop,
         };
     }
@@ -1333,12 +1341,29 @@ impl ShownUntil {
         }
     }
 
-    /// A line that ends no later than what this channel already showed.
-    fn covers(mut self, seg: &LabeledSegment) -> bool {
+    /// The part of a replayed line that was not shown yet: its words that
+    /// start after what this channel already showed (plus REPLAY_JITTER_MS,
+    /// since Direct's word timings run a little later than Flux's: measured
+    /// 2026-11-18, two replayed lines ended a few hundred ms past the cutoff
+    /// and showed twice when the whole line was compared). A line without
+    /// word timings is kept unless its midpoint was already covered.
+    fn unshown(mut self, seg: LabeledSegment) -> Option<LabeledSegment> {
         let until = *self.slot(seg.speaker);
-        until > 0.0 && seg.end_ms <= until
+        if until <= 0.0 {
+            return Some(seg);
+        }
+        if seg.words.is_empty() {
+            return ((seg.start_ms + seg.end_ms) / 2.0 > until).then_some(seg);
+        }
+        if seg.words.iter().all(|w| w.start_ms >= until + REPLAY_JITTER_MS) {
+            return Some(seg);
+        }
+        with_words(&seg, |w| w.start_ms >= until + REPLAY_JITTER_MS)
     }
 }
+
+/// See `ShownUntil::unshown`.
+const REPLAY_JITTER_MS: f64 = 150.0;
 
 /// Turns the core's output into transcript events: rows for shown lines,
 /// `transcript-retract` for Mic-In lines found to be bleed. Records in
@@ -1354,10 +1379,10 @@ pub(crate) fn realtime_emitter<R: Runtime>(
     let clock = std::time::Instant::now();
     move |out| match out {
         RealtimeOutput::Show { key, seg } => {
-            if skip.covers(&seg) {
+            let Some(seg) = skip.unshown(seg) else {
                 info!("Deepgram realtime: skipping a replayed line already shown before the fallback");
                 return;
-            }
+            };
             {
                 let mut shown = shown.lock().unwrap();
                 let slot = shown.slot(seg.speaker);
@@ -2545,12 +2570,25 @@ mod tests {
     }
 
     #[test]
-    fn a_replayed_line_is_skipped_only_up_to_what_its_channel_showed() {
+    fn a_replayed_line_keeps_only_what_its_channel_did_not_show() {
         let skip = ShownUntil { mic_in_ms: 10_000.0, speaker_out_ms: 4_000.0, unlabelled_ms: 0.0 };
-        assert!(skip.covers(&seg("old", 8_000.0, 9_500.0, Some(MIC_IN_LABEL))));
-        assert!(!skip.covers(&seg("unfinished far turn", 3_000.0, 9_000.0, Some(SPEAKER_OUT_LABEL))), "the far side's open turn is not lost");
-        assert!(!skip.covers(&seg("new", 9_800.0, 11_000.0, Some(MIC_IN_LABEL))));
-        assert!(!ShownUntil::default().covers(&seg("x", 0.0, 0.0, None)), "nothing shown: nothing skipped");
+        let text = |s: Option<LabeledSegment>| s.map(|s| s.text);
+        // Live case: the replayed line ends a little after the cutoff.
+        assert_eq!(text(skip.unshown(timed_seg("let me put together a quote", 7_000.0, 10_300.0, MIC_IN_LABEL))), None);
+        // A replayed line that runs on past the cutoff keeps its new words.
+        assert_eq!(
+            text(skip.unshown(timed_seg("we said this then something new", 8_000.0, 12_000.0, MIC_IN_LABEL))),
+            Some("something new".to_string())
+        );
+        // The far side's open turn (after its own cutoff) is kept whole.
+        assert_eq!(
+            text(skip.unshown(timed_seg("one more thing", 5_000.0, 6_000.0, SPEAKER_OUT_LABEL))),
+            Some("one more thing".to_string())
+        );
+        // Untimed lines: kept unless their midpoint was covered.
+        assert_eq!(text(skip.unshown(seg("old", 8_000.0, 9_500.0, Some(MIC_IN_LABEL)))), None);
+        assert!(skip.unshown(seg("new", 9_800.0, 11_000.0, Some(MIC_IN_LABEL))).is_some());
+        assert!(ShownUntil::default().unshown(seg("x", 0.0, 0.0, None)).is_some(), "nothing shown: nothing skipped");
     }
 
     #[test]
@@ -3301,6 +3339,21 @@ mod tests {
         seg.words.extend(bleed);
         seg.text = format!("let me check with the team first {far}");
         assert_eq!(texts(&s.push(seg, 8_500.0)), vec!["show Some(\"Mic-In\"): let me check with the team first"]);
+    }
+
+    /// Review round 2: a far-side "yes" near the user's "yes absolutely" must
+    /// not take the reply down with the echo that follows it.
+    #[test]
+    fn a_reply_sharing_one_word_with_the_far_side_survives() {
+        let mut s = BleedSuppressor::default();
+        let far = "yes and we also need batch for compliance review";
+        s.push(timed_seg(far, 1_000.0, 5_000.0, SPEAKER_OUT_LABEL), 5_000.0);
+        let mut seg = timed_seg("yes absolutely", 0.0, 900.0, MIC_IN_LABEL);
+        let mut bleed = timed("we also need batch for compliance review", 1_480.0, 5_080.0);
+        bleed.iter_mut().for_each(|w| w.src += 2);
+        seg.words.extend(bleed);
+        seg.text = "yes absolutely we also need batch for compliance review".into();
+        assert_eq!(texts(&s.push(seg, 5_500.0)), vec!["show Some(\"Mic-In\"): yes absolutely"]);
     }
 
     #[test]

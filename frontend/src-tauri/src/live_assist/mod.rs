@@ -90,9 +90,10 @@ enum Msg {
     Dismiss(String),
     Pin { id: String, pinned: bool, reply: oneshot::Sender<Result<Card, String>> },
     Cards(oneshot::Sender<Vec<Card>>),
-    SidecarAttached,
-    SidecarDetached,
-    Sidecar(SidecarEvent),
+    SidecarAttached(u64),
+    SidecarDetached(u64),
+    /// An event and the generation of the connection it came on.
+    Sidecar(u64, SidecarEvent),
     Stop,
 }
 
@@ -179,8 +180,8 @@ pub fn start_session<R: Runtime>(app: &AppHandle<R>, meeting_folder: Option<Path
     });
 
     let calls_off = CancellationToken::new();
-    if SIDECAR.lock().unwrap().is_some() {
-        let _ = tx.send(Msg::SidecarAttached);
+    if let Some((generation, _)) = SIDECAR.lock().unwrap().as_ref() {
+        let _ = tx.send(Msg::SidecarAttached(*generation));
     }
     tauri::async_runtime::spawn(run(app.clone(), rx, tx.clone(), meeting_folder, calls_off.clone()));
     *SESSION.lock().unwrap() = Some(Session { tx, listeners: vec![update_id, retract_id], calls_off });
@@ -227,7 +228,7 @@ pub fn next_sidecar_generation() -> u64 {
 pub fn attach_sidecar(generation: u64, control: mpsc::UnboundedSender<String>) {
     *SIDECAR.lock().unwrap() = Some((generation, control));
     if let Some(tx) = session_tx() {
-        let _ = tx.send(Msg::SidecarAttached);
+        let _ = tx.send(Msg::SidecarAttached(generation));
     }
 }
 
@@ -243,7 +244,7 @@ pub fn detach_sidecar(generation: u64) {
         sidecar.take();
     }
     if let Some(tx) = session_tx() {
-        let _ = tx.send(Msg::SidecarDetached);
+        let _ = tx.send(Msg::SidecarDetached(generation));
     }
 }
 
@@ -256,7 +257,7 @@ pub fn on_sidecar_message(generation: u64, text: &str) {
     match serde_json::from_str::<SidecarEvent>(text) {
         Ok(event) => {
             if let Some(tx) = session_tx() {
-                let _ = tx.send(Msg::Sidecar(event));
+                let _ = tx.send(Msg::Sidecar(generation, event));
             }
         }
         // DO NOT log the message: it can hold card text built from the meeting.
@@ -339,8 +340,9 @@ async fn run<R: Runtime>(
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut was_enabled = ENABLED.load(Ordering::SeqCst);
-    // Pipecat engine: the sidecar triggers the calls (see SIDECAR).
-    let mut sidecar_mode = false;
+    // Pipecat engine: the generation of the attached sidecar, which triggers
+    // the calls (see SIDECAR). None: the Rust timer triggers them.
+    let mut attached: Option<u64> = None;
     // What the sidecar was last told about calls being allowed.
     let mut sidecar_allowed: Option<bool> = None;
 
@@ -351,13 +353,13 @@ async fn run<R: Runtime>(
                 match msg {
                     Msg::Stop => break,
                     Msg::Line { seq, side, text } => {
-                        if sidecar_mode {
+                        if attached.is_some() {
                             to_sidecar(serde_json::json!({ "type": "line", "seq": seq, "side": side_name(side), "text": text }));
                         }
                         engine.on_line(seq, side, &text, Instant::now());
                     }
                     Msg::Retract(seq) => {
-                        if sidecar_mode {
+                        if attached.is_some() {
                             to_sidecar(serde_json::json!({ "type": "retract", "seq": seq }));
                         }
                         let had_pins = !engine.pinned().is_empty();
@@ -368,14 +370,14 @@ async fn run<R: Runtime>(
                             if had_pins {
                                 save_pins(folder.as_deref(), &engine.pinned());
                             }
-                            if sidecar_mode {
+                            if attached.is_some() {
                                 send_shown(&engine);
                             }
                         }
                     }
-                    Msg::SidecarAttached => {
+                    Msg::SidecarAttached(generation) => {
                         info!("live assist: Pipecat engine attached; Flux turn events trigger calls");
-                        sidecar_mode = true;
+                        attached = Some(generation);
                         // A Rust-timer call in flight is dropped: the sidecar owns calls now.
                         if let Some(token) = cancel.take() {
                             token.cancel();
@@ -392,16 +394,17 @@ async fn run<R: Runtime>(
                         }
                         send_shown(&engine);
                     }
-                    Msg::SidecarDetached => {
-                        if sidecar_mode {
+                    Msg::SidecarDetached(generation) => {
+                        if attached == Some(generation) {
                             info!("live assist: Pipecat engine detached; the Rust timer triggers calls");
+                            attached = None;
+                            sidecar_allowed = None;
                         }
-                        sidecar_mode = false;
-                        sidecar_allowed = None;
                     }
-                    Msg::Sidecar(event) => {
-                        // Queued before a detach: the timer owns calls now.
-                        if sidecar_mode {
+                    Msg::Sidecar(generation, event) => {
+                        // Only the attached connection's events: one queued
+                        // before a detach, or from an earlier sidecar, is dropped.
+                        if attached == Some(generation) {
                             apply_sidecar_event(&app, &mut engine, event, calls_allowed(&calls_off));
                         }
                     }
@@ -423,7 +426,7 @@ async fn run<R: Runtime>(
                             if was_pinned {
                                 save_pins(folder.as_deref(), &engine.pinned());
                             }
-                            if sidecar_mode {
+                            if attached.is_some() {
                                 send_shown(&engine);
                             }
                         }
@@ -455,12 +458,12 @@ async fn run<R: Runtime>(
             emit_status(&app, if enabled { "idle" } else { "off" }, None);
             was_enabled = enabled;
         }
-        if sidecar_mode && sidecar_allowed != Some(allowed) {
+        if attached.is_some() && sidecar_allowed != Some(allowed) {
             // Turning assist off, or Stop, cancels the sidecar's call in flight.
             to_sidecar(serde_json::json!({ "type": "assist_enabled", "enabled": allowed }));
             sidecar_allowed = Some(allowed);
         }
-        if let Some(request) = engine.poll(Instant::now(), allowed && !sidecar_mode) {
+        if let Some(request) = engine.poll(Instant::now(), allowed && attached.is_none()) {
             let token = calls_off.child_token();
             cancel = Some(token.clone());
             let prompt = cards::user_prompt(

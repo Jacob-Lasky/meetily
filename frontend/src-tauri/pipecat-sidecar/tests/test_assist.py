@@ -264,6 +264,8 @@ async def test_limits_come_from_rust():
     assert "line 1" not in llm.calls[0][1] and "line 3" in llm.calls[0][1]
     assert Limits.from_config({"max_lines": 5, "call_timeout_secs": 3}).max_lines == 5
     assert Limits.from_config(None) == Limits()
+    bad = {"max_lines": -1, "call_timeout_secs": float("inf"), "max_age_secs": "x", "max_tokens": True}
+    assert Limits.from_config(bad) == Limits(), "bad values keep the defaults"
 
 
 async def test_malformed_output_is_not_logged(caplog_loguru):

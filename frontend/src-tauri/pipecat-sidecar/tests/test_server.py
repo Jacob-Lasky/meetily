@@ -213,6 +213,9 @@ async def test_a_bad_control_message_does_not_drop_the_connection(sidecar):
     async with websockets.connect(f"{base}/control", additional_headers=auth()) as control:
         await control.send(json.dumps({"type": "line", "side": "me", "text": "no seq"}))
         await control.send("not json")
+        await control.send('{"type": "line", "seq": 1e309, "side": "me", "text": "overflow"}')
+        await control.send(json.dumps({"type": "assist_config", "enabled": True, "limits": {"max_lines": -1}, "llm": None}))
+        await control.send(json.dumps({"type": "line", "seq": 2, "side": "me", "text": "still fine"}))
         await control.send(json.dumps({"type": "assist_enabled", "enabled": True}))
         await asyncio.sleep(0.1)
         assert sc.assist.enabled, "later messages still apply"
@@ -228,3 +231,24 @@ def test_a_cut_short_turn_keeps_the_last_update_timing():
     assert bare["words"] == [] and bare["type"] == "TurnInfo"
     committed = {"type": "TurnInfo", "event": "EndOfTurn", "transcript": "x"}
     assert turn_info_for(TranscriptionFrame("x", "", "", result=committed), update) is committed
+
+
+async def test_a_failure_arriving_with_close_stream_is_still_reported(monkeypatch):
+    """Both the pipeline's end and CloseStream are ready at once: the failure wins."""
+    from meetily_sidecar.server import Sidecar as S
+
+    class FakeWS:
+        def recv(self):
+            # Already complete, like a CloseStream that landed in the same
+            # loop tick as the pipeline's end.
+            f = asyncio.get_running_loop().create_future()
+            f.set_result(json.dumps({"type": "CloseStream"}))
+            return f
+
+    async def failed():
+        return None
+
+    run_task = asyncio.ensure_future(failed())
+    await asyncio.sleep(0)
+    assert run_task.done()
+    assert await S._pump(FakeWS(), worker=None, run_task=run_task) is True

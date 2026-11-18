@@ -25,6 +25,7 @@ Pure asyncio: the LLM is an injected coroutine, so tests drive this with fakes.
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -51,14 +52,25 @@ class Limits:
 
     @classmethod
     def from_config(cls, raw) -> "Limits":
-        if not isinstance(raw, dict):
-            return cls()
+        """Limits from Rust's config; a missing, non-numeric, non-finite or
+        non-positive value keeps its default."""
         base = cls()
+        if not isinstance(raw, dict):
+            return base
+
+        def positive(name, cast):
+            value = raw.get(name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return getattr(base, name)
+            if not math.isfinite(value) or value <= 0:
+                return getattr(base, name)
+            return cast(value)
+
         return cls(
-            call_timeout_secs=float(raw.get("call_timeout_secs", base.call_timeout_secs)),
-            max_lines=int(raw.get("max_lines", base.max_lines)),
-            max_age_secs=float(raw.get("max_age_secs", base.max_age_secs)),
-            max_tokens=int(raw.get("max_tokens", base.max_tokens)),
+            call_timeout_secs=positive("call_timeout_secs", float),
+            max_lines=positive("max_lines", int),
+            max_age_secs=positive("max_age_secs", float),
+            max_tokens=positive("max_tokens", int),
         )
 
 
@@ -213,6 +225,9 @@ class Assist:
         # Append the triggering turn unless Rust's line for it is already the
         # newest line. Comparing with the newest "them" line instead would
         # take an earlier identical turn ("Yes.") for this one and leave it out.
+        # Limit: two identical far-side turns back to back, the second ending
+        # before Rust's line for it arrives, show as one "Them: Yes." line;
+        # the prompt then lacks only an adjacent repeat of the same words.
         if not lines or lines[-1][0] != "them" or normalize(lines[-1][1]) != normalize(turn_text):
             lines.append(("them", turn_text))
         return user_prompt(lines, self._shown)

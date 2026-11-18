@@ -734,7 +734,7 @@ function ModelCard({
                     e.stopPropagation();
                     onDelete();
                   }}
-                  className="bg-orange-600 text-white px-3 py-1.5 rounded-md text-sm font-medium hover:bg-orange-700 transition-colors"
+                  className="bg-orange-700 text-white px-3 py-1.5 rounded-md text-sm font-medium hover:bg-orange-800 transition-colors"
                 >
                   Delete
                 </button>

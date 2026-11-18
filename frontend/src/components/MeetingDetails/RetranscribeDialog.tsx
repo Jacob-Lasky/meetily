@@ -394,8 +394,8 @@ export function RetranscribeDialog({
                 Cancel
               </Button>
               <Button
+                variant="blue"
                 onClick={handleStartRetranscription}
-                className="bg-blue-600 hover:bg-blue-700"
                 disabled={!meetingFolderPath}
               >
                 <RefreshCw className="h-4 w-4 mr-2" />

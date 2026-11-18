@@ -1168,10 +1168,10 @@ export function ModelSettingsModal({
                       </AlertDescription>
                     </Alert>
                     <Button
-                      variant="default"
+                      variant="blue"
                       size="sm"
                       onClick={() => invoke('open_external_url', { url: 'https://ollama.com/download' })}
-                      className="w-full bg-blue-600 hover:bg-blue-700"
+                      className="w-full"
                     >
                       <ExternalLink className="mr-2 h-4 w-4" />
                       Download Ollama

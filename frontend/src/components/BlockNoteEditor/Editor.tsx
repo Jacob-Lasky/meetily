@@ -4,6 +4,7 @@ import { useEffect } from "react";
 import type { PartialBlock, Block } from "@blocknote/core";
 import { useCreateBlockNote } from "@blocknote/react";
 import { BlockNoteView } from "@blocknote/shadcn";
+import { useResolvedTheme } from '@/components/ThemeProvider';
 import "@blocknote/shadcn/style.css";
 import "@blocknote/core/fonts/inter.css";
 
@@ -20,6 +21,7 @@ export default function Editor({ initialContent, onChange, editable = true }: Ed
     editable
   });
 
+  const resolvedTheme = useResolvedTheme();
   const editor = useCreateBlockNote({
     initialContent: initialContent as PartialBlock[] | undefined,
   });
@@ -47,5 +49,5 @@ export default function Editor({ initialContent, onChange, editable = true }: Ed
     };
   }, [editor, onChange]);
 
-  return <BlockNoteView editor={editor} editable={editable} theme="light" />;
+  return <BlockNoteView editor={editor} editable={editable} theme={resolvedTheme} />;
 }

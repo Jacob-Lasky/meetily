@@ -68,20 +68,22 @@ def daily_guides(text: str) -> str:
     return "\n".join(keep)
 
 
-#: Size bounds per section (characters, after link stripping). A source whose
-#: format changed (headings, relative links) lands outside them and the refresh
-#: stops instead of shipping an empty or index-sized section.
+#: Size bounds per section (characters, as written: links stripped, blank
+#: runs collapsed, trimmed). A source whose format changed (headings,
+#: relative links) lands outside them and the refresh stops instead of
+#: shipping an empty or index-sized section.
 BOUNDS = {"Deepgram": (2_000, 20_000), "Pipecat": (500, 6_000), "Daily": (1_500, 12_000)}
 
 
 def main() -> None:
-    parts = [fetch(DEEPGRAM), pipecat_intro(fetch(PIPECAT)), daily_guides(fetch(DAILY))]
+    raw = [fetch(DEEPGRAM), pipecat_intro(fetch(PIPECAT)), daily_guides(fetch(DAILY))]
+    # Bounds are checked on each section exactly as it is written.
+    parts = [re.sub(r"\n{3,}", "\n\n", strip_links(p)).strip() for p in raw]
     for name, part in zip(BOUNDS, parts):
         low, high = BOUNDS[name]
-        size = len(strip_links(part))
-        if not low <= size <= high:
-            raise SystemExit(f"{name} section is {size} characters, outside {low}-{high}: its source format changed")
-    text = "\n\n".join(re.sub(r"\n{3,}", "\n\n", strip_links(p)).strip() for p in parts)
+        if not low <= len(part) <= high:
+            raise SystemExit(f"{name} section is {len(part)} characters, outside {low}-{high}: its source format changed")
+    text = "\n\n".join(parts)
     if "](" in text:
         raise SystemExit("a Markdown link survived; extend strip_links before shipping this text")
     today = datetime.date.today().isoformat()

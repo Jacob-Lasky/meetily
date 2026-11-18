@@ -234,18 +234,29 @@ MAX_TOOL_RESULT_CHARS = 8000
 _CUT_MARKER_ROOM = 40
 
 
-def _cut_strings(node: Any, cap: int) -> Any:
-    """`node` with every string longer than `cap` plus the marker room cut to
-    `cap` characters and marked. Strings no longer than that stay whole, so
-    the result never grows and its size only rises with `cap`."""
+def _cut_counted(s: str, cap: int) -> str:
+    """Cut to `cap` and say how much went; strings within the marker's room of
+    `cap` stay whole, since marking them would not shorten them."""
+    if len(s) <= cap + _CUT_MARKER_ROOM:
+        return s
+    return s[:cap] + f" [cut: {len(s) - cap} more characters]"
+
+
+def _cut_short(s: str, cap: int) -> str:
+    """Cut to `cap` with a one-character ellipsis: for results of many short
+    strings, where a counted marker would cost more than it saves."""
+    return s if len(s) <= cap + 1 else s[:cap] + "\u2026"
+
+
+def _cut_strings(node: Any, cap: int, cut: Callable[[str, int], str]) -> Any:
+    """`node` with every string passed through `cut`. Neither cut ever makes a
+    string longer, and the result's size only rises with `cap`."""
     if isinstance(node, str):
-        if len(node) <= cap + _CUT_MARKER_ROOM:
-            return node
-        return node[:cap] + f" [cut: {len(node) - cap} more characters]"
+        return cut(node, cap)
     if isinstance(node, dict):
-        return {k: _cut_strings(v, cap) for k, v in node.items()}
+        return {k: _cut_strings(v, cap, cut) for k, v in node.items()}
     if isinstance(node, list):
-        return [_cut_strings(v, cap) for v in node]
+        return [_cut_strings(v, cap, cut) for v in node]
     return node
 
 
@@ -253,28 +264,32 @@ def _clip_json(text: str) -> str | None:
     """A JSON result, shortened so it stays valid JSON and keeps every field
     (an answer after a long context field survives): every string longer than
     one shared cap is cut to it, the largest cap that fits found by bisection.
-    None when the text is not JSON, is nested too deep to walk, or does not
-    fit even with every string cut to nothing (then the plain cut applies)."""
+    Counted markers first; when even a zero cap does not fit that way, a bare
+    ellipsis. None when the text is not JSON, is nested too deep to walk, or
+    does not fit even with every string cut to nothing (then the plain cut
+    applies)."""
     if not text.lstrip().startswith(("{", "[", '"')):
         return None
     try:
         value = json.loads(text)
+        for cut in (_cut_counted, _cut_short):
 
-        def dumped(cap: int) -> str:
-            return json.dumps(_cut_strings(value, cap), ensure_ascii=False)
+            def dumped(cap: int) -> str:
+                return json.dumps(_cut_strings(value, cap, cut), ensure_ascii=False)
 
-        best = dumped(0)
-        if len(best) > MAX_TOOL_RESULT_CHARS:
-            return None
-        low, high = 0, MAX_TOOL_RESULT_CHARS
-        while low < high:
-            mid = (low + high + 1) // 2
-            out = dumped(mid)
-            if len(out) <= MAX_TOOL_RESULT_CHARS:
-                low, best = mid, out
-            else:
-                high = mid - 1
-        return best
+            best = dumped(0)
+            if len(best) > MAX_TOOL_RESULT_CHARS:
+                continue
+            low, high = 0, MAX_TOOL_RESULT_CHARS
+            while low < high:
+                mid = (low + high + 1) // 2
+                out = dumped(mid)
+                if len(out) <= MAX_TOOL_RESULT_CHARS:
+                    low, best = mid, out
+                else:
+                    high = mid - 1
+            return best
+        return None
     except (ValueError, RecursionError):
         return None
 

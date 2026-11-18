@@ -671,3 +671,17 @@ def test_results_that_cannot_keep_their_structure_get_the_plain_cut_within_the_l
     for text in (numbers, deep, "plain " * 2000):
         out = clip_tool_result(text)
         assert len(out) <= MAX_TOOL_RESULT_CHARS and out.endswith("more characters]")
+
+
+def test_many_short_strings_are_shortened_rather_than_losing_the_structure():
+    import json
+
+    from meetily_sidecar.research import MAX_TOOL_RESULT_CHARS, clip_tool_result
+
+    rows = {"results": [{"body": "b" * 30} for _ in range(300)], "answer": "Flux"}
+    text = json.dumps(rows)
+    assert len(text) > MAX_TOOL_RESULT_CHARS
+    out = clip_tool_result(text)
+    assert len(out) <= MAX_TOOL_RESULT_CHARS
+    parsed = json.loads(out)
+    assert len(parsed["results"]) == 300 and parsed["answer"].startswith("F")

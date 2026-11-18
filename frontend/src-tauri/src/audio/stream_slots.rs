@@ -75,6 +75,12 @@ impl<S: Supervised> StreamSlots<S> {
         self.slot(kind).stream.is_some()
     }
 
+    /// Borrow the stream in `kind`'s slot, read-only. Signalling a stream
+    /// (finish, stop request) is not a slot mutation and bumps no epoch.
+    pub fn get(&self, kind: DeviceType) -> Option<&S> {
+        self.slot(kind).stream.as_ref()
+    }
+
     pub fn count(&self) -> usize {
         usize::from(self.mic.stream.is_some()) + usize::from(self.system.stream.is_some())
     }

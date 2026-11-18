@@ -58,19 +58,28 @@ class Limits:
         if not isinstance(raw, dict):
             return base
 
-        def positive(name, cast):
+        def seconds(name):
             value = raw.get(name)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 return getattr(base, name)
-            if not math.isfinite(value) or value <= 0:
+            try:
+                ok = math.isfinite(value) and value > 0
+            except OverflowError:  # an int too big for a float
+                ok = False
+            return float(value) if ok else getattr(base, name)
+
+        def count(name):
+            # A whole number of at least 1: 0.5 must not become 0 lines.
+            value = raw.get(name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 return getattr(base, name)
-            return cast(value)
+            return value
 
         return cls(
-            call_timeout_secs=positive("call_timeout_secs", float),
-            max_lines=positive("max_lines", int),
-            max_age_secs=positive("max_age_secs", float),
-            max_tokens=positive("max_tokens", int),
+            call_timeout_secs=seconds("call_timeout_secs"),
+            max_lines=count("max_lines"),
+            max_age_secs=seconds("max_age_secs"),
+            max_tokens=count("max_tokens"),
         )
 
 

@@ -266,6 +266,13 @@ async def test_limits_come_from_rust():
     assert Limits.from_config(None) == Limits()
     bad = {"max_lines": -1, "call_timeout_secs": float("inf"), "max_age_secs": "x", "max_tokens": True}
     assert Limits.from_config(bad) == Limits(), "bad values keep the defaults"
+    # Cycle 2 finding 4: a fraction is not a line count, and a huge int must
+    # fall back per field rather than fail the whole config.
+    assert Limits.from_config({"max_lines": 0.5}).max_lines == Limits().max_lines
+    assert Limits.from_config({"max_tokens": 2.0}).max_tokens == Limits().max_tokens
+    huge = Limits.from_config({"call_timeout_secs": 10**400, "max_age_secs": 10**400, "max_lines": 7})
+    assert huge.call_timeout_secs == Limits().call_timeout_secs and huge.max_age_secs == Limits().max_age_secs
+    assert huge.max_lines == 7
 
 
 async def test_malformed_output_is_not_logged(caplog_loguru):

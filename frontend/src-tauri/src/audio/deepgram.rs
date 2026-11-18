@@ -1080,27 +1080,45 @@ fn trim_bleed(mic: &LabeledSegment, speakers: &[&LabeledSegment]) -> Option<Labe
 
 /// `seg` cut down to the words `keep` selects, its text rebuilt from those
 /// words as displayed and its time from their span. None when no word is
-/// kept. Diarized runs are dropped (callers only cut undiarized lines).
+/// kept. Diarized runs are clipped the same way: each keeps the kept words
+/// that start inside it (its text rebuilt from them, its start moved to the
+/// first), and a run left with none is dropped. `TimedWord` has no speaker,
+/// so the runs' own times are what assigns words to them.
 fn with_words(seg: &LabeledSegment, keep: impl Fn(&TimedWord) -> bool) -> Option<LabeledSegment> {
     let words: Vec<TimedWord> = seg.words.iter().filter(|w| keep(w)).cloned().collect();
     let (first, last) = (words.first()?, words.last()?);
+    let turns = seg
+        .turns
+        .iter()
+        .filter_map(|t| {
+            let inside: Vec<&TimedWord> =
+                words.iter().filter(|w| w.start_ms >= t.start_ms && w.start_ms <= t.end_ms).collect();
+            let first = inside.first()?;
+            Some(SpeakerTurn { text: words_text(inside.iter().copied()), start_ms: first.start_ms, ..t.clone() })
+        })
+        .collect();
+    Some(LabeledSegment {
+        text: words_text(words.iter()),
+        start_ms: first.start_ms,
+        end_ms: last.end_ms,
+        confidence: seg.confidence,
+        speaker: seg.speaker,
+        turns,
+        words,
+    })
+}
+
+/// The displayed words behind `words`, once per source word.
+fn words_text<'a>(words: impl Iterator<Item = &'a TimedWord>) -> String {
     let mut text: Vec<&str> = Vec::new();
     let mut prev = None;
-    for w in &words {
+    for w in words {
         if prev != Some(w.src) {
             text.push(&w.word);
             prev = Some(w.src);
         }
     }
-    Some(LabeledSegment {
-        text: text.join(" "),
-        start_ms: first.start_ms,
-        end_ms: last.end_ms,
-        confidence: seg.confidence,
-        speaker: seg.speaker,
-        turns: Vec::new(),
-        words,
-    })
+    text.join(" ")
 }
 
 /// A mic token the far side said around the same moment: same token, start
@@ -1108,6 +1126,21 @@ fn with_words(seg: &LabeledSegment, keep: impl Fn(&TimedWord) -> bool) -> Option
 /// is placed with the same timing tolerance the match was made with).
 fn is_echoed(m: &TimedWord, far: &[&TimedWord]) -> bool {
     far.iter().any(|f| f.token == m.token && (f.start_ms - m.start_ms).abs() <= BLEED_WORD_WINDOW_MS)
+}
+
+/// At most half of `seg`'s source words echoed. Counted in source words, not
+/// tokens ("SOC-2" is one word, two tokens), and a word is echoed when any of
+/// its tokens is, the same rule `trim_bleed` places its cut with.
+fn half_echoed_at_most(seg: &LabeledSegment, far_words: &[&TimedWord]) -> bool {
+    let mut all = std::collections::BTreeSet::new();
+    let mut echoed = std::collections::BTreeSet::new();
+    for w in &seg.words {
+        all.insert(w.src);
+        if is_echoed(w, far_words) {
+            echoed.insert(w.src);
+        }
+    }
+    echoed.len() * 2 <= all.len()
 }
 
 /// What bleed suppression does with one Mic-In line.
@@ -1134,9 +1167,7 @@ fn judge_mic(mic: &LabeledSegment, far: &[&LabeledSegment]) -> MicVerdict {
     if is_bleed_of(mic, far) {
         let far_words: Vec<&TimedWord> = far.iter().flat_map(|s| s.words.iter()).collect();
         return match trimmed {
-            Some(keep) if keep.words.iter().filter(|w| is_echoed(w, &far_words)).count() * 2 <= keep.words.len() => {
-                MicVerdict::Trim(keep)
-            }
+            Some(keep) if half_echoed_at_most(&keep, &far_words) => MicVerdict::Trim(keep),
             _ => MicVerdict::Drop,
         };
     }
@@ -1346,14 +1377,16 @@ impl ShownUntil {
     /// since Direct's word timings run a little later than Flux's: measured
     /// 2026-11-18, two replayed lines ended a few hundred ms past the cutoff
     /// and showed twice when the whole line was compared). A line without
-    /// word timings is kept unless its midpoint was already covered.
+    /// word timings is kept when its midpoint is at or after the cutoff.
+    /// Diarized runs are clipped with the words (`with_words`).
     fn unshown(mut self, seg: LabeledSegment) -> Option<LabeledSegment> {
         let until = *self.slot(seg.speaker);
         if until <= 0.0 {
             return Some(seg);
         }
         if seg.words.is_empty() {
-            return ((seg.start_ms + seg.end_ms) / 2.0 > until).then_some(seg);
+            // At or after the cutoff: new. Before it: shown up to its middle.
+            return ((seg.start_ms + seg.end_ms) / 2.0 >= until).then_some(seg);
         }
         if seg.words.iter().all(|w| w.start_ms >= until + REPLAY_JITTER_MS) {
             return Some(seg);
@@ -2585,10 +2618,37 @@ mod tests {
             text(skip.unshown(timed_seg("one more thing", 5_000.0, 6_000.0, SPEAKER_OUT_LABEL))),
             Some("one more thing".to_string())
         );
-        // Untimed lines: kept unless their midpoint was covered.
+        // Untimed lines: kept when their midpoint is at or after the cutoff.
         assert_eq!(text(skip.unshown(seg("old", 8_000.0, 9_500.0, Some(MIC_IN_LABEL)))), None);
         assert!(skip.unshown(seg("new", 9_800.0, 11_000.0, Some(MIC_IN_LABEL))).is_some());
+        assert!(
+            skip.unshown(seg("midpoint exactly at the cutoff", 9_900.0, 10_100.0, Some(MIC_IN_LABEL))).is_some(),
+            "cycle 2 finding 1: a midpoint at the cutoff is new speech"
+        );
         assert!(ShownUntil::default().unshown(seg("x", 0.0, 0.0, None)).is_some(), "nothing shown: nothing skipped");
+    }
+
+    /// Cycle 2 finding 2: a diarized replayed line cut at the cutoff keeps its
+    /// speaker numbering, clipped to the words it still shows.
+    #[test]
+    fn a_cut_replayed_line_keeps_its_diarized_runs() {
+        let skip = ShownUntil { speaker_out_ms: 10_000.0, ..ShownUntil::default() };
+        let mut line = timed_seg("we said this then you said that", 8_000.0, 15_000.0, SPEAKER_OUT_LABEL);
+        let turn = |text: &str, start_ms: f64, end_ms: f64, speaker: i64| SpeakerTurn {
+            text: text.into(),
+            start_ms,
+            end_ms,
+            confidence: 0.9,
+            speaker,
+        };
+        line.turns = vec![turn("we said this then", 8_000.0, 11_999.0, 0), turn("you said that", 12_000.0, 15_000.0, 1)];
+        let kept = skip.unshown(line).expect("new words remain");
+        assert_eq!(kept.text, "then you said that");
+        let runs: Vec<(String, i64)> = kept.turns.iter().map(|t| (t.text.clone(), t.speaker)).collect();
+        assert_eq!(runs, vec![("then".to_string(), 0), ("you said that".to_string(), 1)]);
+        assert_eq!(kept.turns[0].start_ms, kept.start_ms, "the first run starts at the first kept word");
+        let rows: Vec<Option<String>> = transcript_lines(kept).into_iter().map(|l| l.speaker).collect();
+        assert_eq!(rows, vec![Some("Speaker-Out 1".to_string()), Some("Speaker-Out 2".to_string())]);
     }
 
     #[test]
@@ -3354,6 +3414,32 @@ mod tests {
         seg.words.extend(bleed);
         seg.text = "yes absolutely we also need batch for compliance review".into();
         assert_eq!(texts(&s.push(seg, 5_500.0)), vec!["show Some(\"Mic-In\"): yes absolutely"]);
+    }
+
+    /// Cycle 2 finding 3: "SOC-2 absolutely" has one echoed word in two, even
+    /// though "SOC-2" is two tokens.
+    #[test]
+    fn a_multi_token_word_counts_once_in_the_half_echoed_check() {
+        let far = timed_seg("soc 2 we also need batch for compliance review today", 1_000.0, 6_000.0, SPEAKER_OUT_LABEL);
+        // The reply: "SOC-2" (source word 0, tokens soc + 2) then "absolutely".
+        let mk = |token: &str, src: usize, start_ms: f64, word: &str| TimedWord {
+            token: token.into(),
+            start_ms,
+            end_ms: start_ms + 200.0,
+            src,
+            word: word.into(),
+        };
+        let keep = LabeledSegment {
+            text: "SOC-2 absolutely".into(),
+            start_ms: 1_000.0,
+            end_ms: 1_800.0,
+            confidence: 0.9,
+            speaker: Some(MIC_IN_LABEL),
+            turns: Vec::new(),
+            words: vec![mk("soc", 0, 1_000.0, "SOC-2"), mk("2", 0, 1_000.0, "SOC-2"), mk("absolutely", 1, 1_600.0, "absolutely")],
+        };
+        let far_words: Vec<&TimedWord> = far.words.iter().collect();
+        assert!(half_echoed_at_most(&keep, &far_words), "one of two words echoed");
     }
 
     #[test]

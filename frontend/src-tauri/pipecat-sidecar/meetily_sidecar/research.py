@@ -229,10 +229,10 @@ def tool_name_for(tool: str, server: str, taken: set[str]) -> str:
 #: shutdown.
 #:
 #: Contract limit (WORK-581): at session end, close() spends at most
-#: WARM_UP_CLOSE_WAIT_SECS, on one deadline, closing the current MCP clients
-#: and waiting for every MCP server still connecting, and then returns. A
-#: client still closing or a server still connecting after that is
-#: abandoned: an HTTP or SSE connection is dropped, and a stdio server's
+#: WARM_UP_CLOSE_WAIT_SECS, on one deadline, letting the cancelled lookup
+#: finish, closing the current MCP clients and waiting for every MCP server
+#: still connecting, and then returns. A lookup still unwinding, a client
+#: still closing or a server still connecting after that is abandoned: an HTTP or SSE connection is dropped, and a stdio server's
 #: stdin pipe closes when the sidecar exits. Whether that server then exits
 #: is up to the server.
 WARM_UP_CLOSE_WAIT_SECS = 3.0
@@ -435,11 +435,6 @@ class Research:
         self._waiting = None
         lookup = self._current
         self._cancel_current("session ended")
-        if lookup is not None and lookup.task is not None:
-            try:
-                await lookup.task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
         # Warm-ups still connecting are not cancelled (that could strand the
         # MCP server one is starting): every tool source is closed by now
         # (replaced ones on reconfigure, the current one below), and a
@@ -447,6 +442,9 @@ class Research:
         # connects. Wait for all of them on one deadline; see the contract
         # limit at WARM_UP_CLOSE_WAIT_SECS for what happens after it.
         pending = {t for t in self._warming if not t.done()}
+        if lookup is not None and lookup.task is not None and not lookup.task.done():
+            # Cancelled above; it unwinds under the same deadline.
+            pending.add(lookup.task)
         if self._tools is not None:
             # Closed under the same deadline as the warm-ups, not before it.
             pending.add(asyncio.get_running_loop().create_task(self._tools.close()))

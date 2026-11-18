@@ -588,3 +588,25 @@ async def test_a_swap_still_closing_its_old_source_starts_no_warm_up_after_close
     await settle()
     assert Recording.listed == 0, "a warm-up started after close() returned"
     assert new.closed == 1 and not r.has_tools
+
+
+async def test_a_lookup_slow_to_cancel_shares_the_deadline(monkeypatch):
+    import meetily_sidecar.research as research_mod
+
+    monkeypatch.setattr(research_mod, "WARM_UP_CLOSE_WAIT_SECS", 0.1)
+
+    async def stubborn(system, question, tools, call_tool):
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            await asyncio.sleep(10)  # slow to unwind
+            raise
+        return "{}"
+
+    r = await configured([], loop=stubborn)
+    r.ask("q?", "t")
+    await settle()
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await asyncio.wait_for(r.close(), 2)
+    assert loop.time() - started < 0.25, "a lookup slow to cancel must count against the one deadline"

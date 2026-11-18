@@ -1,3 +1,6 @@
+const plugin = require('tailwindcss/plugin');
+const palette = require('./theme-palette');
+
 /** @type {import('tailwindcss').Config} */
 module.exports = {
     darkMode: ['class'],
@@ -13,7 +16,10 @@ module.exports = {
   				'var(--font-source-sans-3)'
   			]
   		},
+  		// Palette colours resolve through CSS variables so `.dark` can remap
+  		// them; see theme-palette.js for why text uses a separate role.
   		colors: {
+  			...palette.surfaceColors,
   			background: 'hsl(var(--background))',
   			foreground: 'hsl(var(--foreground))',
   			border: 'hsl(var(--border))',
@@ -56,6 +62,8 @@ module.exports = {
   				'5': 'hsl(var(--chart-5))'
   			}
   		},
+  		textColor: palette.inkColors,
+  		placeholderColor: palette.inkColors,
   		borderRadius: {
   			lg: 'var(--radius)',
   			md: 'calc(var(--radius) - 2px)',
@@ -89,5 +97,8 @@ module.exports = {
     require("tailwindcss-animate"),
     require("@tailwindcss/typography"),
     require("@tailwindcss/container-queries"),
+    plugin(({ addBase }) => {
+      addBase({ ':root': palette.light, '.dark': palette.dark });
+    }),
   ],
 }

@@ -443,8 +443,8 @@ export function ImportAudioDialog({
                 Cancel
               </Button>
               <Button
+                variant="blue"
                 onClick={handleStartImport}
-                className="bg-blue-600 hover:bg-blue-700"
                 disabled={!fileInfo}
               >
                 <Upload className="h-4 w-4 mr-2" />

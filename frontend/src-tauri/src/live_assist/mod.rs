@@ -65,7 +65,13 @@ static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 /// the Pipecat engine (WORK-559). Set: the sidecar's Flux turn events trigger
 /// the calls and this session only applies their cards. Unset: the Rust
 /// timer triggers them, as on the Direct engine.
-static SIDECAR: Mutex<Option<mpsc::UnboundedSender<String>>> = Mutex::new(None);
+///
+/// Each attach gets a new generation, and messages from the sidecar carry the
+/// generation of the connection they came on: a message still in flight from
+/// an earlier sidecar (after a fallback, or from the previous recording while
+/// its sidecar shuts down) is dropped instead of reaching this session.
+static SIDECAR: Mutex<Option<(u64, mpsc::UnboundedSender<String>)>> = Mutex::new(None);
+static SIDECAR_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HTTP: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
 
 struct Session {
@@ -211,38 +217,55 @@ fn session_tx() -> Option<mpsc::UnboundedSender<Msg>> {
 // PIPECAT SIDECAR BRIDGE (called by audio::pipecat)
 // ============================================================================
 
+/// A generation for the next sidecar connection (see SIDECAR).
+pub fn next_sidecar_generation() -> u64 {
+    SIDECAR_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+}
+
 /// The recording's transcription now runs through the Pipecat sidecar: its
 /// turn events trigger assist calls from here on.
-pub fn attach_sidecar<R: Runtime>(_app: &AppHandle<R>, control: mpsc::UnboundedSender<String>) {
-    *SIDECAR.lock().unwrap() = Some(control);
+pub fn attach_sidecar(generation: u64, control: mpsc::UnboundedSender<String>) {
+    *SIDECAR.lock().unwrap() = Some((generation, control));
     if let Some(tx) = session_tx() {
         let _ = tx.send(Msg::SidecarAttached);
     }
 }
 
-/// The sidecar is gone (recording over, or it failed and the recording fell
-/// back to Direct): the Rust timer triggers calls again.
-pub fn detach_sidecar<R: Runtime>(_app: &AppHandle<R>) {
-    SIDECAR.lock().unwrap().take();
+/// That sidecar is gone (recording over, its control connection lost, or it
+/// failed and the recording fell back to Direct): the Rust timer triggers
+/// calls again. A stale generation detaches nothing.
+pub fn detach_sidecar(generation: u64) {
+    {
+        let mut sidecar = SIDECAR.lock().unwrap();
+        if sidecar.as_ref().map(|(g, _)| *g) != Some(generation) {
+            return;
+        }
+        sidecar.take();
+    }
     if let Some(tx) = session_tx() {
         let _ = tx.send(Msg::SidecarDetached);
     }
 }
 
-/// One JSON message from the sidecar's `/control` connection.
-pub fn on_sidecar_message(text: &str) {
+/// One JSON message from the sidecar's `/control` connection `generation`.
+pub fn on_sidecar_message(generation: u64, text: &str) {
+    if SIDECAR.lock().unwrap().as_ref().map(|(g, _)| *g) != Some(generation) {
+        info!("live assist: dropping a message from a sidecar that is no longer attached");
+        return;
+    }
     match serde_json::from_str::<SidecarEvent>(text) {
         Ok(event) => {
             if let Some(tx) = session_tx() {
                 let _ = tx.send(Msg::Sidecar(event));
             }
         }
-        Err(e) => warn!("live assist: unreadable sidecar message ({e}): {:.120}", text),
+        // DO NOT log the message: it can hold card text built from the meeting.
+        Err(e) => warn!("live assist: unreadable sidecar message ({e}; {} bytes)", text.len()),
     }
 }
 
 fn to_sidecar(message: serde_json::Value) {
-    if let Some(tx) = SIDECAR.lock().unwrap().as_ref() {
+    if let Some((_, tx)) = SIDECAR.lock().unwrap().as_ref() {
         let _ = tx.send(message.to_string());
     }
 }
@@ -280,10 +303,19 @@ async fn sidecar_config<R: Runtime>(app: &AppHandle<R>, enabled: bool) -> serde_
         }))
     }
     .await;
+    let window = Config::default();
     let mut config = serde_json::json!({
         "type": "assist_config",
         "enabled": enabled,
         "system_prompt": cards::SYSTEM_PROMPT,
+        // The sidecar's limits come from here, their one home
+        // (meetily_sidecar/assist.py `Limits`).
+        "limits": {
+            "call_timeout_secs": CALL_TIMEOUT.as_secs_f64(),
+            "max_lines": window.max_lines,
+            "max_age_secs": window.max_age.as_secs_f64(),
+            "max_tokens": CLAUDE_MAX_TOKENS,
+        },
     });
     match llm {
         Ok(llm) => config["llm"] = llm,
@@ -368,7 +400,10 @@ async fn run<R: Runtime>(
                         sidecar_allowed = None;
                     }
                     Msg::Sidecar(event) => {
-                        apply_sidecar_event(&app, &mut engine, event, calls_allowed(&calls_off));
+                        // Queued before a detach: the timer owns calls now.
+                        if sidecar_mode {
+                            apply_sidecar_event(&app, &mut engine, event, calls_allowed(&calls_off));
+                        }
                     }
                     Msg::CallDone { call_id, result } => {
                         if engine.in_flight() == Some(call_id) {
@@ -539,7 +574,9 @@ fn apply_result<R: Runtime>(
         Ok(raw) => raw,
         Err(e) => {
             // Malformed output is that turn's "no cards", not an error state.
-            warn!("live assist: call {call_id}: {e}; output starts {:?}", output.chars().take(120).collect::<String>());
+            // DO NOT log the output itself: it can echo what was said in the
+            // meeting, and this log is kept on disk.
+            warn!("live assist: call {call_id}: {e} ({} chars)", output.chars().count());
             Vec::new()
         }
     };
@@ -817,6 +854,41 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(PINS_FILE), b"{oops").unwrap();
         assert!(read_pins(dir.path()).is_err());
+    }
+
+    /// The sidecar's control messages (`meetily_sidecar/assist.py`); the
+    /// Python tests emit and check the same fixture.
+    #[test]
+    fn sidecar_events_match_the_fixture_shared_with_the_sidecar() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../pipecat-sidecar/tests/fixtures/control_events.json")).unwrap();
+        let events = fixture["events"].as_array().unwrap();
+        assert_eq!(events.len(), 5);
+        for event in events {
+            let parsed: SidecarEvent = serde_json::from_value(event.clone())
+                .unwrap_or_else(|e| panic!("Rust cannot read the sidecar's {}: {e}", event["type"]));
+            if let SidecarEvent::AssistCards { cards, .. } = parsed {
+                let raw = parse_cards(&serde_json::json!({ "cards": cards }).to_string()).unwrap();
+                assert_eq!(raw.len(), 1, "the card survives Rust's re-validation");
+            }
+        }
+    }
+
+    #[test]
+    fn a_message_from_a_detached_sidecar_is_dropped() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let generation = next_sidecar_generation();
+        attach_sidecar(generation, tx);
+        to_sidecar(serde_json::json!({ "type": "ping" }));
+        assert!(rx.try_recv().is_ok(), "the attached sidecar gets messages");
+        detach_sidecar(generation + 1000);
+        assert!(SIDECAR.lock().unwrap().is_some(), "a stale generation detaches nothing");
+        detach_sidecar(generation);
+        assert!(SIDECAR.lock().unwrap().is_none());
+        to_sidecar(serde_json::json!({ "type": "ping" }));
+        assert!(rx.try_recv().is_err(), "nothing goes to a detached sidecar");
+        // No session and a stale generation: dropped without a panic.
+        on_sidecar_message(generation, r#"{"type":"assist_started","call_id":1,"trigger":"final"}"#);
     }
 
     #[test]

@@ -1068,42 +1068,72 @@ fn trim_bleed(mic: &LabeledSegment, speakers: &[&LabeledSegment]) -> Option<Labe
     // tolerates 20% misses, so without this edge check the cut would swallow
     // the user's last (or first) few words into the bleed.
     let far: Vec<&TimedWord> = speakers.iter().flat_map(|s| s.words.iter()).collect();
-    let echoed = |src: usize| {
-        mic.words.iter().filter(|w| w.src == src).any(|m| {
-            far.iter().any(|f| f.token == m.token && (f.start_ms - m.start_ms).abs() <= BLEED_EDGE_MAX_DELTA_MS)
-        })
-    };
+    let echoed = |src: usize| mic.words.iter().filter(|w| w.src == src).any(|m| is_echoed(m, &far));
     let accept = |keep: Option<LabeledSegment>, bleed: Option<LabeledSegment>| match (keep, bleed) {
         (Some(keep), Some(bleed)) if is_trimmable_bleed(&bleed) && !is_bleed_of(&keep, speakers) => Some(keep),
         _ => None,
     };
     // Bleed at the end: the user spoke, then the far side's reply leaked in.
-    if let Some(mut cut) = ((first_src + 1)..=last_src).find(|&cut| accept(part(first_src, cut - 1), part(cut, last_src)).is_some()) {
-        while cut < last_src && !echoed(cut) {
-            cut += 1;
-        }
+    if let Some(first_cut) =
+        ((first_src + 1)..=last_src).find(|&cut| accept(part(first_src, cut - 1), part(cut, last_src)).is_some())
+    {
+        // Move the cut to the first echoed word, if that still passes.
+        let cut = (first_cut..=last_src).find(|&c| echoed(c)).unwrap_or(first_cut);
         if let Some(keep) = accept(part(first_src, cut - 1), part(cut, last_src)) {
             return Some(keep);
         }
+        return accept(part(first_src, first_cut - 1), part(first_cut, last_src));
     }
     // Bleed at the start: the far side was still finishing when the user began.
-    if let Some(mut cut) =
+    if let Some(first_cut) =
         ((first_src + 1)..=last_src).rev().find(|&cut| accept(part(cut, last_src), part(first_src, cut - 1)).is_some())
     {
-        while cut > first_src + 1 && !echoed(cut - 1) {
-            cut -= 1;
-        }
+        // Move the cut back to just after the last echoed word.
+        let cut = ((first_src + 1)..=first_cut).rev().find(|&c| echoed(c - 1)).unwrap_or(first_cut);
         if let Some(keep) = accept(part(cut, last_src), part(first_src, cut - 1)) {
             return Some(keep);
         }
+        return accept(part(first_cut, last_src), part(first_src, first_cut - 1));
     }
     None
 }
 
-/// How close in time a word must be to the same far-side word to count as
-/// its echo when placing a trim cut. Acoustic bleed lags by tens of ms, but
-/// Flux word timings come in ~0.32-0.4 s steps (measured 2026-11-18).
-const BLEED_EDGE_MAX_DELTA_MS: f64 = 800.0;
+/// A mic token the far side said around the same moment: same token, start
+/// within BLEED_WORD_WINDOW_MS (the window `is_bleed_of` matches in, so a cut
+/// is placed with the same timing tolerance the match was made with).
+fn is_echoed(m: &TimedWord, far: &[&TimedWord]) -> bool {
+    far.iter().any(|f| f.token == m.token && (f.start_ms - m.start_ms).abs() <= BLEED_WORD_WINDOW_MS)
+}
+
+/// What bleed suppression does with one Mic-In line.
+#[derive(Debug, PartialEq)]
+enum MicVerdict {
+    /// Not bleed: show as is.
+    Keep,
+    /// Show only this part; the rest was the far side.
+    Trim(LabeledSegment),
+    /// All of it was the far side.
+    Drop,
+}
+
+/// Judge a Mic-In line against the far side's recent finals. A line can pass
+/// the whole-line rule (80% of its words echoed) and still begin or end with
+/// the user's own words (two words of reply, then eight of bleed), so a trim
+/// is tried first. On a line that is bleed as a whole, the trim is accepted
+/// only if NONE of the kept words was said by the far side around then; that
+/// keeps a misheard echo ("40,000" for "forty thousand") from surviving as a
+/// fragment.
+fn judge_mic(mic: &LabeledSegment, far: &[&LabeledSegment]) -> MicVerdict {
+    let trimmed = trim_bleed(mic, far);
+    if is_bleed_of(mic, far) {
+        let far_words: Vec<&TimedWord> = far.iter().flat_map(|s| s.words.iter()).collect();
+        return match trimmed {
+            Some(keep) if keep.words.iter().all(|w| !is_echoed(w, &far_words)) => MicVerdict::Trim(keep),
+            _ => MicVerdict::Drop,
+        };
+    }
+    trimmed.map_or(MicVerdict::Keep, MicVerdict::Trim)
+}
 
 /// What the realtime session tells the transcript: show a line, or take back
 /// a line it showed.
@@ -1161,10 +1191,11 @@ impl BleedSuppressor {
         match seg.speaker {
             Some(MIC_IN_LABEL) => {
                 let far: Vec<&LabeledSegment> = self.recent_speaker.iter().map(|(_, s)| s).collect();
-                if is_bleed_of(&seg, &far) {
-                    return Vec::new();
-                }
-                let seg = trim_bleed(&seg, &far).unwrap_or(seg);
+                let seg = match judge_mic(&seg, &far) {
+                    MicVerdict::Drop => return Vec::new(),
+                    MicVerdict::Trim(keep) => keep,
+                    MicVerdict::Keep => seg,
+                };
                 self.shown_mic.push((now_ms, key, seg.clone()));
                 vec![RealtimeOutput::Show { key, seg }]
             }
@@ -1174,19 +1205,19 @@ impl BleedSuppressor {
                 let far: Vec<&LabeledSegment> = self.recent_speaker.iter().map(|(_, s)| s).collect();
                 let mut out = vec![RealtimeOutput::Show { key, seg: out_seg }];
                 let mut reshown = Vec::new();
-                self.shown_mic.retain(|(at, mic_key, mic)| {
-                    if is_bleed_of(mic, &far) {
+                self.shown_mic.retain(|(at, mic_key, mic)| match judge_mic(mic, &far) {
+                    MicVerdict::Keep => true,
+                    MicVerdict::Drop => {
                         out.push(RealtimeOutput::Retract { key: *mic_key });
-                        return false;
+                        false
                     }
-                    if let Some(kept) = trim_bleed(mic, &far) {
+                    MicVerdict::Trim(kept) => {
                         // Part of a shown line was bleed: take the line back
                         // and show what the user actually said.
                         out.push(RealtimeOutput::Retract { key: *mic_key });
                         reshown.push((*at, kept));
-                        return false;
+                        false
                     }
-                    true
                 });
                 for (at, kept) in reshown {
                     let kept_key = self.next_key;
@@ -1249,10 +1280,10 @@ pub async fn run_realtime_transcription<R: Runtime>(
     let options = configured_options(&app).await.map_err(|e| e.to_string())?;
     let language = crate::get_language_preference_internal();
 
-    let receiver = if super::pipecat::load_engine(&app) == super::pipecat::LiveEngine::Pipecat {
+    let (receiver, already_shown) = if super::pipecat::load_engine(&app) == super::pipecat::LiveEngine::Pipecat {
         match super::pipecat::run(&app, &api_key, &options, language.clone(), transcription_receiver).await {
             super::pipecat::Outcome::Finished(result) => return result,
-            super::pipecat::Outcome::FallBack { receiver, reason } => {
+            super::pipecat::Outcome::FallBack { receiver, reason, shown } => {
                 warn!("Pipecat live engine: falling back to Direct for this recording: {reason}");
                 let _ = app.emit(
                     "transcription-error",
@@ -1265,11 +1296,11 @@ pub async fn run_realtime_transcription<R: Runtime>(
                         "actionable": false
                     }),
                 );
-                receiver
+                (receiver, shown)
             }
         }
     } else {
-        transcription_receiver
+        (transcription_receiver, ShownUntil::default())
     };
 
     run_realtime_core(
@@ -1278,19 +1309,60 @@ pub async fn run_realtime_transcription<R: Runtime>(
         options,
         language,
         receiver,
-        realtime_emitter(app),
+        realtime_emitter(app, Arc::default(), already_shown),
     )
     .await
 }
 
+/// Recording time (ms) up to which each channel's lines have been shown.
+/// After a fallback the Pipecat engine's unconfirmed audio is replayed to
+/// Direct, and Direct's lines that end by then were already shown once.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct ShownUntil {
+    pub mic_in_ms: f64,
+    pub speaker_out_ms: f64,
+    pub unlabelled_ms: f64,
+}
+
+impl ShownUntil {
+    fn slot(&mut self, speaker: Option<&str>) -> &mut f64 {
+        match speaker {
+            Some(MIC_IN_LABEL) => &mut self.mic_in_ms,
+            Some(SPEAKER_OUT_LABEL) => &mut self.speaker_out_ms,
+            _ => &mut self.unlabelled_ms,
+        }
+    }
+
+    /// A line that ends no later than what this channel already showed.
+    fn covers(mut self, seg: &LabeledSegment) -> bool {
+        let until = *self.slot(seg.speaker);
+        until > 0.0 && seg.end_ms <= until
+    }
+}
+
 /// Turns the core's output into transcript events: rows for shown lines,
-/// `transcript-retract` for Mic-In lines found to be bleed.
-pub(crate) fn realtime_emitter<R: Runtime>(app: AppHandle<R>) -> impl FnMut(RealtimeOutput) + Send + 'static {
+/// `transcript-retract` for Mic-In lines found to be bleed. Records in
+/// `shown` how far each channel got, and drops lines `skip` says were shown
+/// already (a Direct fallback replaying the Pipecat engine's tail).
+pub(crate) fn realtime_emitter<R: Runtime>(
+    app: AppHandle<R>,
+    shown: Arc<std::sync::Mutex<ShownUntil>>,
+    skip: ShownUntil,
+) -> impl FnMut(RealtimeOutput) + Send + 'static {
     // Only Mic-In lines are ever retracted, so only they are recorded.
     let mut ledger = RetractionLedger::default();
     let clock = std::time::Instant::now();
     move |out| match out {
         RealtimeOutput::Show { key, seg } => {
+            if skip.covers(&seg) {
+                info!("Deepgram realtime: skipping a replayed line already shown before the fallback");
+                return;
+            }
+            {
+                let mut shown = shown.lock().unwrap();
+                let slot = shown.slot(seg.speaker);
+                *slot = slot.max(seg.end_ms);
+            }
             let retractable = seg.speaker == Some(MIC_IN_LABEL);
             let sequence_ids = emit_labeled_segment(&app, seg);
             if retractable {
@@ -2473,6 +2545,15 @@ mod tests {
     }
 
     #[test]
+    fn a_replayed_line_is_skipped_only_up_to_what_its_channel_showed() {
+        let skip = ShownUntil { mic_in_ms: 10_000.0, speaker_out_ms: 4_000.0, unlabelled_ms: 0.0 };
+        assert!(skip.covers(&seg("old", 8_000.0, 9_500.0, Some(MIC_IN_LABEL))));
+        assert!(!skip.covers(&seg("unfinished far turn", 3_000.0, 9_000.0, Some(SPEAKER_OUT_LABEL))), "the far side's open turn is not lost");
+        assert!(!skip.covers(&seg("new", 9_800.0, 11_000.0, Some(MIC_IN_LABEL))));
+        assert!(!ShownUntil::default().covers(&seg("x", 0.0, 0.0, None)), "nothing shown: nothing skipped");
+    }
+
+    #[test]
     fn a_flux_turn_is_timed_by_its_words_not_its_window() {
         let m: FluxTurnInfo = serde_json::from_value(serde_json::json!({
             "type": "TurnInfo", "event": "EndOfTurn", "transcript": "Yes. We handle",
@@ -2526,7 +2607,7 @@ mod tests {
         let (outer_tx, outer_rx) = mpsc::unbounded_channel::<AudioChunk>();
         let (inner_tx, inner_rx) = mpsc::unbounded_channel::<AudioChunk>();
         let (seen_tx, mut seen_rx) = mpsc::unbounded_channel::<LabeledSegment>();
-        let core = run_realtime_core(sidecar.endpoints(), sidecar.token.clone(), options, None, inner_rx, move |out| {
+        let core = run_realtime_core(sidecar.endpoints(), sidecar.token.clone(), options, None, inner_rx, move |out: RealtimeOutput| {
             if let RealtimeOutput::Show { seg, .. } = out {
                 let _ = seen_tx.send(seg);
             }
@@ -2569,7 +2650,7 @@ mod tests {
             }
         };
         let ((rest, result), ()) = tokio::time::timeout(Duration::from_secs(60), async {
-            tokio::join!(relay(outer_rx, inner_tx, core), feeder)
+            tokio::join!(relay(outer_rx, inner_tx, core, |_: &AudioChunk| {}), feeder)
         })
         .await
         .expect("the crash is noticed, not waited on forever");
@@ -3188,6 +3269,47 @@ mod tests {
         seg.end_ms = 6_000.0;
         let out = s.push(seg, 6_200.0);
         assert_eq!(texts(&out), vec!["show Some(\"Mic-In\"): that would be me for the pilot"]);
+    }
+
+    /// Review round 1: two own words then eight echoed ones pass the whole-line
+    /// 80% rule; the reply must survive, not vanish with the bleed.
+    #[test]
+    fn a_short_reply_followed_by_a_long_echo_keeps_the_reply() {
+        let mut s = BleedSuppressor::default();
+        let far = "both ideally real time for agent assist and batch";
+        s.push(timed_seg(far, 1_000.0, 5_000.0, SPEAKER_OUT_LABEL), 5_000.0);
+        let mut seg = timed_seg("got it", 0.0, 900.0, MIC_IN_LABEL);
+        let mut bleed = timed(far, 1_080.0, 5_080.0);
+        bleed.iter_mut().for_each(|w| w.src += 2);
+        seg.words.extend(bleed);
+        seg.text = format!("got it {far}");
+        assert!(is_bleed_of(&seg, &[&timed_seg(far, 1_000.0, 5_000.0, SPEAKER_OUT_LABEL)]), "the case: whole-line bleed");
+        assert_eq!(texts(&s.push(seg, 5_500.0)), vec!["show Some(\"Mic-In\"): got it"]);
+    }
+
+    /// Review round 1: an echo whose timings sit ~1 s off the far side's still
+    /// matches as a run, so its cut must use the same tolerance.
+    #[test]
+    fn an_echo_a_second_off_is_still_trimmed() {
+        let mut s = BleedSuppressor::default();
+        let far = "can you send me the soc two report";
+        s.push(timed_seg(far, 4_000.0, 7_000.0, SPEAKER_OUT_LABEL), 7_000.0);
+        let mut seg = timed_seg("let me check with the team first", 0.0, 3_500.0, MIC_IN_LABEL);
+        let mut bleed = timed(far, 5_000.0, 8_000.0);
+        let n = seg.words.len();
+        bleed.iter_mut().for_each(|w| w.src += n);
+        seg.words.extend(bleed);
+        seg.text = format!("let me check with the team first {far}");
+        assert_eq!(texts(&s.push(seg, 8_500.0)), vec!["show Some(\"Mic-In\"): let me check with the team first"]);
+    }
+
+    #[test]
+    fn a_misheard_echo_is_dropped_whole_not_left_as_a_fragment() {
+        let mut s = BleedSuppressor::default();
+        let far = "we handle about forty thousand calls a day mostly english";
+        s.push(timed_seg(far, 0.0, 4_000.0, SPEAKER_OUT_LABEL), 4_000.0);
+        let echo = "we handle about 40 000 calls a day mostly english";
+        assert!(s.push(timed_seg(echo, 80.0, 4_080.0, MIC_IN_LABEL), 4_500.0).is_empty());
     }
 
     #[test]

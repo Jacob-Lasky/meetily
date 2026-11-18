@@ -199,8 +199,10 @@ pub fn user_prompt<'a>(
 
 /// Lowercase words with punctuation dropped, for quote matching.
 pub fn normalize(text: &str) -> String {
+    // Full Unicode lowercase, as the sidecar's prompt.py does: ASCII-only
+    // lowercasing kept "Économie" and "économie" apart.
     text.chars()
-        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { ' ' })
+        .flat_map(|c| if c.is_alphanumeric() { c.to_lowercase().collect::<Vec<_>>() } else { vec![' '] })
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -213,6 +215,12 @@ mod tests {
 
     /// The Pipecat sidecar builds the same user prompt in Python
     /// (`meetily_sidecar/prompt.py`); both test suites check this fixture.
+    #[test]
+    fn normalize_lowercases_beyond_ascii() {
+        assert_eq!(normalize("Économie française!"), "économie française");
+        assert_eq!(normalize("ÜBER  Straße"), "über straße");
+    }
+
     #[test]
     fn user_prompt_matches_the_fixture_shared_with_the_sidecar() {
         let fixture: serde_json::Value =

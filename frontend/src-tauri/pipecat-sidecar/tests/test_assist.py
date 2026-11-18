@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from meetily_sidecar.assist import Assist
+from meetily_sidecar.assist import Assist, Limits
 
 CARD = '{"cards":[{"kind":"ask","text":"Which plan?","quote":"pricing"}]}'
 
@@ -189,7 +189,7 @@ async def test_provider_failure_is_reported():
 
 
 async def test_a_slow_call_times_out():
-    a, llm, events = make(call_timeout=0.05)
+    a, llm, events = make(limits=Limits(call_timeout_secs=0.05))
     a.on_end_of_turn("pricing?")
     await asyncio.sleep(0.1)
     await settle()
@@ -242,3 +242,69 @@ async def test_close_cancels_the_call_in_flight():
     await settle()
     await a.close()
     assert llm.cancelled == [0]
+
+
+async def test_a_repeated_identical_turn_is_still_the_last_line_of_the_prompt():
+    a, llm, _ = make()
+    a.add_line(1, "them", "Yes.")
+    a.add_line(2, "me", "So batch too?")
+    # The second "Yes." ended before Rust's line for it arrived.
+    a.on_end_of_turn("Yes.")
+    await settle()
+    assert llm.calls[0][1].endswith("Them: Yes.\nMe: So batch too?\nThem: Yes.\n")
+
+
+async def test_limits_come_from_rust():
+    a, llm, _ = make()
+    a.configure(system_prompt="S", infer=llm, llm_error=None, enabled=True, limits=Limits(max_lines=2))
+    for i in range(4):
+        a.add_line(i, "me", f"line {i}")
+    a.on_end_of_turn("now")
+    await settle()
+    assert "line 1" not in llm.calls[0][1] and "line 3" in llm.calls[0][1]
+    assert Limits.from_config({"max_lines": 5, "call_timeout_secs": 3}).max_lines == 5
+    assert Limits.from_config(None) == Limits()
+
+
+async def test_malformed_output_is_not_logged(caplog_loguru):
+    secret = "the wire code is 4471-9920"
+    a, llm, _ = make(FakeLLM(output=f"Sure! They said {secret}."))
+    a.on_end_of_turn("pricing?")
+    await settle()
+    llm.release(0)
+    await settle()
+    assert secret not in caplog_loguru.text
+    assert "chars" in caplog_loguru.text
+
+
+async def test_emitted_events_match_the_fixture_shared_with_rust():
+    import json
+    from pathlib import Path
+
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "control_events.json").read_text())
+    expected = {}
+    for e in fixture["events"]:
+        expected.setdefault(e["type"], set(e))
+    events = []
+    llm = FakeLLM()
+    a = Assist(emit=events.append)
+    a.configure(system_prompt="", infer=llm, llm_error=None, enabled=True)
+    a.on_eager_end_of_turn("so the")
+    await settle()
+    a.on_turn_resumed()
+    a.on_end_of_turn("so the plan?")
+    await settle()
+    llm.release(1)
+    await settle()
+    llm.error = RuntimeError("boom")
+    a.on_end_of_turn("again?")
+    await settle()
+    llm.release(2)
+    await settle()
+    b = Assist(emit=events.append)
+    b.configure(system_prompt="", infer=None, llm_error="no model", enabled=True)
+    b.on_end_of_turn("x")
+    seen = {e["type"] for e in events}
+    assert seen == set(expected), seen
+    for e in events:
+        assert set(e) == expected[e["type"]], (e["type"], set(e) ^ expected[e["type"]])

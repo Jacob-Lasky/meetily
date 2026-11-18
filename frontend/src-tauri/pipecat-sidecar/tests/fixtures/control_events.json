@@ -1,0 +1,10 @@
+{
+  "_comment": "Shared by tests/test_assist.py (the sidecar must emit exactly these keys per type) and src/live_assist/mod.rs (Rust must read every one).",
+  "events": [
+    {"type": "assist_started", "call_id": 1, "trigger": "eager"},
+    {"type": "assist_cancelled", "call_id": 1, "reason": "turn resumed"},
+    {"type": "assist_cards", "call_id": 2, "trigger": "final", "cards": [{"kind": "ask", "text": "Which plan?", "quote": "pricing"}], "call_ms": 1200, "since_end_of_turn_ms": 900},
+    {"type": "assist_error", "call_id": 3, "error": "401 invalid x-api-key"},
+    {"type": "assist_error", "call_id": null, "error": "no summary model is configured (Settings > Summary)"}
+  ]
+}

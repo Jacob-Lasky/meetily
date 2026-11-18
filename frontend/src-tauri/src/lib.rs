@@ -28,9 +28,9 @@ macro_rules! perf_trace {
     ($($arg:tt)*) => {};
 }
 
-// Make these macros available to other modules
-pub(crate) use perf_debug;
-pub(crate) use perf_trace;
+// The macros reach every module declared below by textual scope (macro_rules
+// defined before the `mod` items); a `pub(crate) use` re-export of them was
+// redundant and only produced unused-import warnings.
 
 // Re-export async logging macros for external use (removed due to macro conflicts)
 

@@ -80,40 +80,54 @@ pub fn load_engine<R: Runtime>(app: &AppHandle<R>) -> LiveEngine {
 // RUN (called by deepgram::run_realtime_transcription)
 // ============================================================================
 
-pub enum Outcome {
+pub(crate) enum Outcome {
     /// The recording ended on the Pipecat engine (with its result).
     Finished(Result<(), String>),
-    /// Continue the recording on Direct with what is left of the audio.
-    FallBack { receiver: mpsc::UnboundedReceiver<AudioChunk>, reason: String },
+    /// Continue the recording on Direct with what is left of the audio:
+    /// the recent audio the Pipecat engine had not finished (replayed first),
+    /// then the rest of the recording. `shown` says how far each channel's
+    /// lines already got, so the replay does not show them twice.
+    FallBack {
+        receiver: mpsc::UnboundedReceiver<AudioChunk>,
+        reason: String,
+        shown: deepgram::ShownUntil,
+    },
 }
 
-pub async fn run<R: Runtime>(
+/// Most recent audio kept for replay on a fallback. It covers an unfinished
+/// turn (Flux commits a turn only at its end, so a crash loses the turn in
+/// progress); a longer replay would also be sent to Deepgram in one burst.
+const REPLAY_SECS: f64 = 30.0;
+
+pub(crate) async fn run<R: Runtime>(
     app: &AppHandle<R>,
     deepgram_api_key: &str,
     options: &DeepgramOptions,
     language: Option<String>,
     receiver: mpsc::UnboundedReceiver<AudioChunk>,
 ) -> Outcome {
+    let fall_back = |receiver, reason| Outcome::FallBack { receiver, reason, shown: deepgram::ShownUntil::default() };
     let command = match SidecarCommand::resolve(app, false) {
         Ok(command) => command,
-        Err(reason) => return Outcome::FallBack { receiver, reason },
+        Err(reason) => return fall_back(receiver, reason),
     };
     let sidecar = match Sidecar::spawn(command, deepgram_api_key, STARTUP_TIMEOUT).await {
         Ok(sidecar) => sidecar,
         Err(reason) => {
             // Most often the environment is not built yet: build it for next time.
             spawn_prepare(app.clone());
-            return Outcome::FallBack { receiver, reason };
+            return fall_back(receiver, reason);
         }
     };
-    let control = match sidecar.connect_control().await {
+    let generation = crate::live_assist::next_sidecar_generation();
+    let control = match sidecar.connect_control(app.clone(), generation).await {
         Ok(control) => control,
         Err(reason) => {
             sidecar.shutdown().await;
-            return Outcome::FallBack { receiver, reason };
+            return fall_back(receiver, reason);
         }
     };
-    crate::live_assist::attach_sidecar(app, control.tx.clone());
+    crate::live_assist::attach_sidecar(generation, control.tx.clone());
 
     let mut flux_options = options.clone();
     if !flux_options.model.starts_with("flux") {
@@ -126,29 +140,71 @@ pub async fn run<R: Runtime>(
         flux_options.model
     );
     let (inner_tx, inner_rx) = mpsc::unbounded_channel();
+    let shown = Arc::new(std::sync::Mutex::new(deepgram::ShownUntil::default()));
     let core = deepgram::run_realtime_core(
         sidecar.endpoints(),
         sidecar.token.clone(),
         flux_options,
         language,
         inner_rx,
-        deepgram::realtime_emitter(app.clone()),
+        deepgram::realtime_emitter(app.clone(), shown.clone(), deepgram::ShownUntil::default()),
     );
-    let (rest, result) = relay(receiver, inner_tx, core).await;
+    let mut recent = ReplayBuffer::default();
+    let (rest, result) = relay(receiver, inner_tx, core, |chunk: &AudioChunk| recent.push(chunk)).await;
 
-    crate::live_assist::detach_sidecar(app);
+    crate::live_assist::detach_sidecar(generation);
     control.close();
     let exit = sidecar.shutdown().await;
     match (rest, result) {
         (_, Ok(())) => Outcome::Finished(Ok(())),
-        (Some(receiver), Err(e)) => {
+        (Some(rest), Err(e)) => {
             let reason = match exit {
                 Some(code) => format!("{e}; sidecar {code}"),
                 None => e,
             };
-            Outcome::FallBack { receiver, reason }
+            let shown = *shown.lock().unwrap();
+            info!("Pipecat live engine: replaying {:.1} s of recent audio to Direct", recent.seconds());
+            Outcome::FallBack { receiver: recent.then(rest), reason, shown }
         }
         (None, Err(e)) => Outcome::Finished(Err(format!("Pipecat live engine: {e}"))),
+    }
+}
+
+/// The last REPLAY_SECS of audio sent to the Pipecat engine.
+#[derive(Default)]
+struct ReplayBuffer {
+    chunks: std::collections::VecDeque<AudioChunk>,
+}
+
+impl ReplayBuffer {
+    fn push(&mut self, chunk: &AudioChunk) {
+        self.chunks.push_back(chunk.clone());
+        while self.chunks.front().is_some_and(|c| chunk.timestamp - c.timestamp > REPLAY_SECS) {
+            self.chunks.pop_front();
+        }
+    }
+
+    fn seconds(&self) -> f64 {
+        match (self.chunks.front(), self.chunks.back()) {
+            (Some(first), Some(last)) => last.timestamp - first.timestamp,
+            _ => 0.0,
+        }
+    }
+
+    /// A receiver that yields the buffered chunks, then everything `rest` yields.
+    fn then(self, mut rest: mpsc::UnboundedReceiver<AudioChunk>) -> mpsc::UnboundedReceiver<AudioChunk> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        for chunk in self.chunks {
+            let _ = tx.send(chunk);
+        }
+        tokio::spawn(async move {
+            while let Some(chunk) = rest.recv().await {
+                if tx.send(chunk).is_err() {
+                    return;
+                }
+            }
+        });
+        rx
     }
 }
 
@@ -160,13 +216,15 @@ pub async fn run<R: Runtime>(
 /// result. A core that ends "cleanly" before the recording did is reported as
 /// an error: the sidecar went away, and the rest of the call would otherwise
 /// go untranscribed.
-pub(crate) async fn relay<T, F>(
+pub(crate) async fn relay<T, F, S>(
     mut outer: mpsc::UnboundedReceiver<T>,
     inner: mpsc::UnboundedSender<T>,
     core: F,
+    mut sent: S,
 ) -> (Option<mpsc::UnboundedReceiver<T>>, Result<(), String>)
 where
     F: std::future::Future<Output = Result<(), String>>,
+    S: FnMut(&T),
 {
     tokio::pin!(core);
     let mut inner = Some(inner);
@@ -181,6 +239,7 @@ where
             }
             chunk = outer.recv(), if inner.is_some() => match chunk {
                 Some(chunk) => {
+                    sent(&chunk);
                     // A send error means the core dropped its receiver; the
                     // core's own result arrives on the next turn of the loop.
                     let _ = inner.as_ref().map(|tx| tx.send(chunk));
@@ -415,7 +474,7 @@ impl Sidecar {
 
     /// Open `/control`: text messages to the sidecar go through the returned
     /// sender; messages from it go to `live_assist`.
-    async fn connect_control(&self) -> Result<Control, String> {
+    async fn connect_control<R: Runtime>(&self, app: AppHandle<R>, generation: u64) -> Result<Control, String> {
         let request = self.request("/control")?;
         let (ws, _) = tokio_tungstenite::connect_async(request)
             .await
@@ -435,11 +494,23 @@ impl Sidecar {
             }
             let _ = write.close().await;
         });
+        let reader_closing = closing.clone();
         tokio::spawn(async move {
             while let Some(Ok(message)) = read.next().await {
                 if let Message::Text(text) = message {
-                    crate::live_assist::on_sidecar_message(&text);
+                    crate::live_assist::on_sidecar_message(generation, &text);
                 }
+            }
+            if !reader_closing.load(Ordering::SeqCst) {
+                // The sidecar still transcribes, but nothing can reach assist
+                // any more (and it turns its own calls off): hand assist back
+                // to the Rust timer rather than leave it silently dead.
+                warn!("Pipecat live engine: control connection lost; live assist uses the Rust timer");
+                crate::live_assist::detach_sidecar(generation);
+                let _ = app.emit(
+                    crate::live_assist::ASSIST_STATUS_EVENT,
+                    serde_json::json!({ "state": "error", "message": "lost the connection to the Pipecat engine; live assist continues on the timer" }),
+                );
             }
         });
         Ok(Control { tx, closing })
@@ -484,13 +555,27 @@ fn new_token() -> String {
 async fn forward_logs(stderr: tokio::process::ChildStderr) {
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        if line.contains("| ERROR") || line.contains("| CRITICAL") {
-            error!("pipecat-sidecar: {line}");
-        } else if line.contains("| WARNING") {
-            warn!("pipecat-sidecar: {line}");
-        } else {
-            info!("pipecat-sidecar: {line}");
+        match sidecar_log_level(&line) {
+            log::Level::Error => error!("pipecat-sidecar: {line}"),
+            log::Level::Warn => warn!("pipecat-sidecar: {line}"),
+            _ => info!("pipecat-sidecar: {line}"),
         }
+    }
+}
+
+/// Level for one sidecar stderr line. Loguru lines carry `| LEVEL |`; any
+/// other line (an interpreter crash: "Fatal Python error", a traceback) is
+/// a warning, never INFO, so a sidecar that dies at startup stands out.
+fn sidecar_log_level(line: &str) -> log::Level {
+    let loguru = |level: &str| line.contains(&format!("| {level}"));
+    if loguru("ERROR") || loguru("CRITICAL") {
+        log::Level::Error
+    } else if loguru("WARNING") {
+        log::Level::Warn
+    } else if loguru("INFO") || loguru("DEBUG") || loguru("TRACE") || loguru("SUCCESS") {
+        log::Level::Info
+    } else {
+        log::Level::Warn
     }
 }
 
@@ -607,7 +692,7 @@ pub(crate) mod tests {
             outer_tx.send(x).unwrap();
         }
         drop(outer_tx);
-        let (rest, result) = relay(outer_rx, inner_tx, core).await;
+        let (rest, result) = relay(outer_rx, inner_tx, core, |_| {}).await;
         assert!(rest.is_none(), "recording ended: nothing to fall back with");
         assert_eq!(result, Ok(()));
     }
@@ -621,7 +706,7 @@ pub(crate) mod tests {
             Err("Deepgram Flux realtime error: boom".to_string())
         };
         outer_tx.send(1).unwrap();
-        let (rest, result) = relay(outer_rx, inner_tx, core).await;
+        let (rest, result) = relay(outer_rx, inner_tx, core, |_| {}).await;
         assert_eq!(result, Err("Deepgram Flux realtime error: boom".to_string()));
         let mut rest = rest.expect("the recording continues on Direct");
         outer_tx.send(2).unwrap();
@@ -632,7 +717,7 @@ pub(crate) mod tests {
     async fn a_core_ending_cleanly_mid_recording_is_still_a_fallback() {
         let (_outer_tx, outer_rx) = mpsc::unbounded_channel::<u32>();
         let (inner_tx, _inner_rx) = mpsc::unbounded_channel::<u32>();
-        let (rest, result) = relay(outer_rx, inner_tx, async { Ok(()) }).await;
+        let (rest, result) = relay(outer_rx, inner_tx, async { Ok(()) }, |_| {}).await;
         assert!(rest.is_some());
         assert!(result.unwrap_err().contains("mid-recording"));
     }
@@ -646,7 +731,7 @@ pub(crate) mod tests {
             while inner_rx.recv().await.is_some() {}
             Err("final responses lost".to_string())
         };
-        let (rest, result) = relay(outer_rx, inner_tx, core).await;
+        let (rest, result) = relay(outer_rx, inner_tx, core, |_| {}).await;
         assert!(rest.is_none());
         assert_eq!(result, Err("final responses lost".to_string()));
     }
@@ -682,6 +767,41 @@ pub(crate) mod tests {
         .map(|(k, v)| (k.to_string(), v.to_string()));
         let kept: Vec<String> = inherited_env(parent.into_iter()).into_iter().map(|(k, _)| k).collect();
         assert_eq!(kept, vec!["HOME", "PATH", "LC_ALL", "SSL_CERT_FILE"]);
+    }
+
+    #[tokio::test]
+    async fn a_fallback_replays_the_recent_audio_before_the_rest() {
+        let chunk = |t: f64| AudioChunk {
+            data: vec![0.0; 160],
+            sample_rate: 16_000,
+            timestamp: t,
+            chunk_id: (t * 10.0) as u64,
+            device_type: crate::audio::recording_state::DeviceType::Microphone,
+            layout: crate::audio::recording_state::AudioLayout::MicOnly,
+        };
+        let mut recent = ReplayBuffer::default();
+        for t in [0.0, 10.0, 25.0, 40.0, 45.0] {
+            recent.push(&chunk(t));
+        }
+        assert_eq!(recent.seconds(), 20.0, "kept 25..45: older than REPLAY_SECS behind the newest is dropped");
+        let (tx, rest) = mpsc::unbounded_channel();
+        tx.send(chunk(46.0)).unwrap();
+        drop(tx);
+        let mut rx = recent.then(rest);
+        let mut got = Vec::new();
+        while let Some(c) = rx.recv().await {
+            got.push(c.timestamp);
+        }
+        assert_eq!(got, vec![25.0, 40.0, 45.0, 46.0], "the replay, then the rest of the recording, in order");
+    }
+
+    #[test]
+    fn sidecar_crash_output_is_never_logged_as_info() {
+        assert_eq!(sidecar_log_level("2026-11-18 10:38:03.870 | INFO     | __main__:on_ready:60 - listening"), log::Level::Info);
+        assert_eq!(sidecar_log_level("2026-11-18 10:38:03.870 | WARNING  | x - y"), log::Level::Warn);
+        assert_eq!(sidecar_log_level("2026-11-18 10:38:03.870 | ERROR    | x - y"), log::Level::Error);
+        assert_eq!(sidecar_log_level("Fatal Python error: init_fs_encoding: failed to get the Python codec"), log::Level::Warn);
+        assert_eq!(sidecar_log_level("ModuleNotFoundError: No module named 'encodings'"), log::Level::Warn);
     }
 
     #[test]

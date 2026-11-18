@@ -37,12 +37,32 @@ from .prompt import ParseError, normalize, parse_cards, user_prompt
 Infer = Callable[[str, str], Awaitable[str]]
 Emit = Callable[[dict], None]
 
-#: A slower answer is stale by the time it lands (same as Rust CALL_TIMEOUT).
-CALL_TIMEOUT_SECS = 20.0
-#: Context window, as in the Rust engine's Config::default().
-MAX_LINES = 12
-MAX_AGE_SECS = 120.0
-#: Most shown-card texts sent with a call.
+@dataclass(frozen=True)
+class Limits:
+    """Call timeout, context window and token cap. Their one home is Rust
+    (`live_assist`: CALL_TIMEOUT, engine Config, CLAUDE_MAX_TOKENS), which
+    sends them in the assist config; these defaults only apply until it has.
+    """
+
+    call_timeout_secs: float = 20.0
+    max_lines: int = 12
+    max_age_secs: float = 120.0
+    max_tokens: int = 1024
+
+    @classmethod
+    def from_config(cls, raw) -> "Limits":
+        if not isinstance(raw, dict):
+            return cls()
+        base = cls()
+        return cls(
+            call_timeout_secs=float(raw.get("call_timeout_secs", base.call_timeout_secs)),
+            max_lines=int(raw.get("max_lines", base.max_lines)),
+            max_age_secs=float(raw.get("max_age_secs", base.max_age_secs)),
+            max_tokens=int(raw.get("max_tokens", base.max_tokens)),
+        )
+
+
+#: Most shown-card texts kept for a prompt (Rust sends at most 20).
 MAX_SHOWN_IN_PROMPT = 20
 
 
@@ -76,12 +96,12 @@ class Assist:
         infer: Infer | None = None,
         *,
         clock: Callable[[], float] = time.monotonic,
-        call_timeout: float = CALL_TIMEOUT_SECS,
+        limits: Limits = Limits(),
     ):
         self._emit = emit
         self._infer = infer
         self._clock = clock
-        self._call_timeout = call_timeout
+        self.limits = limits
         self._enabled = False
         self._system_prompt = ""
         self._llm_error: str | None = "live assist is not configured yet"
@@ -94,8 +114,18 @@ class Assist:
 
     # ---- configuration (from Rust over /control) --------------------------
 
-    def configure(self, *, system_prompt: str, infer: Infer | None, llm_error: str | None, enabled: bool):
+    def configure(
+        self,
+        *,
+        system_prompt: str,
+        infer: Infer | None,
+        llm_error: str | None,
+        enabled: bool,
+        limits: Limits | None = None,
+    ):
         self._system_prompt = system_prompt
+        if limits is not None:
+            self.limits = limits
         self._infer = infer
         self._llm_error = llm_error if infer is None else None
         self.set_enabled(enabled)
@@ -172,16 +202,18 @@ class Assist:
 
     def _prune(self):
         now = self._clock()
-        while len(self._lines) > MAX_LINES:
+        while len(self._lines) > self.limits.max_lines:
             self._lines.popleft()
-        while self._lines and now - self._lines[0].at > MAX_AGE_SECS:
+        while self._lines and now - self._lines[0].at > self.limits.max_age_secs:
             self._lines.popleft()
 
     def _prompt_for(self, turn_text: str) -> str:
         self._prune()
         lines = [(line.side, line.text) for line in self._lines]
-        last_them = next((t for s, t in reversed(lines) if s == "them"), None)
-        if last_them is None or normalize(last_them) != normalize(turn_text):
+        # Append the triggering turn unless Rust's line for it is already the
+        # newest line. Comparing with the newest "them" line instead would
+        # take an earlier identical turn ("Yes.") for this one and leave it out.
+        if not lines or lines[-1][0] != "them" or normalize(lines[-1][1]) != normalize(turn_text):
             lines.append(("them", turn_text))
         return user_prompt(lines, self._shown)
 
@@ -205,11 +237,13 @@ class Assist:
     async def _run(self, call: _Call, prompt: str):
         assert self._infer is not None
         try:
-            call.output = await asyncio.wait_for(self._infer(self._system_prompt, prompt), self._call_timeout)
+            call.output = await asyncio.wait_for(
+                self._infer(self._system_prompt, prompt), self.limits.call_timeout_secs
+            )
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
-            call.error = f"timed out after {self._call_timeout:g} s"
+            call.error = f"timed out after {self.limits.call_timeout_secs:g} s"
         except Exception as e:  # noqa: BLE001 - any provider failure is that call's error
             call.error = str(e) or type(e).__name__
         call.done = True
@@ -234,8 +268,9 @@ class Assist:
                 cards = parse_cards(call.output or "")
             except ParseError as e:
                 # Malformed output is that turn's "no cards", not an error state.
-                preview = (call.output or "")[:120]
-                logger.warning(f"live assist: call {call.call_id}: {e}; output starts {preview!r}")
+                # DO NOT log the output itself: it can echo what was said in
+                # the meeting, and these lines end up in Meetily's log.
+                logger.warning(f"live assist: call {call.call_id}: {e} ({len(call.output or '')} chars)")
                 cards = []
             logger.info(
                 f"live assist: call {call.call_id} returned {len(cards)} card(s), "

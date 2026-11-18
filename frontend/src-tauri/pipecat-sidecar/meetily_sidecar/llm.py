@@ -17,14 +17,8 @@ from typing import Any
 
 from .assist import Infer
 
-#: 3 cards x 25 words of JSON is ~250 tokens (Rust CLAUDE_MAX_TOKENS).
-MAX_TOKENS = 1024
-
 #: Default endpoints, matching `summary/llm_client.rs`.
 OLLAMA_DEFAULT = "http://localhost:11434"
-
-SUPPORTED = ("claude", "openai", "groq", "openrouter", "ollama", "custom-openai")
-
 
 class UnsupportedProvider(ValueError):
     pass
@@ -73,15 +67,16 @@ def build_service(cfg: dict[str, Any]):
     )
 
 
-def make_infer(cfg: dict[str, Any]) -> Infer:
-    """An `Infer` coroutine bound to one service instance."""
+def make_infer(cfg: dict[str, Any], max_tokens: int) -> Infer:
+    """An `Infer` coroutine bound to one service instance. `max_tokens` comes
+    from Rust (`Limits`)."""
     from pipecat.processors.aggregators.llm_context import LLMContext
 
     service = build_service(cfg)
 
     async def infer(system_prompt: str, prompt: str) -> str:
         context = LLMContext(messages=[{"role": "user", "content": prompt}])
-        out = await service.run_inference(context, max_tokens=MAX_TOKENS, system_instruction=system_prompt)
+        out = await service.run_inference(context, max_tokens=max_tokens, system_instruction=system_prompt)
         return out or ""
 
     return infer

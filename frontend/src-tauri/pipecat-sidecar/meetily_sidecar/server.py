@@ -23,17 +23,19 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from loguru import logger
-from pipecat.frames.frames import TranscriptionFrame
+from pipecat.frames.frames import InterimTranscriptionFrame, TranscriptionFrame
 from pipecat.processors.frame_processor import FrameProcessor
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.datastructures import Headers
 from websockets.http11 import Response
 
-from .assist import Assist
+from .assist import Assist, Limits
 
 SAMPLE_RATE = 16_000
 #: How long a channel pipeline may take to drain after CloseStream.
 DRAIN_TIMEOUT_SECS = 15.0
+#: How long a cancelled pipeline may take to stop.
+CANCEL_TIMEOUT_SECS = 5.0
 
 
 class Sidecar:
@@ -87,20 +89,22 @@ class Sidecar:
                 if isinstance(raw, bytes):
                     continue
                 try:
-                    msg = json.loads(raw)
-                except ValueError:
-                    logger.warning("control: dropped a message that was not JSON")
-                    continue
-                handle_control(self.assist, msg)
+                    handle_control(self.assist, json.loads(raw))
+                except (ValueError, KeyError, TypeError) as e:
+                    # One bad message must not drop the connection (and with
+                    # it every later card).
+                    logger.warning(f"control: dropped an unusable message ({type(e).__name__})")
         finally:
             self._control = None
+            # Nobody can see cards or turn assist off any more: make no calls.
+            self.assist.set_enabled(False)
             await self.assist.close()
             logger.info("control disconnected")
 
     # ---- /v2/listen -------------------------------------------------------
 
     async def _serve_channel(self, ws: ServerConnection, query: dict[str, list[str]]):
-        from pipecat.frames.frames import EndFrame, InputAudioRawFrame
+        from pipecat.frames.frames import EndFrame
         from pipecat.pipeline.pipeline import Pipeline
         from pipecat.pipeline.worker import PipelineParams, PipelineWorker, ProcessorUnusablePolicy
         from pipecat.workers.runner import WorkerRunner
@@ -144,27 +148,13 @@ class Sidecar:
         run_task = asyncio.create_task(runner.run())
         self.channels_open += 1
         logger.info(f"{side} channel open")
-        pipeline_ended = False
         try:
-            async for msg in ws:
-                if run_task.done():
-                    pipeline_ended = True
-                    break
-                if isinstance(msg, bytes):
-                    await worker.queue_frame(
-                        InputAudioRawFrame(audio=msg, sample_rate=SAMPLE_RATE, num_channels=1)
-                    )
-                    continue
-                try:
-                    ctl = json.loads(msg)
-                except ValueError:
-                    continue
-                if ctl.get("type") == "CloseStream":
-                    break
+            pipeline_ended = await self._pump(ws, worker, run_task)
             if pipeline_ended:
-                # The pipeline stopped while Rust was still sending (a permanent
-                # Flux failure under ProcessorUnusablePolicy.END). Say so, so
-                # Rust falls back instead of waiting on a silent channel.
+                # The pipeline stopped on its own (a permanent Flux failure
+                # under ProcessorUnusablePolicy.END). Say so at once, even if
+                # no more audio comes (capture paused), so Rust falls back
+                # instead of waiting on a silent channel.
                 reason = last_error[-1] if last_error else "the Flux pipeline ended unexpectedly"
                 await _send_quietly(ws, json.dumps({"type": "Error", "description": reason}))
             else:
@@ -173,14 +163,51 @@ class Sidecar:
                     await asyncio.wait_for(asyncio.shield(run_task), DRAIN_TIMEOUT_SECS)
                 except asyncio.TimeoutError:
                     logger.warning(f"{side} channel: pipeline did not drain in {DRAIN_TIMEOUT_SECS:g} s")
+                    # Final turns may be lost: report it rather than close as
+                    # if the drain succeeded.
+                    await _send_quietly(
+                        ws,
+                        json.dumps({"type": "Error", "description": f"the {side} channel did not finish within {DRAIN_TIMEOUT_SECS:g} s; its last turn may be missing"}),
+                    )
                     await worker.cancel(reason="drain timeout")
-                    await run_task
+                    try:
+                        await asyncio.wait_for(run_task, CANCEL_TIMEOUT_SECS)
+                    except asyncio.TimeoutError:
+                        run_task.cancel()
         finally:
             self.channels_open -= 1
             if not run_task.done():
                 run_task.cancel()
             await ws.close()
             logger.info(f"{side} channel closed")
+
+
+    @staticmethod
+    async def _pump(ws: ServerConnection, worker, run_task: asyncio.Task) -> bool:
+        """Feed the channel's audio to the pipeline until CloseStream or the
+        socket closes (False), or until the pipeline ends by itself (True).
+        Waits on both at once: a pipeline that dies while no audio arrives
+        is noticed straight away."""
+        from pipecat.frames.frames import InputAudioRawFrame
+
+        while True:
+            recv = asyncio.ensure_future(ws.recv())
+            done, _ = await asyncio.wait({recv, run_task}, return_when=asyncio.FIRST_COMPLETED)
+            if recv not in done:
+                recv.cancel()
+                return True
+            try:
+                msg = recv.result()
+            except Exception:  # noqa: BLE001 - the peer closed or the socket failed
+                return False
+            if isinstance(msg, bytes):
+                await worker.queue_frame(InputAudioRawFrame(audio=msg, sample_rate=SAMPLE_RATE, num_channels=1))
+                continue
+            try:
+                if json.loads(msg).get("type") == "CloseStream":
+                    return False
+            except (ValueError, AttributeError):
+                continue
 
 
 def handle_control(assist: Assist, msg: dict[str, Any]):
@@ -190,12 +217,13 @@ def handle_control(assist: Assist, msg: dict[str, Any]):
         from .llm import UnsupportedProvider, make_infer
 
         infer, err = None, None
+        limits = Limits.from_config(msg.get("limits"))
         llm = msg.get("llm")
         if msg.get("llm_error"):
             err = str(msg["llm_error"])
         elif isinstance(llm, dict):
             try:
-                infer = make_infer(llm)
+                infer = make_infer(llm, limits.max_tokens)
             except UnsupportedProvider as e:
                 err = str(e)
             except Exception as e:  # noqa: BLE001 - surfaced to the user as the assist error
@@ -207,6 +235,7 @@ def handle_control(assist: Assist, msg: dict[str, Any]):
             infer=infer,
             llm_error=err,
             enabled=bool(msg.get("enabled")),
+            limits=limits,
         )
     elif kind == "assist_enabled":
         assist.set_enabled(bool(msg.get("enabled")))
@@ -260,17 +289,34 @@ class TurnRelay(FrameProcessor):
     def __init__(self, ws: ServerConnection, **kwargs):
         super().__init__(**kwargs)
         self._ws = ws
+        # The turn in progress, as of Flux's last Update (words and window).
+        self._last_update: dict | None = None
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
-        if isinstance(frame, TranscriptionFrame):
-            result = frame.result if isinstance(frame.result, dict) else None
-            if result is None:
-                # A turn cut short by a dropped Flux connection has no TurnInfo:
-                # send its text in the same shape, untimed.
-                result = {"type": "TurnInfo", "event": "EndOfTurn", "transcript": frame.text, "words": []}
-            await _send_quietly(self._ws, json.dumps(result))
+        if isinstance(frame, InterimTranscriptionFrame) and isinstance(frame.result, dict):
+            self._last_update = frame.result
+        elif isinstance(frame, TranscriptionFrame):
+            await _send_quietly(self._ws, json.dumps(turn_info_for(frame, self._last_update)))
+            self._last_update = None
         await self.push_frame(frame, direction)
+
+
+def turn_info_for(frame: TranscriptionFrame, last_update: dict | None) -> dict:
+    """The TurnInfo to send for a committed turn.
+
+    A turn cut short by a dropped Flux connection (Pipecat pushes its text
+    unfinalized, with no result) is still the user's words, so it is sent:
+    the rest of the speech becomes a new turn on the new connection, with no
+    overlap. It is timed by the turn's last Update; without that it would
+    have no time at all and sort at 0:00.
+    """
+    if isinstance(frame.result, dict):
+        return frame.result
+    info = dict(last_update or {})
+    info.update({"type": "TurnInfo", "event": "EndOfTurn", "transcript": frame.text})
+    info.setdefault("words", [])
+    return info
 
 
 async def _send_quietly(ws: ServerConnection, text: str):

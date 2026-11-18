@@ -127,8 +127,32 @@ pub struct Research {
 }
 
 impl Default for Research {
+    /// On by default since the built-in Deepgram docs server (WORK-581): a
+    /// fresh install gets docs-grounded lookups with nothing to set up.
     fn default() -> Self {
-        Self { enabled: false, servers: Vec::new() }
+        Self { enabled: true, servers: Vec::new() }
+    }
+}
+
+/// Name of the built-in Deepgram docs research server; user servers cannot
+/// take it (the sidecar keys MCP clients by server name).
+pub const BUILTIN_DOCS_NAME: &str = "Deepgram docs";
+
+/// Knowledge and research that ship with the app (WORK-581), so colleagues
+/// get Deepgram-grounded cards with nothing to paste or configure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Builtin {
+    /// `deepgram_public.md` (from deepgram.com/llms.txt) as a knowledge item.
+    pub deepgram_overview: bool,
+    /// Deepgram's hosted docs MCP server as a research server, authenticated
+    /// with the Deepgram API key saved for transcription.
+    pub deepgram_docs: bool,
+}
+
+impl Default for Builtin {
+    fn default() -> Self {
+        Self { deepgram_overview: true, deepgram_docs: true }
     }
 }
 
@@ -153,6 +177,7 @@ pub struct AssistSettings {
     pub instructions: String,
     pub card_kinds: CardKinds,
     pub research: Research,
+    pub builtin: Builtin,
 }
 
 fn yes() -> bool {
@@ -199,6 +224,9 @@ impl AssistSettings {
             if s.name.trim().is_empty() {
                 return Err("every MCP server needs a name".into());
             }
+            if s.name.trim().eq_ignore_ascii_case(BUILTIN_DOCS_NAME) {
+                return Err(format!("{BUILTIN_DOCS_NAME} is the built-in server's name; pick another"));
+            }
             if !names.insert(s.name.trim().to_lowercase()) {
                 return Err(format!("two MCP servers are named {}", s.name.trim()));
             }
@@ -228,6 +256,7 @@ mod tests {
         let s: AssistSettings = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(s, AssistSettings::default());
         assert!(s.card_kinds.answer && s.card_kinds.todo);
+        assert!(s.builtin.deepgram_overview && s.builtin.deepgram_docs && s.research.enabled, "built-ins on by default");
         assert!(s.model.is_none());
         assert!(s.validate(0).is_ok());
     }
@@ -235,11 +264,11 @@ mod tests {
     #[test]
     fn keys_are_camel_case_for_the_frontend() {
         let v = serde_json::to_value(AssistSettings::default()).unwrap();
-        for key in ["model", "aboutMe", "knowledge", "instructions", "cardKinds", "research"] {
+        for key in ["model", "aboutMe", "knowledge", "instructions", "cardKinds", "research", "builtin"] {
             assert!(v.get(key).is_some(), "missing {key}");
         }
         let ts = include_str!("../../../src/lib/ai-assist-settings.ts");
-        for key in ["aboutMe", "cardKinds", "allowedTools", "transport"] {
+        for key in ["aboutMe", "cardKinds", "allowedTools", "transport", "deepgramOverview", "deepgramDocs"] {
             assert!(ts.contains(key), "frontend settings type lacks {key}");
         }
     }
@@ -287,6 +316,8 @@ mod tests {
         assert!(s.validate(0).is_ok());
         s.research.servers.push(server("A", McpTransport::Http, "", "https://x"));
         assert!(s.validate(0).is_err(), "duplicate name");
+        s.research.servers[1].name = "deepgram DOCS".into();
+        assert!(s.validate(0).is_err(), "the built-in server's name is reserved");
         s.research.servers[1].name = "b".into();
         s.research.servers[1].url = "ftp://x".into();
         assert!(s.validate(0).is_err(), "bad URL");
@@ -294,7 +325,7 @@ mod tests {
 
     #[test]
     fn active_servers_need_research_and_the_server_on() {
-        let mut r = Research::default();
+        let mut r = Research { enabled: false, ..Default::default() };
         r.servers.push(McpServer {
             id: "d".into(),
             name: "DeepHive".into(),

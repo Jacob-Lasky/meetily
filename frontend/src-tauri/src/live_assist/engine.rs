@@ -274,9 +274,13 @@ impl Engine {
                 origin: None,
             });
         }
-        // The model lists cards in its own order; show the first one on top.
-        let mut list: Vec<Card> = added.clone();
-        list.extend(std::mem::take(&mut self.cards));
+        // Pinned cards stay on top (Jake, WORK-581: "Pin should raise the
+        // question to the top"); new cards go right under them, in the
+        // model's order, above the older unpinned ones.
+        let (pinned, older): (Vec<Card>, Vec<Card>) = std::mem::take(&mut self.cards).into_iter().partition(|c| c.pinned);
+        let mut list: Vec<Card> = pinned;
+        list.extend(added.iter().cloned());
+        list.extend(older);
         let mut evicted = Vec::new();
         let mut unpinned = 0;
         list.retain(|c| {
@@ -304,10 +308,15 @@ impl Engine {
         true
     }
 
+    /// Pin or unpin a card. A pinned card moves to the very top; an
+    /// unpinned one to the top of the unpinned cards, under the pins.
     pub fn set_pinned(&mut self, id: &str, pinned: bool) -> Option<Card> {
-        let card = self.cards.iter_mut().find(|c| c.id == id)?;
+        let pos = self.cards.iter().position(|c| c.id == id)?;
+        let mut card = self.cards.remove(pos);
         card.pinned = pinned;
-        Some(card.clone())
+        let at = if pinned { 0 } else { self.cards.iter().take_while(|c| c.pinned).count() };
+        self.cards.insert(at, card.clone());
+        Some(card)
     }
 
     pub fn cards(&self) -> &[Card] {
@@ -377,6 +386,24 @@ mod tests {
 
     fn raw(kind: CardKind, text: &str, quote: &str) -> RawCard {
         RawCard { kind, text: text.into(), quote: quote.into() }
+    }
+
+    #[test]
+    fn a_pinned_card_goes_to_the_top_and_new_cards_come_in_under_the_pins() {
+        let t0 = Instant::now();
+        let mut e = Engine::new(Config::default());
+        e.on_line(1, Side::Them, "What does streaming cost per minute?", t0);
+        let first = e.on_external_cards(1, vec![raw(CardKind::Ask, "Which volume?", ""), raw(CardKind::Todo, "Send pricing", "")], None, 1);
+        let ids: Vec<String> = first.added.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(e.cards().iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["Which volume?", "Send pricing"]);
+        e.set_pinned(&ids[1], true).unwrap();
+        assert_eq!(e.cards()[0].text, "Send pricing", "pinning raises the card to the top");
+        e.on_external_cards(2, vec![raw(CardKind::Fact, "Nova-3 $0.0092/min", "")], None, 2);
+        let order: Vec<&str> = e.cards().iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(order, ["Send pricing", "Nova-3 $0.0092/min", "Which volume?"], "new cards under the pins");
+        e.set_pinned(&ids[1], false).unwrap();
+        assert_eq!(e.cards()[0].text, "Send pricing", "unpinned, it heads the unpinned cards");
+        assert!(!e.cards()[0].pinned);
     }
 
     // ---- cards from the Pipecat sidecar (WORK-559) -----------------------

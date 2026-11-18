@@ -54,11 +54,16 @@ export interface AssistStatus {
   message?: string;
 }
 
-/** New cards go on top; a card already shown keeps its place. */
+/**
+ * New cards go right under the pinned ones, above older unpinned cards; a
+ * card already shown keeps its place. Same order as the backend engine.
+ */
 export function withAdded(cards: AssistCard[], added: AssistCard[]): AssistCard[] {
   const known = new Set(cards.map((c) => c.id));
   const fresh = added.filter((c) => !known.has(c.id));
-  return fresh.length ? [...fresh, ...cards] : cards;
+  if (!fresh.length) return cards;
+  const pinned = cards.filter((c) => c.pinned);
+  return [...pinned, ...fresh, ...cards.filter((c) => !c.pinned)];
 }
 
 /** Cards minus `ids` (same array when none matched, so React skips a render). */
@@ -67,9 +72,16 @@ export function withoutIds(cards: AssistCard[], ids: readonly string[]): AssistC
   return cards.some((c) => drop.has(c.id)) ? cards.filter((c) => !drop.has(c.id)) : cards;
 }
 
-/** Replace one card (after pin/unpin) in place. */
+/**
+ * Replace one card after pin/unpin: a pinned card moves to the very top, an
+ * unpinned one to the top of the unpinned cards (same as engine.rs).
+ */
 export function withCard(cards: AssistCard[], card: AssistCard): AssistCard[] {
-  return cards.map((c) => (c.id === card.id ? card : c));
+  if (!cards.some((c) => c.id === card.id)) return cards;
+  const rest = cards.filter((c) => c.id !== card.id);
+  if (card.pinned) return [card, ...rest];
+  const pins = rest.filter((c) => c.pinned);
+  return [...pins, card, ...rest.filter((c) => !c.pinned)];
 }
 
 /**

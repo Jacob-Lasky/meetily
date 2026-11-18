@@ -38,6 +38,8 @@ export interface AssistSettings {
   instructions: string;
   cardKinds: CardKindFlags;
   research: { enabled: boolean; servers: McpServer[] };
+  /** Knowledge and research that ship with the app (settings.rs `Builtin`). */
+  builtin: { deepgramOverview: boolean; deepgramDocs: boolean };
 }
 
 export interface PromptPreview {
@@ -71,8 +73,12 @@ export const DEFAULT_SETTINGS: AssistSettings = {
   knowledge: [],
   instructions: '',
   cardKinds: { answer: true, ask: true, fact: true, todo: true },
-  research: { enabled: false, servers: [] },
+  research: { enabled: true, servers: [] },
+  builtin: { deepgramOverview: true, deepgramDocs: true },
 };
+
+/** Same as settings.rs BUILTIN_DOCS_NAME: user servers cannot take it. */
+export const BUILTIN_DOCS_NAME = 'Deepgram docs';
 
 /** Characters of standing context the backend counts against MAX_CONTEXT_CHARS. */
 export function contextChars(s: AssistSettings): number {

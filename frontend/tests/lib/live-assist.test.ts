@@ -29,9 +29,19 @@ describe('live assist card list', () => {
     expect(withoutIds(list, ['zzz'])).toBe(list);
   });
 
-  test('pin updates the card in place', () => {
-    const list = [card('a'), card('b')];
-    expect(withCard(list, card('b', { pinned: true }))[1].pinned).toBe(true);
+  test('pinning raises a card to the top; unpinning puts it under the pins', () => {
+    const list = [card('p', { pinned: true }), card('a'), card('b')];
+    const pinned = withCard(list, card('b', { pinned: true }));
+    expect(pinned.map((c) => c.id)).toEqual(['b', 'p', 'a']);
+    expect(pinned[0].pinned).toBe(true);
+    const unpinned = withCard(pinned, card('b'));
+    expect(unpinned.map((c) => c.id)).toEqual(['p', 'b', 'a']);
+    expect(withCard(list, card('zzz'))).toBe(list);
+  });
+
+  test('new cards come in under the pinned ones', () => {
+    const list = withAdded([card('p', { pinned: true }), card('old')], [card('a'), card('b')]);
+    expect(list.map((c) => c.id)).toEqual(['p', 'a', 'b', 'old']);
   });
 
   test('remount sync keeps live cards that arrived during the fetch and drops withdrawn ones', () => {

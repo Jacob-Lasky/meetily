@@ -380,20 +380,64 @@ async fn assist_target<R: Runtime>(
     Ok((provider, model, target))
 }
 
-/// Research needs an MCP server on and a kind its cards can use.
-fn research_on(settings: &AssistSettings) -> bool {
-    !settings.research.active_servers().is_empty() && (settings.card_kinds.answer || settings.card_kinds.fact)
+/// The built-in Deepgram knowledge (`scripts/refresh-deepgram-knowledge.py`
+/// regenerates it from deepgram.com/llms.txt).
+pub const DEEPGRAM_PUBLIC: &str = include_str!("deepgram_public.md");
+const DEEPGRAM_PUBLIC_NAME: &str = "Deepgram public overview (built in)";
+/// Deepgram's hosted docs MCP server (developers.deepgram.com, "Agentic
+/// Developer Tools"); it takes `Authorization: Token <Deepgram API key>`.
+const DEEPGRAM_DOCS_MCP_URL: &str = "https://api.dx.deepgram.com/kapa/mcp";
+const DEEPGRAM_DOCS_TOOL: &str = "search_deepgram_knowledge_sources";
+
+/// Research would run: it is on, some server is on (a user server or the
+/// built-in docs), and a kind its cards can use is on. Whether the built-in
+/// docs server can connect (a Deepgram key) is settled in `research_servers`.
+fn research_wanted(settings: &AssistSettings) -> bool {
+    settings.research.enabled
+        && (!settings.research.active_servers().is_empty() || settings.builtin.deepgram_docs)
+        && (settings.card_kinds.answer || settings.card_kinds.fact)
 }
 
 fn prompt_parts<'a>(settings: &'a AssistSettings, brief: &'a str, research: bool) -> PromptParts<'a> {
+    let builtin = settings.builtin.deepgram_overview.then_some((DEEPGRAM_PUBLIC_NAME, DEEPGRAM_PUBLIC));
     PromptParts {
         kinds: settings.card_kinds.enabled(),
         instructions: &settings.instructions,
         about_me: &settings.about_me,
-        knowledge: settings.knowledge.iter().filter(|k| k.enabled).map(|k| (k.name.as_str(), k.text.as_str())).collect(),
+        knowledge: builtin
+            .into_iter()
+            .chain(settings.knowledge.iter().filter(|k| k.enabled).map(|k| (k.name.as_str(), k.text.as_str())))
+            .collect(),
         brief,
         research,
     }
+}
+
+/// The Deepgram API key saved for transcription, if any.
+async fn deepgram_key<R: Runtime>(app: &AppHandle<R>) -> Option<String> {
+    let state = app.try_state::<AppState>()?;
+    SettingsRepository::get_transcript_api_key(state.db_manager.pool(), "deepgram")
+        .await
+        .ok()
+        .flatten()
+        .filter(|k| !k.trim().is_empty())
+}
+
+/// The built-in Deepgram docs server with the saved key, or None without one.
+async fn builtin_docs_server<R: Runtime>(app: &AppHandle<R>) -> Option<settings::McpServer> {
+    let key = deepgram_key(app).await?;
+    Some(settings::McpServer {
+        id: "builtin-deepgram-docs".into(),
+        name: settings::BUILTIN_DOCS_NAME.into(),
+        enabled: true,
+        transport: McpTransport::Http,
+        command: String::new(),
+        args: Vec::new(),
+        env: Default::default(),
+        url: DEEPGRAM_DOCS_MCP_URL.into(),
+        headers: [("Authorization".to_string(), format!("Token {}", key.trim()))].into_iter().collect(),
+        allowed_tools: vec![DEEPGRAM_DOCS_TOOL.into()],
+    })
 }
 
 /// The card system prompt for these settings and brief.
@@ -401,12 +445,22 @@ pub fn compose_prompt(settings: &AssistSettings, brief: &str, research: bool) ->
     cards::system_prompt(&prompt_parts(settings, brief, research))
 }
 
-/// MCP servers as the sidecar's `research.py` reads them.
-fn research_servers_json(settings: &AssistSettings) -> Vec<serde_json::Value> {
-    settings
-        .research
-        .active_servers()
-        .into_iter()
+/// The research lane's MCP servers, as the sidecar's `research.py` reads
+/// them: the user's servers that are on, then the built-in docs server when
+/// it is on and a Deepgram key is saved. Empty when research is not wanted.
+async fn research_servers<R: Runtime>(app: &AppHandle<R>, settings: &AssistSettings) -> Vec<serde_json::Value> {
+    if !research_wanted(settings) {
+        return Vec::new();
+    }
+    let mut servers: Vec<settings::McpServer> = settings.research.active_servers().into_iter().cloned().collect();
+    if settings.builtin.deepgram_docs {
+        match builtin_docs_server(app).await {
+            Some(docs) => servers.push(docs),
+            None => info!("live assist: no Deepgram key saved; the built-in Deepgram docs server is skipped"),
+        }
+    }
+    servers
+        .iter()
         .map(|s| {
             serde_json::json!({
                 "name": s.name.trim(),
@@ -433,7 +487,8 @@ fn research_servers_json(settings: &AssistSettings) -> Vec<serde_json::Value> {
 async fn sidecar_config<R: Runtime>(app: &AppHandle<R>, enabled: bool) -> serde_json::Value {
     let settings = load_settings(app);
     let brief = load_brief(app);
-    let research = research_on(&settings);
+    let servers = research_servers(app, &settings).await;
+    let research = !servers.is_empty();
     let llm = assist_target(app, &settings).await.map(|(provider, model, target)| {
         let endpoint = target.ollama_endpoint.or(target.custom_openai_endpoint);
         serde_json::json!({
@@ -458,7 +513,7 @@ async fn sidecar_config<R: Runtime>(app: &AppHandle<R>, enabled: bool) -> serde_
         },
         "research": {
             "enabled": research,
-            "servers": if research { research_servers_json(&settings) } else { Vec::new() },
+            "servers": servers,
             "system_prompt": cards::research_prompt(&prompt_parts(&settings, &brief, true)),
             "timeout_secs": RESEARCH_TIMEOUT.as_secs_f64(),
             "max_tool_calls": RESEARCH_MAX_TOOL_CALLS,
@@ -1176,7 +1231,7 @@ pub struct PromptPreview {
 #[tauri::command]
 pub async fn ai_assist_prompt_preview<R: Runtime>(app: AppHandle<R>, settings: AssistSettings) -> PromptPreview {
     let brief = load_brief(&app);
-    let research = research_on(&settings);
+    let research = research_wanted(&settings);
     let parts = prompt_parts(&settings, &brief, research);
     PromptPreview {
         built_in: cards::built_in_rules(&parts),
@@ -1254,6 +1309,22 @@ fn clip_chars(text: &str, max: usize) -> String {
         return text.to_string();
     }
     format!("{}…", text.chars().take(max).collect::<String>().trim_end())
+}
+
+/// Test the built-in Deepgram docs server with the saved Deepgram key (the
+/// key stays in Rust; the UI never sees it).
+#[tauri::command]
+pub async fn ai_assist_test_builtin_docs<R: Runtime>(app: AppHandle<R>) -> Result<Vec<mcp_probe::ToolInfo>, String> {
+    let server = builtin_docs_server(&app)
+        .await
+        .ok_or("no Deepgram API key is saved (Settings › Transcription › Deepgram)")?;
+    mcp_probe::list_tools(&server).await
+}
+
+/// The built-in Deepgram knowledge text, for the Knowledge section.
+#[tauri::command]
+pub async fn ai_assist_builtin_knowledge() -> String {
+    DEEPGRAM_PUBLIC.to_string()
 }
 
 /// Connect to one MCP server and list its tools (Settings › AI Assist
@@ -1361,6 +1432,32 @@ mod tests {
 
     /// The two lock tests share the global CONTEXT_SAVE: run them one at a time.
     static LOCK_TESTS: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn the_builtin_overview_is_in_the_prompt_unless_turned_off() {
+        let mut settings = AssistSettings::default();
+        let on = compose_prompt(&settings, "", false);
+        assert!(on.contains("<knowledge name=\"Deepgram public overview (built in)\">"));
+        assert!(on.contains("Nova-3"), "the bundled text itself is sent");
+        assert!(!DEEPGRAM_PUBLIC.contains("]("), "links are stripped from the bundled text");
+        settings.builtin.deepgram_overview = false;
+        assert!(!compose_prompt(&settings, "", false).contains("Deepgram public overview"));
+    }
+
+    #[test]
+    fn research_is_wanted_with_only_the_builtin_docs_server() {
+        let mut settings = AssistSettings::default();
+        assert!(research_wanted(&settings), "default: research on with the built-in docs");
+        settings.builtin.deepgram_docs = false;
+        assert!(!research_wanted(&settings), "no server at all");
+        settings.builtin.deepgram_docs = true;
+        settings.research.enabled = false;
+        assert!(!research_wanted(&settings));
+        settings.research.enabled = true;
+        settings.card_kinds.answer = false;
+        settings.card_kinds.fact = false;
+        assert!(!research_wanted(&settings), "lookups answer as answer or fact cards");
+    }
 
     #[test]
     fn pins_round_trip_through_the_meeting_folder() {

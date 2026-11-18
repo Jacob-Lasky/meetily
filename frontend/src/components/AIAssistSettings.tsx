@@ -372,6 +372,10 @@ function KnowledgeSection({ form, update, chars }: SectionProps & { chars: numbe
         Product facts, pricing, FAQs, objection handling. Sent as cached context on Claude, so calls do not pay for it
         in full each time. Text files only (.txt, .md, .csv, .json…); for a PDF, paste its text.
       </p>
+      <BuiltinOverview
+        on={form.builtin.deepgramOverview}
+        onChange={(v) => update({ builtin: { ...form.builtin, deepgramOverview: v } })}
+      />
       {form.knowledge.length > 0 && (
         <ul className="space-y-2 mb-4">
           {form.knowledge.map((k, i) => (
@@ -500,6 +504,10 @@ function ResearchSection({
           onCheckedChange={(v) => update({ research: { ...form.research, enabled: v } })}
         />
       </div>
+      <BuiltinDocs
+        on={form.builtin.deepgramDocs}
+        onChange={(v) => update({ builtin: { ...form.builtin, deepgramDocs: v } })}
+      />
       <ul className="space-y-3">
         {servers.map((s, i) => (
           <McpServerEditor
@@ -693,5 +701,67 @@ function McpServerEditor({
         {!tools && <span className="text-gray-400"> · Test to pick from the server&apos;s tools</span>}
       </div>
     </li>
+  );
+}
+
+/** The built-in Deepgram overview (deepgram.com/llms.txt), on by default. */
+function BuiltinOverview({ on, onChange }: { on: boolean; onChange: (v: boolean) => void }) {
+  const [text, setText] = useState<string | null>(null);
+  useEffect(() => {
+    invoke<string>('ai_assist_builtin_knowledge')
+      .then(setText)
+      .catch(() => setText(''));
+  }, []);
+  return (
+    <div className="rounded border border-blue-200 bg-blue-50/40 p-3 mb-4" data-testid="builtin-overview">
+      <div className="flex items-center gap-3">
+        <Switch checked={on} aria-label="Use the built-in Deepgram overview" onCheckedChange={onChange} />
+        <span className="flex-1 text-sm font-medium text-gray-900">Deepgram public overview (built in)</span>
+        <span className="text-xs text-gray-500">{text ? `${[...text].length.toLocaleString()} chars` : ''}</span>
+      </div>
+      <p className="text-xs text-gray-600 mt-1 ml-12">
+        Products, models, pricing tiers, deployment and trust facts from deepgram.com/llms.txt. Ships with the app, so a
+        colleague gets Deepgram-aware cards with nothing to paste.
+      </p>
+      {text && (
+        <details className="mt-2 ml-12">
+          <summary className="cursor-pointer text-xs text-gray-500">View text</summary>
+          <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded bg-white border border-gray-200 p-2 text-xs text-gray-800">
+            {text}
+          </pre>
+        </details>
+      )}
+    </div>
+  );
+}
+
+/** The built-in Deepgram docs research server, on by default. */
+function BuiltinDocs({ on, onChange }: { on: boolean; onChange: (v: boolean) => void }) {
+  const [testing, setTesting] = useState(false);
+  const test = async () => {
+    setTesting(true);
+    try {
+      const tools = await invoke<McpToolInfo[]>('ai_assist_test_builtin_docs');
+      toast.success(`Deepgram docs: ${tools.map((t) => t.name).join(', ') || 'no tools'}`);
+    } catch (e) {
+      toast.error('Deepgram docs did not connect', { description: String(e) });
+    } finally {
+      setTesting(false);
+    }
+  };
+  return (
+    <div className="rounded border border-blue-200 bg-blue-50/40 p-3 mb-3" data-testid="builtin-docs">
+      <div className="flex items-center gap-3">
+        <Switch checked={on} aria-label="Use the built-in Deepgram docs" onCheckedChange={onChange} />
+        <span className="flex-1 text-sm font-medium text-gray-900">Deepgram docs (built in)</span>
+        <Button variant="outline" size="sm" onClick={test} disabled={testing}>
+          {testing ? 'Testing…' : 'Test'}
+        </Button>
+      </div>
+      <p className="text-xs text-gray-600 mt-1 ml-12">
+        Deepgram&apos;s hosted docs search (developers.deepgram.com), signed in with the Deepgram API key saved for
+        transcription. Lookups answer from the official docs.
+      </p>
+    </div>
   );
 }

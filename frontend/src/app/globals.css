@@ -217,6 +217,28 @@
     background-color: transparent;
   }
 
+  /* Under `color-scheme: dark`, WebKit paints a text field that has no
+     background class in its own neutral #1e1e1e with a dim placeholder,
+     which sits outside the remapped palette and is hard to read (WORK-559,
+     the live-assist Meeting brief). Default bare fields to the card surface
+     and palette ink. :where() keeps this at zero specificity so any bg-,
+     text- or placeholder: class on the field still wins. Light mode is
+     unchanged: the card surface there is white, the field's old colour. */
+  :where(textarea, select, input:not([type='checkbox'], [type='radio'], [type='range'], [type='color'], [type='file'])) {
+    background-color: rgb(var(--pal-s-white));
+  }
+
+  /* Tailwind's preflight colours placeholders with theme('colors.gray.400'),
+     and `colors` here is the SURFACE role, so in dark mode every placeholder
+     without a placeholder: class came out in a dim surface shade. Use the
+     ink role of the same shade: identical in light mode (#9ca3af), lightened
+     in dark. Same specificity as preflight's rule and declared after it, so
+     it wins; placeholder: utilities still win over both. */
+  textarea::placeholder,
+  input::placeholder {
+    color: rgb(var(--pal-i-gray-400));
+  }
+
   /* Disable scrolling on any BlockNote wrapper elements */
   [data-node-type] {
     overflow: visible !important;

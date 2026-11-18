@@ -5,6 +5,7 @@ import {
   briefEntry,
   contextChars,
   MAX_CONTEXT_CHARS,
+  overviewIncluded,
   deepHiveServer,
   formatPairs,
   joinCommand,
@@ -52,6 +53,11 @@ describe('AI Assist settings helpers', () => {
     expect(contextChars({ ...s, builtin: { ...s.builtin, deepgramOverview: false } }, 100)).toBe(8);
     // An overview that does not fit is left out.
     expect(contextChars(s, MAX_CONTEXT_CHARS)).toBe(8);
+    // The meeting brief counts, and can push the overview out.
+    expect(contextChars(s, 100, 50)).toBe(158);
+    expect(overviewIncluded(s, 100, 50)).toBe(true);
+    expect(overviewIncluded(s, 100, MAX_CONTEXT_CHARS - 100)).toBe(false);
+    expect(contextChars(s, 100, MAX_CONTEXT_CHARS - 100)).toBe(8 + MAX_CONTEXT_CHARS - 100);
   });
 
   test('the DeepHive preset is the stdio relay limited to search_knowledge', () => {

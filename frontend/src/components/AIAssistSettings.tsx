@@ -20,6 +20,7 @@ import {
   McpToolInfo,
   PromptPreview,
   contextChars,
+  overviewIncluded,
   deepHiveServer,
   formatPairs,
   joinCommand,
@@ -73,6 +74,9 @@ export function AIAssistSettings() {
   const [preview, setPreview] = useState<PromptPreview | null>(null);
   const [saving, setSaving] = useState(false);
   const [builtinText, setBuiltinText] = useState<string | null>(null);
+  // The saved meeting brief's length: the backend counts it against the
+  // context limit too (settings.rs `context_chars`).
+  const [briefChars, setBriefChars] = useState(0);
   // Bumped when the form is replaced wholesale (Discard), so editors that
   // keep their own text (command line, env/header pairs) start over from it.
   const [revision, setRevision] = useState(0);
@@ -95,6 +99,9 @@ export function AIAssistSettings() {
     invoke<string>('ai_assist_builtin_knowledge')
       .then(setBuiltinText)
       .catch(() => setBuiltinText(''));
+    invoke<string>('ai_assist_get_brief')
+      .then((b) => setBriefChars([...b].length))
+      .catch(() => setBriefChars(0));
   }, []);
 
   // The prompt as it would be with the unsaved form.
@@ -127,7 +134,9 @@ export function AIAssistSettings() {
     return <p className="text-sm text-gray-500 p-6">Loading…</p>;
   }
 
-  const chars = contextChars(form, builtinText ? [...builtinText].length : 0);
+  const builtinChars = builtinText ? [...builtinText].length : 0;
+  const chars = contextChars(form, builtinChars, briefChars);
+  const overviewIn = overviewIncluded(form, builtinChars, briefChars);
 
   return (
     <div className="space-y-6 mt-6 pb-24" data-testid="ai-assist-settings">
@@ -151,7 +160,14 @@ export function AIAssistSettings() {
         />
       </div>
 
-      <KnowledgeSection form={form} update={update} chars={chars} builtinText={builtinText} />
+      <KnowledgeSection
+        form={form}
+        update={update}
+        chars={chars}
+        briefChars={briefChars}
+        builtinText={builtinText}
+        overviewIn={overviewIn}
+      />
 
       <div className={section}>
         <h3 className={heading}>
@@ -338,8 +354,10 @@ function KnowledgeSection({
   form,
   update,
   chars,
+  briefChars,
   builtinText,
-}: SectionProps & { chars: number; builtinText: string | null }) {
+  overviewIn,
+}: SectionProps & { chars: number; briefChars: number; builtinText: string | null; overviewIn: boolean }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const [draftName, setDraftName] = useState('');
   const [draftText, setDraftText] = useState('');
@@ -384,6 +402,7 @@ function KnowledgeSection({
       <BuiltinOverview
         text={builtinText}
         on={form.builtin.deepgramOverview}
+        included={overviewIn}
         onChange={(v) => update({ builtin: { ...form.builtin, deepgramOverview: v } })}
       />
       {form.knowledge.length > 0 && (
@@ -458,7 +477,8 @@ function KnowledgeSection({
         </div>
       </div>
       <p className={`text-xs mt-2 ${over ? 'text-red-600' : 'text-gray-500'}`}>
-        Built-in overview, about me and enabled knowledge: {chars.toLocaleString()} / {MAX_CONTEXT_CHARS.toLocaleString()} characters
+        {briefChars > 0 ? 'Built-in overview, about me, enabled knowledge and the meeting brief' : 'Built-in overview, about me and enabled knowledge'}
+        : {chars.toLocaleString()} / {MAX_CONTEXT_CHARS.toLocaleString()} characters
         {over && ' — over the limit; turn some off to save'}
       </p>
     </div>
@@ -723,10 +743,12 @@ function McpServerEditor({
 function BuiltinOverview({
   text,
   on,
+  included,
   onChange,
 }: {
   text: string | null;
   on: boolean;
+  included: boolean;
   onChange: (v: boolean) => void;
 }) {
   return (
@@ -743,6 +765,12 @@ function BuiltinOverview({
         Pipecat and Daily are and do (their docs&apos; llms.txt). Ships with the app, so a colleague gets aware cards
         with nothing to paste.
       </p>
+      {on && text && !included && (
+        <p className="text-xs text-amber-700 mt-1 ml-12" data-testid="builtin-overview-left-out">
+          Left out for now: it does not fit with your own context and the meeting brief. Turn some knowledge off to bring
+          it back.
+        </p>
+      )}
       {text && (
         <details className="mt-2 ml-12">
           <summary className="cursor-pointer text-xs text-gray-500">View text</summary>

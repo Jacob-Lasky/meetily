@@ -80,17 +80,28 @@ export const DEFAULT_SETTINGS: AssistSettings = {
 /** Same as settings.rs BUILTIN_DOCS_NAME: user servers cannot take it. */
 export const BUILTIN_DOCS_NAME = 'Deepgram docs';
 
+function ownChars(s: AssistSettings): number {
+  return [...s.aboutMe].length + s.knowledge.filter((k) => k.enabled).reduce((n, k) => n + [...k.text].length, 0);
+}
+
+/**
+ * Whether the built-in overview goes into the prompt: on, and it fits with
+ * about me, enabled knowledge and the meeting brief (settings.rs
+ * `overview_included`; the backend leaves it out otherwise).
+ */
+export function overviewIncluded(s: AssistSettings, builtinChars: number, briefChars = 0): boolean {
+  return s.builtin.deepgramOverview && ownChars(s) + briefChars + builtinChars <= MAX_CONTEXT_CHARS;
+}
+
 /**
  * Characters of standing context the backend counts against
- * MAX_CONTEXT_CHARS (settings.rs `context_chars`, brief aside): about me and
- * enabled knowledge, plus the built-in overview (`builtinChars`, its length)
- * when it is on and fits; when it does not fit the backend leaves it out.
+ * MAX_CONTEXT_CHARS (settings.rs `context_chars`): about me, enabled
+ * knowledge, the meeting brief (`briefChars`) and the built-in overview
+ * (`builtinChars`, its length) when it is included.
  */
-export function contextChars(s: AssistSettings, builtinChars = 0): number {
-  const own =
-    [...s.aboutMe].length + s.knowledge.filter((k) => k.enabled).reduce((n, k) => n + [...k.text].length, 0);
-  const overview = s.builtin.deepgramOverview && own + builtinChars <= MAX_CONTEXT_CHARS ? builtinChars : 0;
-  return own + overview;
+export function contextChars(s: AssistSettings, builtinChars = 0, briefChars = 0): number {
+  const overview = overviewIncluded(s, builtinChars, briefChars) ? builtinChars : 0;
+  return ownChars(s) + briefChars + overview;
 }
 
 export function newId(prefix: string): string {

@@ -22,6 +22,7 @@ Pure asyncio around two injected pieces, so tests drive it with fakes:
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import re
 import time
@@ -229,11 +230,60 @@ def tool_name_for(tool: str, server: str, taken: set[str]) -> str:
 MAX_TOOL_RESULT_CHARS = 8000
 
 
+#: A string value in a JSON result is not cut below this many characters.
+_MIN_JSON_STRING_CHARS = 200
+
+
+def _clip_json(text: str) -> str | None:
+    """A JSON object or array result, shortened by cutting its longest string
+    values until it fits, so it stays valid JSON and keeps every field (an
+    answer after a long context field survives). None when the text is not
+    JSON, or when cutting strings cannot make it fit."""
+    stripped = text.lstrip()
+    if not stripped.startswith(("{", "[")):
+        return None
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return None
+
+    def strings(node: Any, out: list[tuple[Any, Any]]) -> None:
+        items = node.items() if isinstance(node, dict) else enumerate(node) if isinstance(node, list) else ()
+        for key, child in items:
+            if isinstance(child, str):
+                out.append((node, key))
+            else:
+                strings(child, out)
+
+    for _ in range(64):
+        dumped = json.dumps(value, ensure_ascii=False)
+        excess = len(dumped) - MAX_TOOL_RESULT_CHARS
+        if excess <= 0:
+            return dumped
+        found: list[tuple[Any, Any]] = []
+        strings(value, found)
+        if not found:
+            return None
+        node, key = max(found, key=lambda ref: len(ref[0][ref[1]]))
+        s = node[key]
+        marker_room = 40
+        keep = max(_MIN_JSON_STRING_CHARS, len(s) - excess - marker_room)
+        if keep >= len(s):
+            return None
+        node[key] = s[:keep] + f" [cut: {len(s) - keep} more characters]"
+    return None
+
+
 def clip_tool_result(text: str) -> str:
-    """Cut at the last line break before the limit (docs results are
-    line-oriented text) and say how much was left out."""
+    """Fit a tool result under MAX_TOOL_RESULT_CHARS and say what was left
+    out. A JSON result keeps its structure (`_clip_json`); other text is cut
+    at the last line break before the limit (docs results are line-oriented
+    markdown)."""
     if len(text) <= MAX_TOOL_RESULT_CHARS:
         return text
+    clipped = _clip_json(text)
+    if clipped is not None:
+        return clipped
     cut = text.rfind("\n", 0, MAX_TOOL_RESULT_CHARS)
     if cut < MAX_TOOL_RESULT_CHARS // 2:
         cut = MAX_TOOL_RESULT_CHARS

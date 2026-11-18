@@ -635,3 +635,20 @@ def test_a_cut_falls_on_a_line_break():
     kept, note = out.rsplit("\n[cut: ", 1)
     assert kept.endswith("line") and len(kept) <= MAX_TOOL_RESULT_CHARS
     assert note == f"{len(text) - len(kept)} more characters]"
+
+
+def test_a_json_result_stays_valid_and_keeps_every_field():
+    import json
+
+    from meetily_sidecar.research import MAX_TOOL_RESULT_CHARS, clip_tool_result
+
+    text = json.dumps({"context": "c" * 5000, "results": [{"body": "b" * 4000, "answer": "Flux is 260 ms"}]})
+    assert len(text) > MAX_TOOL_RESULT_CHARS
+    out = clip_tool_result(text)
+    assert len(out) <= MAX_TOOL_RESULT_CHARS
+    parsed = json.loads(out)
+    assert parsed["results"][0]["answer"] == "Flux is 260 ms"
+    assert "[cut: " in parsed["context"]
+    # Many short strings that cannot be cut fall back to the plain cut.
+    many = json.dumps(["s" * 150] * 100)
+    assert clip_tool_result(many).rsplit("\n[cut: ", 1)[1].endswith("more characters]")

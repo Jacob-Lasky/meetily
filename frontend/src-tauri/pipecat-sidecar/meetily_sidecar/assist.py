@@ -19,6 +19,10 @@ bleed suppression, keyed by Rust's sequence ids, so a retracted Mic-In line
 also leaves the prompt. The turn that triggered the call is appended when Rust
 has not sent its line yet (it is still on its way, or only predicted).
 
+Each call also carries the docs excerpts that best match the turn (the local
+docs index, `docs_kb`: Deepgram, Pipecat and Daily developer docs, searched in
+milliseconds), so a card can answer from the docs without waiting for a lookup.
+
 A card reply may also ask for a lookup (`"research": "..."`, only offered
 when the research lane is on): the question goes to `Research`, which answers
 it with MCP tools as a later card (WORK-581). The card call itself never
@@ -38,6 +42,7 @@ from typing import Awaitable, Callable
 
 from loguru import logger
 
+from .docs_kb import DocsKB, excerpts_block, tokens
 from .prompt import ParseError, normalize, parse_cards, parse_research, user_prompt
 from .research import Research
 
@@ -139,6 +144,8 @@ class Assist:
         self._waiting_turn: tuple[str, float] | None = None
         self._next_call_id = 0
         self.calls_started = 0
+        # The local docs index (Rust's config turns it on); None: no excerpts.
+        self.docs: DocsKB | None = None
 
     # ---- configuration (from Rust over /control) --------------------------
 
@@ -247,7 +254,21 @@ class Assist:
         # the prompt then lacks only an adjacent repeat of the same words.
         if not lines or lines[-1][0] != "them" or normalize(lines[-1][1]) != normalize(turn_text):
             lines.append(("them", turn_text))
-        return user_prompt(lines, self._shown)
+        return user_prompt(lines, self._shown) + self._excerpts(lines, turn_text)
+
+    def _excerpts(self, lines: list[tuple[str, str]], turn_text: str) -> str:
+        """Docs excerpts for this turn. The query is the turn; a short turn
+        ("And on-prem?") borrows the line before it for its subject. Logs
+        counts and timing only: the query is what was said in the meeting."""
+        if self.docs is None:
+            return ""
+        query = turn_text
+        if len(set(tokens(turn_text))) < 4 and len(lines) >= 2:
+            query = f"{lines[-2][1]} {turn_text}"
+        hits, ms = self.docs.search(query)
+        if self.docs.index is not None:
+            logger.info(f"docs kb: {len(hits)} excerpt(s) for this call, searched in {ms:.1f} ms")
+        return excerpts_block(hits)
 
     def _start(self, text: str, trigger: str, end_of_turn_at: float | None = None):
         self._next_call_id += 1
@@ -345,3 +366,5 @@ class Assist:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         await self.research.close()
+        if self.docs is not None:
+            await self.docs.close()

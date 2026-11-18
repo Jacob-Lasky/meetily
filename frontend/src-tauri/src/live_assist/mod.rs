@@ -62,6 +62,8 @@ const SETTINGS_STORE: &str = "live_assist.json";
 const ENABLED_KEY: &str = "enabled";
 /// Pinned cards, in the meeting folder.
 pub const PINS_FILE: &str = "live-assist.json";
+/// The local docs index's download cache, in the app data folder.
+const DOCS_KB_DIR: &str = "docs-kb";
 
 /// Whole-call limit. A slower answer is stale by the time it lands.
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
@@ -546,7 +548,28 @@ async fn sidecar_config<R: Runtime>(app: &AppHandle<R>, enabled: bool) -> serde_
         Ok(llm) => config["llm"] = llm,
         Err(e) => config["llm_error"] = serde_json::Value::String(e),
     }
+    if let Ok(dir) = app.path().app_data_dir() {
+        config["docs_kb"] = docs_kb_config(&settings, &dir);
+    }
     config
+}
+
+/// The sidecar's local docs index (`meetily_sidecar/docs_kb.py`, WORK-559):
+/// where it caches the downloaded docs, and which docs. The built-in docs
+/// switches in Settings › AI Assist choose the sources, as they do for the
+/// research lane; no sources turns the index off.
+fn docs_kb_config(settings: &AssistSettings, app_data_dir: &Path) -> serde_json::Value {
+    let mut sources = Vec::new();
+    if settings.builtin.deepgram_docs {
+        sources.push("deepgram");
+    }
+    if settings.builtin.pipecat_daily_docs {
+        sources.extend(["pipecat", "daily"]);
+    }
+    serde_json::json!({
+        "cache_dir": app_data_dir.join(DOCS_KB_DIR),
+        "sources": sources,
+    })
 }
 
 async fn run<R: Runtime>(
@@ -1760,6 +1783,19 @@ mod tests {
         assert!(rx.try_recv().is_err(), "nothing goes to a detached sidecar");
         // No session and a stale generation: dropped without a panic.
         on_sidecar_message(generation, r#"{"type":"assist_started","call_id":1,"trigger":"final"}"#);
+    }
+
+    #[test]
+    fn docs_kb_sources_follow_the_builtin_docs_switches() {
+        let dir = Path::new("/data/com.meetily.ai");
+        let mut settings = AssistSettings::default();
+        let all = docs_kb_config(&settings, dir);
+        assert_eq!(all["sources"], serde_json::json!(["deepgram", "pipecat", "daily"]));
+        assert_eq!(all["cache_dir"], serde_json::json!("/data/com.meetily.ai/docs-kb"));
+        settings.builtin.deepgram_docs = false;
+        assert_eq!(docs_kb_config(&settings, dir)["sources"], serde_json::json!(["pipecat", "daily"]));
+        settings.builtin.pipecat_daily_docs = false;
+        assert_eq!(docs_kb_config(&settings, dir)["sources"], serde_json::json!([]), "both off: no index");
     }
 
     #[test]

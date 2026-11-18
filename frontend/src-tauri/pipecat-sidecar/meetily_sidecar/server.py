@@ -243,6 +243,7 @@ def handle_control(assist: Assist, msg: dict[str, Any]):
             limits=limits,
         )
         _configure_research(assist, msg.get("research"), llm if infer is not None else None)
+        _configure_docs(assist, msg.get("docs_kb"))
     elif kind == "assist_enabled":
         assist.set_enabled(bool(msg.get("enabled")))
     elif kind == "line":
@@ -251,6 +252,30 @@ def handle_control(assist: Assist, msg: dict[str, Any]):
         assist.retract(int(msg["seq"]))
     elif kind == "shown":
         assist.set_shown(list(msg.get("texts") or []))
+
+
+def _configure_docs(assist: Assist, raw: Any):
+    """Set up (or turn off) the local docs index from the config's `docs_kb`
+    part: `{"cache_dir": str, "sources": ["deepgram", "pipecat", "daily"]}`.
+    The loaded index is kept while the folder and sources stay the same."""
+    from pathlib import Path
+
+    from .docs_kb import SOURCES, DocsKB
+
+    if not isinstance(raw, dict) or not raw.get("cache_dir"):
+        sources: tuple[str, ...] = ()
+        cache_dir = None
+    else:
+        sources = tuple(s for s in (raw.get("sources") or []) if s in SOURCES)
+        cache_dir = Path(str(raw["cache_dir"]))
+    current = assist.docs
+    if current is not None and current.cache_dir == cache_dir and current.sources == sources:
+        return
+    if current is not None:
+        asyncio.get_running_loop().create_task(current.close())
+    assist.docs = DocsKB(cache_dir, sources) if cache_dir is not None and sources else None
+    if assist.docs is not None:
+        assist.docs.ensure()
 
 
 def _configure_research(assist: Assist, raw: Any, llm: dict | None):

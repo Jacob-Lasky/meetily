@@ -806,12 +806,12 @@ const BUILTIN_DOCS = {
   deepgram: {
     title: 'Deepgram docs (built in)',
     command: 'ai_assist_test_builtin_docs',
-    help: "Deepgram's hosted docs search (developers.deepgram.com), signed in with the Deepgram API key saved for transcription. Lookups answer from the official docs.",
+    help: "All of developers.deepgram.com, downloaded once (refreshed weekly) and searched on every card, so cards answer from the docs in their normal second or two. Also Deepgram's hosted docs search for slower lookups, signed in with the Deepgram API key saved for transcription. Pipecat live engine.",
   },
   pipecatDaily: {
     title: 'Pipecat and Daily docs (built in)',
     command: 'ai_assist_test_builtin_pipecat_daily',
-    help: "Pipecat's and Daily's public docs search (docs.pipecat.ai, docs.daily.co). No sign-in; search only.",
+    help: "All of docs.pipecat.ai and docs.daily.co, downloaded once (refreshed weekly) and searched on every card, plus their public docs search for slower lookups. No sign-in. Pipecat live engine.",
   },
 } as const;
 

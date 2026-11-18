@@ -465,6 +465,9 @@ fn nova_interim(m: &RealtimeMessage) -> Option<(Option<(usize, usize)>, String, 
 /// through the last interim (an interim over 0-4.3 s, then a final over
 /// 0-3.3 s), and the rest is still being heard: keep it greyed instead of
 /// blanking it until the next interim. Times are stream seconds.
+///
+/// Limit: a word is kept when its midpoint is at or after the final's end,
+/// and dropped otherwise, judged on the interim's timing alone.
 fn interim_after(words: &[DeepgramWord], final_end_s: f64) -> Vec<DeepgramWord> {
     // By midpoint: interim and final word boundaries can differ by a few ms,
     // and a word the final already holds ends by its end.
@@ -1275,6 +1278,12 @@ pub(crate) enum RealtimeOutput {
 /// match on, so this compares words against what Speaker-Out said in the last
 /// INTERIM_BLEED_WINDOW_MS. Display only: a wrong guess just hides a grey
 /// line until its final, which still goes through `BleedSuppressor`.
+///
+/// Limit: each Speaker-Out text (interim or final) stamps the current time on
+/// every word after its common prefix with the previous Speaker-Out text,
+/// compared as `word_list` words (lowercased, punctuation dropped), including
+/// words already seen. Mic-In grey lines are judged against those
+/// stamps for INTERIM_BLEED_WINDOW_MS.
 #[derive(Default)]
 struct InterimBleedFilter {
     /// Each far-side word and when it was last newly said.

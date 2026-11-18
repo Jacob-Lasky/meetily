@@ -1,6 +1,7 @@
 'use client';
 
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, ReactNode, MutableRefObject } from 'react';
+import { useScrollFollow } from '@/hooks/useScrollFollow';
 import { Transcript, TranscriptUpdate } from '@/types';
 import { toast } from 'sonner';
 import { useRecordingState } from './RecordingStateContext';
@@ -16,7 +17,8 @@ interface TranscriptContextType {
   addTranscript: (update: TranscriptUpdate) => void;
   copyTranscript: () => void;
   flushBuffer: () => void;
-  transcriptContainerRef: React.RefObject<HTMLDivElement>;
+  /** Callback ref for the live transcript panel's scroll element. */
+  transcriptContainerRef: (el: HTMLDivElement | null) => void;
   /** Scroll the transcript to the bottom if the user was following it (live line growth). */
   followBottom: () => void;
   meetingTitle: string;
@@ -40,8 +42,12 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   const transcriptsRef = useRef<Transcript[]>(transcripts);
   // Sequence ids retracted this session, so a reload sync cannot bring one back.
   const retractedIdsRef = useRef<Set<number>>(new Set());
-  const isUserAtBottomRef = useRef<boolean>(true);
-  const transcriptContainerRef = useRef<HTMLDivElement>(null);
+  const {
+    containerRef: scrollContainerRef,
+    setContainer: transcriptContainerRef,
+    isUserAtBottomRef,
+    followBottom,
+  } = useScrollFollow();
   const finalFlushRef = useRef<(() => void) | null>(null);
 
   // Keep ref updated with current transcripts
@@ -49,50 +55,14 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     transcriptsRef.current = transcripts;
   }, [transcripts]);
 
-  // Smart auto-scroll: Track user scroll position
+  // Auto-scroll when transcripts change (only if user is at bottom).
+  // Wait for the Framer Motion entry (150 ms) so scrollHeight includes the
+  // new row. DO NOT make this a smooth scroll: its intermediate scroll
+  // events read as "not at bottom" and, if the live line grows meanwhile,
+  // the animation stops short and following turns off (WORK-580).
   useEffect(() => {
-    const handleScroll = () => {
-      const container = transcriptContainerRef.current;
-      if (!container) return;
-
-      const { scrollTop, scrollHeight, clientHeight } = container;
-      const isAtBottom = scrollTop + clientHeight >= scrollHeight - 10; // 10px tolerance
-      isUserAtBottomRef.current = isAtBottom;
-    };
-
-    const container = transcriptContainerRef.current;
-    if (container) {
-      container.addEventListener('scroll', handleScroll);
-      return () => container.removeEventListener('scroll', handleScroll);
-    }
-  }, []);
-
-  // Content below the rows (the greyed live line) grew: keep up with it
-  // only if the user was at the bottom before it did. Growth fires no
-  // scroll event, so isUserAtBottomRef still holds the pre-update answer.
-  const followBottom = useCallback(() => {
-    const container = transcriptContainerRef.current;
-    if (isUserAtBottomRef.current && container) {
-      container.scrollTop = container.scrollHeight;
-    }
-  }, []);
-
-  // Auto-scroll when transcripts change (only if user is at bottom)
-  useEffect(() => {
-    // Only auto-scroll if user was at the bottom before new content
-    if (isUserAtBottomRef.current && transcriptContainerRef.current) {
-      // Wait for Framer Motion animation to complete (150ms) before scrolling
-      // This ensures scrollHeight includes the full rendered height of the new transcript
-      const scrollTimeout = setTimeout(() => {
-        const container = transcriptContainerRef.current;
-        if (container) {
-          container.scrollTo({
-            top: container.scrollHeight,
-            behavior: 'smooth'
-          });
-        }
-      }, 150); // Match Framer Motion transition duration
-
+    if (isUserAtBottomRef.current && scrollContainerRef.current) {
+      const scrollTimeout = setTimeout(followBottom, 150);
       return () => clearTimeout(scrollTimeout);
     }
   }, [transcripts]);

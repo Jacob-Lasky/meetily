@@ -6,6 +6,10 @@ import { applyInterim, type InterimLine } from '@/lib/transcript-interim';
  * How long a channel's update waits for the final it may follow to render
  * (that buffer is 10 ms). Deepgram sends a channel's updates 200+ ms
  * apart, so the delay never holds a channel's line back by more than this.
+ *
+ * Limit: each channel's newest update replaces its pending timer and is
+ * scheduled with an UPDATE_DELAY_MS timeout (cancelled on pause, stop or
+ * unmount); nothing here waits for a final to render.
  */
 const UPDATE_DELAY_MS = 30;
 

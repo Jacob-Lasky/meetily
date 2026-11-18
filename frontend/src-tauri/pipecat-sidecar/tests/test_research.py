@@ -685,3 +685,15 @@ def test_many_short_strings_are_shortened_rather_than_losing_the_structure():
     assert len(out) <= MAX_TOOL_RESULT_CHARS
     parsed = json.loads(out)
     assert len(parsed["results"]) == 300 and parsed["answer"].startswith("F")
+
+
+def test_room_left_by_the_cap_goes_to_the_shortest_cut_strings():
+    import json
+
+    from meetily_sidecar.research import MAX_TOOL_RESULT_CHARS, clip_tool_result
+
+    rows = {"results": [{"body": "b" * 30} for _ in range(499)], "answer": "Flux"}
+    out = clip_tool_result(json.dumps(rows))
+    assert len(out) <= MAX_TOOL_RESULT_CHARS
+    parsed = json.loads(out)
+    assert parsed["answer"] == "Flux" and len(parsed["results"]) == 499

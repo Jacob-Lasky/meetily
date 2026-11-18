@@ -260,10 +260,50 @@ def _cut_strings(node: Any, cap: int, cut: Callable[[str, int], str]) -> Any:
     return node
 
 
+def _string_paths(node: Any) -> list[tuple[tuple[Any, ...], str]]:
+    """Every string in a JSON value with the path of keys and indexes to it."""
+    found: list[tuple[tuple[Any, ...], str]] = []
+    stack: list[tuple[Any, tuple[Any, ...]]] = [(node, ())]
+    while stack:
+        item, path = stack.pop()
+        if isinstance(item, str):
+            found.append((path, item))
+        elif isinstance(item, dict):
+            stack.extend((v, path + (k,)) for k, v in item.items())
+        elif isinstance(item, list):
+            stack.extend((v, path + (i,)) for i, v in enumerate(item))
+    return found
+
+
+def _restore_whole(original: Any, cut: Any, room: int) -> Any:
+    """`cut` with cut strings put back whole, shortest first, while they fit in
+    `room` more characters: a uniform cap leaves up to a cap step unused, and a
+    short field such as an answer should get it before a long one."""
+    def at(node: Any, path: tuple[Any, ...]) -> Any:
+        for key in path:
+            node = node[key]
+        return node
+
+    def size(s: str) -> int:
+        return len(json.dumps(s, ensure_ascii=False))
+
+    shortened = [(path, s) for path, s in _string_paths(original) if at(cut, path) != s]
+    for path, whole in sorted(shortened, key=lambda ps: len(ps[1])):
+        if not path:
+            return cut
+        parent = at(cut, path[:-1])
+        grow = size(whole) - size(parent[path[-1]])
+        if grow <= room:
+            parent[path[-1]] = whole
+            room -= grow
+    return cut
+
+
 def _clip_json(text: str) -> str | None:
     """A JSON result, shortened so it stays valid JSON and keeps every field
     (an answer after a long context field survives): every string longer than
-    one shared cap is cut to it, the largest cap that fits found by bisection.
+    one shared cap is cut to it, the largest cap that fits found by bisection,
+    then the room left is spent putting the shortest cut strings back whole.
     Counted markers first; when even a zero cap does not fit that way, a bare
     ellipsis. None when the text is not JSON, is nested too deep to walk, or
     does not fit even with every string cut to nothing (then the plain cut
@@ -277,18 +317,18 @@ def _clip_json(text: str) -> str | None:
             def dumped(cap: int) -> str:
                 return json.dumps(_cut_strings(value, cap, cut), ensure_ascii=False)
 
-            best = dumped(0)
-            if len(best) > MAX_TOOL_RESULT_CHARS:
+            if len(dumped(0)) > MAX_TOOL_RESULT_CHARS:
                 continue
             low, high = 0, MAX_TOOL_RESULT_CHARS
             while low < high:
                 mid = (low + high + 1) // 2
-                out = dumped(mid)
-                if len(out) <= MAX_TOOL_RESULT_CHARS:
-                    low, best = mid, out
+                if len(dumped(mid)) <= MAX_TOOL_RESULT_CHARS:
+                    low = mid
                 else:
                     high = mid - 1
-            return best
+            best = _cut_strings(value, low, cut)
+            room = MAX_TOOL_RESULT_CHARS - len(json.dumps(best, ensure_ascii=False))
+            return json.dumps(_restore_whole(value, best, room), ensure_ascii=False)
         return None
     except (ValueError, RecursionError):
         return None

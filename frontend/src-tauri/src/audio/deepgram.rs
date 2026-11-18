@@ -277,6 +277,8 @@ struct TimedWord {
     /// a line at word boundaries and rebuilds its text from these.
     src: usize,
     word: String,
+    /// The source word's confidence, when Deepgram gave one.
+    confidence: Option<f32>,
 }
 
 fn timed_words(words: &[DeepgramWord]) -> Vec<TimedWord> {
@@ -291,6 +293,7 @@ fn timed_words(words: &[DeepgramWord]) -> Vec<TimedWord> {
                 end_ms: (w.end * 1000.0).max(w.start * 1000.0),
                 src,
                 word: word.clone(),
+                confidence: w.confidence,
             })
         })
         .collect()
@@ -1079,33 +1082,64 @@ fn trim_bleed(mic: &LabeledSegment, speakers: &[&LabeledSegment]) -> Option<Labe
 }
 
 /// `seg` cut down to the words `keep` selects, its text rebuilt from those
-/// words as displayed and its time from their span. None when no word is
-/// kept. Diarized runs are clipped the same way: each keeps the kept words
-/// that start inside it (its text rebuilt from them, its start moved to the
-/// first), and a run left with none is dropped. `TimedWord` has no speaker,
-/// so the runs' own times are what assigns words to them.
+/// words as displayed, its time from their span and its confidence from
+/// theirs. None when no word is kept. Diarized runs are clipped the same way:
+/// each kept word belongs to exactly one run, the last run starting at or
+/// before it (Deepgram's runs touch: one ends where the next begins, so an
+/// "inside the run" test gave a boundary word to both), or the first run if
+/// it starts before them all. Each run's text, start and confidence come
+/// from its own kept words, and a run left with none is dropped.
+/// `TimedWord` has no speaker, so the runs' times are what assigns words.
 fn with_words(seg: &LabeledSegment, keep: impl Fn(&TimedWord) -> bool) -> Option<LabeledSegment> {
     let words: Vec<TimedWord> = seg.words.iter().filter(|w| keep(w)).cloned().collect();
     let (first, last) = (words.first()?, words.last()?);
+    let run_of = |w: &TimedWord| seg.turns.iter().rposition(|t| t.start_ms <= w.start_ms).unwrap_or(0);
     let turns = seg
         .turns
         .iter()
-        .filter_map(|t| {
-            let inside: Vec<&TimedWord> =
-                words.iter().filter(|w| w.start_ms >= t.start_ms && w.start_ms <= t.end_ms).collect();
+        .enumerate()
+        .filter_map(|(i, t)| {
+            let inside: Vec<&TimedWord> = words.iter().filter(|w| run_of(w) == i).collect();
             let first = inside.first()?;
-            Some(SpeakerTurn { text: words_text(inside.iter().copied()), start_ms: first.start_ms, ..t.clone() })
+            Some(SpeakerTurn {
+                text: words_text(inside.iter().copied()),
+                start_ms: first.start_ms,
+                confidence: kept_confidence(inside.iter().copied(), t.confidence),
+                ..t.clone()
+            })
         })
         .collect();
     Some(LabeledSegment {
         text: words_text(words.iter()),
         start_ms: first.start_ms,
         end_ms: last.end_ms,
-        confidence: seg.confidence,
+        confidence: kept_confidence(words.iter(), seg.confidence),
         speaker: seg.speaker,
         turns,
         words,
     })
+}
+
+/// Mean confidence of the source words behind `words` (each counted once),
+/// or `fallback` when none carries one.
+fn kept_confidence<'a>(words: impl Iterator<Item = &'a TimedWord>, fallback: f32) -> f32 {
+    let mut prev = None;
+    let (mut sum, mut n) = (0.0f32, 0u32);
+    for w in words {
+        if prev == Some(w.src) {
+            continue;
+        }
+        prev = Some(w.src);
+        if let Some(c) = w.confidence {
+            sum += c;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        fallback
+    } else {
+        sum / n as f32
+    }
 }
 
 /// The displayed words behind `words`, once per source word.
@@ -2651,6 +2685,37 @@ mod tests {
         assert_eq!(rows, vec![Some("Speaker-Out 1".to_string()), Some("Speaker-Out 2".to_string())]);
     }
 
+    /// Cycle 2 round 1: Deepgram's diarized runs touch (one ends where the
+    /// next begins), so a word on the boundary must go to one run only, and
+    /// a clipped run reports the confidence of the words it still holds.
+    #[test]
+    fn a_word_on_a_run_boundary_goes_to_one_run_and_confidence_follows_the_words() {
+        let skip = ShownUntil { speaker_out_ms: 500.0, ..ShownUntil::default() };
+        let mut line = timed_seg("old kept new", 0.0, 1_500.0, SPEAKER_OUT_LABEL);
+        // Words start at 0, 500, 1000 ms; runs touch at 1000 ms.
+        for (w, c) in line.words.iter_mut().zip([0.1, 0.9, 0.7]) {
+            w.confidence = Some(c);
+        }
+        let turn = |text: &str, start_ms: f64, end_ms: f64, speaker: i64| SpeakerTurn {
+            text: text.into(),
+            start_ms,
+            end_ms,
+            confidence: 0.5,
+            speaker,
+        };
+        line.turns = vec![turn("old kept", 0.0, 1_000.0, 0), turn("new", 1_000.0, 1_500.0, 1)];
+        // Cut at 500 + jitter: "kept" (starts at 500) is not after it, so only
+        // "new" (1000) stays, on the boundary of both runs.
+        let kept = skip.unshown(line.clone()).unwrap();
+        let runs: Vec<(String, i64)> = kept.turns.iter().map(|t| (t.text.clone(), t.speaker)).collect();
+        assert_eq!(runs, vec![("new".to_string(), 1)], "the boundary word is in run 1 only");
+        // Keep "kept" and "new": run 0 is clipped to "kept" with its confidence.
+        let both = with_words(&line, |w| w.start_ms >= 500.0).unwrap();
+        let runs: Vec<(String, f32)> = both.turns.iter().map(|t| (t.text.clone(), t.confidence)).collect();
+        assert_eq!(runs, vec![("kept".to_string(), 0.9), ("new".to_string(), 0.7)]);
+        assert!((both.confidence - 0.8).abs() < 1e-6, "line confidence from its kept words: {}", both.confidence);
+    }
+
     #[test]
     fn a_flux_turn_is_timed_by_its_words_not_its_window() {
         let m: FluxTurnInfo = serde_json::from_value(serde_json::json!({
@@ -3294,6 +3359,7 @@ mod tests {
                 start_ms: start_ms + i as f64 * step,
                 end_ms: start_ms + (i + 1) as f64 * step,
                 src: i,
+                confidence: None,
             })
             .collect()
     }
@@ -3428,6 +3494,7 @@ mod tests {
             end_ms: start_ms + 200.0,
             src,
             word: word.into(),
+            confidence: None,
         };
         let keep = LabeledSegment {
             text: "SOC-2 absolutely".into(),

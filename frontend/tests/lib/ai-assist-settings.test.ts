@@ -4,6 +4,7 @@ import {
   DEFAULT_SETTINGS,
   briefEntry,
   contextChars,
+  MAX_CONTEXT_CHARS,
   deepHiveServer,
   formatPairs,
   joinCommand,
@@ -49,6 +50,8 @@ describe('AI Assist settings helpers', () => {
     expect(contextChars(s)).toBe(8);
     expect(contextChars(s, 100)).toBe(108);
     expect(contextChars({ ...s, builtin: { ...s.builtin, deepgramOverview: false } }, 100)).toBe(8);
+    // An overview that does not fit is left out.
+    expect(contextChars(s, MAX_CONTEXT_CHARS)).toBe(8);
   });
 
   test('the DeepHive preset is the stdio relay limited to search_knowledge', () => {

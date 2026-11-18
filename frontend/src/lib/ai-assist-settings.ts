@@ -82,15 +82,15 @@ export const BUILTIN_DOCS_NAME = 'Deepgram docs';
 
 /**
  * Characters of standing context the backend counts against
- * MAX_CONTEXT_CHARS (settings.rs `context_chars`): the built-in overview when
- * it is on (`builtinChars`, its length), about me and enabled knowledge.
+ * MAX_CONTEXT_CHARS (settings.rs `context_chars`, brief aside): about me and
+ * enabled knowledge, plus the built-in overview (`builtinChars`, its length)
+ * when it is on and fits; when it does not fit the backend leaves it out.
  */
 export function contextChars(s: AssistSettings, builtinChars = 0): number {
-  return (
-    (s.builtin.deepgramOverview ? builtinChars : 0) +
-    [...s.aboutMe].length +
-    s.knowledge.filter((k) => k.enabled).reduce((n, k) => n + [...k.text].length, 0)
-  );
+  const own =
+    [...s.aboutMe].length + s.knowledge.filter((k) => k.enabled).reduce((n, k) => n + [...k.text].length, 0);
+  const overview = s.builtin.deepgramOverview && own + builtinChars <= MAX_CONTEXT_CHARS ? builtinChars : 0;
+  return own + overview;
 }
 
 export function newId(prefix: string): string {

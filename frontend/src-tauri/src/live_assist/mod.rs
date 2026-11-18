@@ -405,7 +405,7 @@ fn research_wanted(settings: &AssistSettings) -> bool {
 }
 
 fn prompt_parts<'a>(settings: &'a AssistSettings, brief: &'a str, research: bool) -> PromptParts<'a> {
-    let builtin = settings.overview_included().then_some((DEEPGRAM_PUBLIC_NAME, DEEPGRAM_PUBLIC));
+    let builtin = settings.overview_included(brief.chars().count()).then_some((DEEPGRAM_PUBLIC_NAME, DEEPGRAM_PUBLIC));
     PromptParts {
         kinds: settings.card_kinds.enabled(),
         instructions: &settings.instructions,
@@ -1030,7 +1030,7 @@ pub fn load_brief<R: Runtime>(app: &AppHandle<R>) -> String {
 
 pub fn set_brief<R: Runtime>(app: &AppHandle<R>, brief: &str) -> Result<(), String> {
     let _guard = CONTEXT_SAVE.lock().unwrap();
-    let total = brief.chars().count() + load_settings(app).context_chars();
+    let total = load_settings(app).context_chars(brief.chars().count());
     if total > settings::MAX_CONTEXT_CHARS {
         return Err(format!(
             "about me, the enabled knowledge and the meeting brief come to {total} characters; the limit is {}",
@@ -1359,7 +1359,11 @@ pub async fn ai_assist_test_builtin_pipecat_daily() -> Result<Vec<mcp_probe::Too
         let tools = mcp_probe::list_tools(&server).await.map_err(|e| format!("{}: {e}", server.name))?;
         let wanted = &server.allowed_tools[0];
         if !tools.iter().any(|t| &t.name == wanted) {
-            return Err(format!("{} does not list {wanted}, the tool lookups use", server.name));
+            return Err(format!(
+                "{} connected but does not list {wanted}, the tool lookups use (it lists {})",
+                server.name,
+                if tools.is_empty() { "no tools".to_string() } else { tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ") }
+            ));
         }
         found.extend(tools.into_iter().filter(|t| &t.name == wanted).map(|t| mcp_probe::ToolInfo {
             name: format!("{}: {}", server.name, t.name),

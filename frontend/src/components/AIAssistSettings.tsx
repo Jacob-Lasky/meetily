@@ -786,7 +786,7 @@ function BuiltinDocs({
       const tools = await invoke<McpToolInfo[]>(docs.command);
       toast.success(`${docs.title}: ${tools.map((t) => t.name).join(', ') || 'no tools'}`);
     } catch (e) {
-      toast.error(`${docs.title} did not connect`, { description: String(e) });
+      toast.error(`${docs.title}: test failed`, { description: String(e) });
     } finally {
       setTesting(false);
     }

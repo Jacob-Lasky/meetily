@@ -230,9 +230,14 @@ MAX_TOOL_RESULT_CHARS = 8000
 
 
 def clip_tool_result(text: str) -> str:
+    """Cut at the last line break before the limit (docs results are
+    line-oriented text) and say how much was left out."""
     if len(text) <= MAX_TOOL_RESULT_CHARS:
         return text
-    return text[:MAX_TOOL_RESULT_CHARS] + f"\n[cut: {len(text) - MAX_TOOL_RESULT_CHARS} more characters]"
+    cut = text.rfind("\n", 0, MAX_TOOL_RESULT_CHARS)
+    if cut < MAX_TOOL_RESULT_CHARS // 2:
+        cut = MAX_TOOL_RESULT_CHARS
+    return text[:cut] + f"\n[cut: {len(text) - cut} more characters]"
 
 
 #: The most session end spends on MCP connections. Rust gives the sidecar

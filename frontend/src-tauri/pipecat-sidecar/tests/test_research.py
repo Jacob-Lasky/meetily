@@ -625,3 +625,13 @@ async def test_long_tool_results_are_cut_before_the_model_sees_them():
     r.ask("q?", "t")
     await settle()
     assert len(seen[0]) < MAX_TOOL_RESULT_CHARS + 100 and seen[0].endswith("[cut: 500 more characters]")
+
+
+def test_a_cut_falls_on_a_line_break():
+    from meetily_sidecar.research import MAX_TOOL_RESULT_CHARS, clip_tool_result
+
+    text = ("line\n" * (MAX_TOOL_RESULT_CHARS // 5 + 100))
+    out = clip_tool_result(text)
+    kept, note = out.rsplit("\n[cut: ", 1)
+    assert kept.endswith("line") and len(kept) <= MAX_TOOL_RESULT_CHARS
+    assert note == f"{len(text) - len(kept)} more characters]"

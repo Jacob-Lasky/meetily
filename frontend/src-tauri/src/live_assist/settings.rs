@@ -207,16 +207,22 @@ impl AssistSettings {
     /// under the context limit next to about me and the enabled knowledge
     /// (settings saved before it existed may already fill the limit; then
     /// it is left out rather than going over).
-    pub fn overview_included(&self) -> bool {
+    ///
+    /// `brief_chars` is the meeting brief's length, which shares the limit.
+    pub fn overview_included(&self, brief_chars: usize) -> bool {
         self.builtin.deepgram_overview
-            && self.own_context_chars() + DEEPGRAM_PUBLIC.chars().count() <= MAX_CONTEXT_CHARS
+            && self.own_context_chars() + brief_chars + DEEPGRAM_PUBLIC.chars().count() <= MAX_CONTEXT_CHARS
     }
 
-    /// About me + enabled knowledge, plus the built-in overview when it is
-    /// on, in characters (what `validate` holds to MAX_CONTEXT_CHARS).
-    pub fn context_chars(&self) -> usize {
-        let builtin = if self.builtin.deepgram_overview { DEEPGRAM_PUBLIC.chars().count() } else { 0 };
-        builtin + self.own_context_chars()
+    /// About me + enabled knowledge, plus the built-in overview when it
+    /// goes into the prompt (`overview_included`), in characters: what
+    /// `validate` holds to MAX_CONTEXT_CHARS. The overview never makes a save
+    /// fail: when it does not fit, it is left out instead.
+    ///
+    /// `brief_chars` (the meeting brief) is included in the total.
+    pub fn context_chars(&self, brief_chars: usize) -> usize {
+        let builtin = if self.overview_included(brief_chars) { DEEPGRAM_PUBLIC.chars().count() } else { 0 };
+        builtin + self.own_context_chars() + brief_chars
     }
 
     /// Settings read from the store. An object saved before the built-ins
@@ -227,9 +233,16 @@ impl AssistSettings {
     /// lookups to them.
     pub fn from_stored(value: serde_json::Value) -> Result<Self, serde_json::Error> {
         let had_builtin = value.get("builtin").is_some();
+        // Saved before the Pipecat and Daily docs existed: follow the choice
+        // made for the other built-in public docs (Deepgram's), so a setup
+        // that turned built-in docs off does not gain new public servers.
+        let had_pipecat_daily = value.pointer("/builtin/pipecatDailyDocs").is_some();
         let mut settings: Self = serde_json::from_value(value)?;
         if !had_builtin && settings.research.servers.is_empty() {
             settings.research.enabled = true;
+        }
+        if had_builtin && !had_pipecat_daily {
+            settings.builtin.pipecat_daily_docs = settings.builtin.deepgram_docs;
         }
         Ok(settings)
     }
@@ -253,7 +266,7 @@ impl AssistSettings {
         if self.instructions.chars().count() > MAX_INSTRUCTIONS_CHARS {
             return Err(format!("instructions are limited to {MAX_INSTRUCTIONS_CHARS} characters"));
         }
-        let context = self.context_chars() + brief_chars;
+        let context = self.context_chars(brief_chars);
         if context > MAX_CONTEXT_CHARS {
             return Err(format!(
                 "about me, the enabled knowledge and the meeting brief come to {context} characters; the limit is {MAX_CONTEXT_CHARS}"
@@ -373,12 +386,13 @@ mod tests {
     fn the_builtin_overview_counts_toward_the_context_limit() {
         let mut s = AssistSettings::default();
         let overview = DEEPGRAM_PUBLIC.chars().count();
-        assert_eq!(s.context_chars(), overview);
+        assert_eq!(s.context_chars(0), overview);
         s.knowledge.push(KnowledgeItem { id: "a".into(), name: "n".into(), text: "x".repeat(MAX_CONTEXT_CHARS - overview), enabled: true });
         assert!(s.validate(0).is_ok());
-        assert!(s.validate(1).is_err(), "at the limit with the overview on");
-        s.builtin.deepgram_overview = false;
-        assert!(s.validate(1).is_ok());
+        assert_eq!(s.context_chars(0), MAX_CONTEXT_CHARS, "at the limit with the overview in");
+        assert!(s.validate(1).is_ok(), "one more brief character: the overview steps out, the save passes");
+        assert_eq!(s.context_chars(1), MAX_CONTEXT_CHARS - overview + 1);
+        assert!(s.validate(overview + 1).is_err(), "own context and brief alone over the limit");
     }
 
     #[test]
@@ -394,11 +408,22 @@ mod tests {
     }
 
     #[test]
+    fn settings_saved_before_pipecat_daily_docs_follow_the_deepgram_docs_choice() {
+        let off = serde_json::json!({ "builtin": { "deepgramOverview": true, "deepgramDocs": false } });
+        assert!(!AssistSettings::from_stored(off).unwrap().builtin.pipecat_daily_docs);
+        let on = serde_json::json!({ "builtin": { "deepgramOverview": true, "deepgramDocs": true } });
+        assert!(AssistSettings::from_stored(on).unwrap().builtin.pipecat_daily_docs);
+        let explicit = serde_json::json!({ "builtin": { "deepgramDocs": false, "pipecatDailyDocs": true } });
+        assert!(AssistSettings::from_stored(explicit).unwrap().builtin.pipecat_daily_docs);
+    }
+
+    #[test]
     fn an_old_full_context_leaves_the_overview_out_instead_of_going_over() {
         let mut s = AssistSettings::default();
-        assert!(s.overview_included());
+        assert!(s.overview_included(0));
         s.knowledge.push(KnowledgeItem { id: "a".into(), name: "n".into(), text: "x".repeat(MAX_CONTEXT_CHARS - 10), enabled: true });
-        assert!(!s.overview_included(), "it would push the prompt past the limit");
+        assert!(!s.overview_included(0), "it would push the prompt past the limit");
+        assert!(s.validate(0).is_ok(), "and the save still passes: the overview is left out, not counted");
     }
 
     #[test]

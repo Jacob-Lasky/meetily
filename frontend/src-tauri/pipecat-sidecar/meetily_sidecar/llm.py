@@ -110,6 +110,12 @@ CLAUDE_THINKING_FAST = {"type": "between_tools"}
 
 CallTool = Callable[[str, dict], Awaitable[str]]
 
+#: Added to the tool results before the last round. Measured 2026-11-18: with
+#: tools merely switched off (tool_choice none), claude-sonnet-5-5 ended the
+#: turn with an empty reply after its searches, so the lookup produced
+#: nothing; told plainly, it answers.
+LAST_ROUND_NOTE = "No more tool calls. Reply now with the JSON object, from what the results above say."
+
 
 def make_tool_loop(cfg: dict[str, Any], max_tokens: int, max_tool_calls: int) -> ToolLoop:
     """The research lane's tool-use loop for `cfg` = {provider, model,
@@ -174,10 +180,12 @@ def _claude_loop(client, model: str, max_tokens: int, max_tool_calls: int) -> To
                 return "".join(getattr(b, "text", "") or "" for b in response.content if b.type == "text")
             # Thinking blocks must go back unchanged with the tool results.
             messages.append({"role": "assistant", "content": [b.model_dump(exclude_none=True) for b in response.content]})
-            results = []
+            results: list[dict] = []
             for use in uses:
                 text = await call_tool(use.name, dict(use.input or {}))
                 results.append({"type": "tool_result", "tool_use_id": use.id, "content": text})
+            if round_no + 1 == max_tool_calls:
+                results.append({"type": "text", "text": LAST_ROUND_NOTE})
             messages.append({"role": "user", "content": results})
         return ""
 
@@ -215,6 +223,8 @@ def _openai_loop(client, model: str, max_tokens: int, max_tool_calls: int) -> To
                     args = {}
                 text = await call_tool(call.function.name, args if isinstance(args, dict) else {})
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": text})
+            if round_no + 1 == max_tool_calls:
+                messages.append({"role": "user", "content": LAST_ROUND_NOTE})
         return ""
 
     return loop

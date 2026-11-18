@@ -168,8 +168,8 @@ export function AIAssistSettings() {
         <details className="mt-4">
           <summary className="cursor-pointer text-sm font-medium text-gray-700">View the full prompt</summary>
           <p className="text-xs text-gray-500 mt-2">
-            What each card call is sent before the transcript, with the meeting brief as it is now. The part above
-            &quot;Me&apos;s extra instructions&quot; is built in.
+            What each card call is sent before the transcript, with the meeting brief as it is now. Everything
+            before &quot;Me&apos;s extra instructions&quot; and &quot;Me&apos;s background&quot; is built in.
           </p>
           <pre
             data-testid="ai-assist-prompt"

@@ -276,6 +276,11 @@ async def test_claude_loop_retries_without_thinking_and_forces_an_answer_on_the_
     assert await loop("S", "q", [ToolSpec("s", "", {"type": "object"}, "X")], call_tool) == "done"
     assert "thinking" not in client.requests[-1]
     assert client.requests[-1]["tool_choice"] == {"type": "none"}
+    from meetily_sidecar.llm import LAST_ROUND_NOTE
+
+    assert client.requests[-1]["messages"][-1]["content"][-1] == {"type": "text", "text": LAST_ROUND_NOTE}, (
+        "the model is told to answer: tool_choice none alone gave empty replies"
+    )
 
 
 async def test_openai_loop_runs_tools_then_answers():
@@ -300,6 +305,14 @@ async def test_openai_loop_runs_tools_then_answers():
     assert await loop("S", "q", [ToolSpec("search_knowledge", "", {"type": "object"}, "X")], call_tool) == '{"cards":[]}'
     assert calls == [("search_knowledge", {"query": "x"})]
     assert requests[1]["messages"][-1] == {"role": "tool", "tool_call_id": "c1", "content": "r"}
+
+    replies[:] = [SimpleNamespace(choices=[SimpleNamespace(message=m)]) for m in (msg1, msg2)]
+    requests.clear()
+    await _openai_loop(client, "gpt", 100, 1)("S", "q", [ToolSpec("search_knowledge", "", {"type": "object"}, "X")], call_tool)
+    from meetily_sidecar.llm import LAST_ROUND_NOTE
+
+    assert requests[1]["messages"][-1] == {"role": "user", "content": LAST_ROUND_NOTE}
+    assert requests[1]["tool_choice"] == "none"
 
 
 def test_make_tool_loop_rejects_unsupported_providers():

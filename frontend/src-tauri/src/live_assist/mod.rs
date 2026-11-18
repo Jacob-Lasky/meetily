@@ -319,7 +319,9 @@ fn send_shown(engine: &Engine) {
 /// A lookup is slower than a card by design (tools, a second model call); one
 /// still useful has to land while the topic is live.
 const RESEARCH_TIMEOUT: Duration = Duration::from_secs(45);
-const RESEARCH_MAX_TOOL_CALLS: u32 = 4;
+/// Each tool round is a model call (~1.5 s); measured 2026-11-18, DeepHive
+/// lookups that searched 5 times took 10 s.
+const RESEARCH_MAX_TOOL_CALLS: u32 = 3;
 
 /// The provider, model and target for assist calls: the AI Assist model when
 /// one is set, else the summary model (Settings › Summary).
@@ -675,6 +677,7 @@ fn apply_sidecar_event<R: Runtime>(app: &AppHandle<R>, engine: &mut Engine, even
                 since_end_of_turn_ms.map_or("?".to_string(), |v| v.to_string()),
                 call_ms.map_or("?".to_string(), |v| v.to_string()),
             );
+            log_cards_for_test(&applied.added);
             if !applied.added.is_empty() {
                 if let Err(e) = app.emit(ASSIST_UPDATE_EVENT, serde_json::json!({ "cards": applied.added })) {
                     error!("live assist: failed to emit cards: {e}");
@@ -716,6 +719,7 @@ fn apply_sidecar_event<R: Runtime>(app: &AppHandle<R>, engine: &mut Engine, even
                 applied.added.len(),
                 call_ms.map_or("?".to_string(), |v| v.to_string()),
             );
+            log_cards_for_test(&applied.added);
             if !applied.added.is_empty() {
                 if let Err(e) = app.emit(ASSIST_UPDATE_EVENT, serde_json::json!({ "cards": applied.added })) {
                     error!("live assist: failed to emit cards: {e}");
@@ -725,6 +729,20 @@ fn apply_sidecar_event<R: Runtime>(app: &AppHandle<R>, engine: &mut Engine, even
             send_shown(engine);
             emit_research(app, "done", &question, None, Some(applied.added.len()));
         }
+    }
+}
+
+/// Test runs only: with `MEETILY_ASSIST_LOG_CARDS=1` in the environment,
+/// each added card's kind, text and origin is logged, so a scripted live run
+/// can check what the cards said. Off by default: DO NOT log card text
+/// otherwise, it is built from the meeting and this log is kept on disk.
+fn log_cards_for_test(cards: &[Card]) {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("MEETILY_ASSIST_LOG_CARDS").as_deref() == Ok("1"));
+    if !*ON {
+        return;
+    }
+    for c in cards {
+        info!("live assist test card: [{:?}] {} (origin: {})", c.kind, c.text, c.origin.as_deref().unwrap_or("-"));
     }
 }
 
@@ -778,6 +796,7 @@ fn apply_result<R: Runtime>(
         applied.added.len(),
         since_final.map_or(0, |d| d.as_millis())
     );
+    log_cards_for_test(&applied.added);
     if !applied.added.is_empty() {
         if let Err(e) = app.emit(ASSIST_UPDATE_EVENT, serde_json::json!({ "cards": applied.added })) {
             error!("live assist: failed to emit cards: {e}");

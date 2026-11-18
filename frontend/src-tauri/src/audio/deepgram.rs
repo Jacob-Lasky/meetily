@@ -272,16 +272,25 @@ struct TimedWord {
     token: String,
     start_ms: f64,
     end_ms: f64,
+    /// Index of the Deepgram word this token came from (a word like "SOC-2"
+    /// gives several tokens), and that word as displayed. Bleed trimming cuts
+    /// a line at word boundaries and rebuilds its text from these.
+    src: usize,
+    word: String,
 }
 
 fn timed_words(words: &[DeepgramWord]) -> Vec<TimedWord> {
     words
         .iter()
-        .flat_map(|w| {
+        .enumerate()
+        .flat_map(|(src, w)| {
+            let word = word_display(w).to_string();
             word_tokens(&w.word).into_iter().map(move |token| TimedWord {
                 token,
                 start_ms: w.start * 1000.0,
                 end_ms: (w.end * 1000.0).max(w.start * 1000.0),
+                src,
+                word: word.clone(),
             })
         })
         .collect()
@@ -399,10 +408,18 @@ fn flux_turn_to_final(m: &FluxTurnInfo) -> Option<FinalSeg> {
     if transcript.is_empty() {
         return None;
     }
+    // The turn's time is its words' span. DO NOT use audio_window_start/end
+    // when words are present: Flux's window runs from the end of the previous
+    // turn, silence included, so the first turn of a call "started" at 0:00
+    // and sorted above earlier Mic-In speech (measured 2026-11-18, WORK-559).
+    let (start_ms, end_ms) = match (m.words.first(), m.words.last()) {
+        (Some(first), Some(last)) => (first.start * 1000.0, (last.end * 1000.0).max(first.start * 1000.0)),
+        _ => (m.audio_window_start * 1000.0, m.audio_window_end * 1000.0),
+    };
     Some(FinalSeg {
         transcript: transcript.to_string(),
-        start_ms: m.audio_window_start * 1000.0,
-        end_ms: m.audio_window_end * 1000.0,
+        start_ms,
+        end_ms,
         confidence: average_confidence(m.words.iter().filter_map(|w| w.confidence)),
         // Flux has no diarization.
         turns: Vec::new(),
@@ -893,7 +910,7 @@ const BLEED_MEMORY_MS: f64 = 30_000.0;
 
 /// A finalized realtime segment in recording-relative ms, ready to emit.
 #[derive(Debug, Clone, PartialEq)]
-struct LabeledSegment {
+pub(crate) struct LabeledSegment {
     text: String,
     start_ms: f64,
     end_ms: f64,
@@ -1002,10 +1019,96 @@ fn is_bleed_of(mic: &LabeledSegment, speakers: &[&LabeledSegment]) -> bool {
     lcs_len(&mic_tokens, &far_tokens) as f64 / mic_tokens.len() as f64 >= BLEED_MIN_WORD_MATCH
 }
 
+/// Fewest tokens a trimmed-off bleed run may have: shorter shared runs
+/// ("yeah, okay") are too likely to be the user's own words.
+const BLEED_TRIM_MIN_TOKENS: usize = BLEED_MIN_CONTAINMENT_TOKENS;
+
+/// The part of `mic` to keep when only its start or its end is the far
+/// side's audio, or None when there is nothing to trim.
+///
+/// Flux ends a turn on its own turn model, not on 300 ms of silence like
+/// nova's endpointing, so on the Pipecat engine the user's words and the
+/// bleed of the far side's reply that follows them come back as ONE Mic-In
+/// line (measured 2026-11-18, WORK-559: "Thanks for joining today. ... Yes.
+/// We handle about forty thousand calls a day, ..." where everything from
+/// "Yes." on was bleed). Whole-line matching cannot remove that, so the line
+/// is cut at a word boundary: the longest run at its end (else at its start)
+/// that is bleed by the same timed-word rule as `is_bleed_of`, with at least
+/// BLEED_TRIM_MIN_TOKENS tokens, leaving a part that is NOT bleed.
+/// Needs word timings; diarized lines are left whole.
+fn trim_bleed(mic: &LabeledSegment, speakers: &[&LabeledSegment]) -> Option<LabeledSegment> {
+    if mic.words.is_empty() || !mic.turns.is_empty() || speakers.iter().all(|s| s.words.is_empty()) {
+        return None;
+    }
+    let first_src = mic.words.first()?.src;
+    let last_src = mic.words.last()?.src;
+    let part = |from: usize, to: usize| -> Option<LabeledSegment> {
+        let words: Vec<TimedWord> = mic.words.iter().filter(|w| w.src >= from && w.src <= to).cloned().collect();
+        let (first, last) = (words.first()?, words.last()?);
+        let mut text: Vec<&str> = Vec::new();
+        let mut prev = None;
+        for w in &words {
+            if prev != Some(w.src) {
+                text.push(&w.word);
+                prev = Some(w.src);
+            }
+        }
+        Some(LabeledSegment {
+            text: text.join(" "),
+            start_ms: first.start_ms,
+            end_ms: last.end_ms,
+            confidence: mic.confidence,
+            speaker: mic.speaker,
+            turns: Vec::new(),
+            words,
+        })
+    };
+    let is_trimmable_bleed = |seg: &LabeledSegment| seg.words.len() >= BLEED_TRIM_MIN_TOKENS && is_bleed_of(seg, speakers);
+    // A source word the far side said at the same moment. The run test above
+    // tolerates 20% misses, so without this edge check the cut would swallow
+    // the user's last (or first) few words into the bleed.
+    let far: Vec<&TimedWord> = speakers.iter().flat_map(|s| s.words.iter()).collect();
+    let echoed = |src: usize| {
+        mic.words.iter().filter(|w| w.src == src).any(|m| {
+            far.iter().any(|f| f.token == m.token && (f.start_ms - m.start_ms).abs() <= BLEED_EDGE_MAX_DELTA_MS)
+        })
+    };
+    let accept = |keep: Option<LabeledSegment>, bleed: Option<LabeledSegment>| match (keep, bleed) {
+        (Some(keep), Some(bleed)) if is_trimmable_bleed(&bleed) && !is_bleed_of(&keep, speakers) => Some(keep),
+        _ => None,
+    };
+    // Bleed at the end: the user spoke, then the far side's reply leaked in.
+    if let Some(mut cut) = ((first_src + 1)..=last_src).find(|&cut| accept(part(first_src, cut - 1), part(cut, last_src)).is_some()) {
+        while cut < last_src && !echoed(cut) {
+            cut += 1;
+        }
+        if let Some(keep) = accept(part(first_src, cut - 1), part(cut, last_src)) {
+            return Some(keep);
+        }
+    }
+    // Bleed at the start: the far side was still finishing when the user began.
+    if let Some(mut cut) =
+        ((first_src + 1)..=last_src).rev().find(|&cut| accept(part(cut, last_src), part(first_src, cut - 1)).is_some())
+    {
+        while cut > first_src + 1 && !echoed(cut - 1) {
+            cut -= 1;
+        }
+        if let Some(keep) = accept(part(cut, last_src), part(first_src, cut - 1)) {
+            return Some(keep);
+        }
+    }
+    None
+}
+
+/// How close in time a word must be to the same far-side word to count as
+/// its echo when placing a trim cut. Acoustic bleed lags by tens of ms, but
+/// Flux word timings come in ~0.32-0.4 s steps (measured 2026-11-18).
+const BLEED_EDGE_MAX_DELTA_MS: f64 = 800.0;
+
 /// What the realtime session tells the transcript: show a line, or take back
 /// a line it showed.
 #[derive(Debug, Clone, PartialEq)]
-enum RealtimeOutput {
+pub(crate) enum RealtimeOutput {
     Show { key: u64, seg: LabeledSegment },
     /// A shown Mic-In line turned out to be Speaker-Out bleed.
     Retract { key: u64 },
@@ -1061,6 +1164,7 @@ impl BleedSuppressor {
                 if is_bleed_of(&seg, &far) {
                     return Vec::new();
                 }
+                let seg = trim_bleed(&seg, &far).unwrap_or(seg);
                 self.shown_mic.push((now_ms, key, seg.clone()));
                 vec![RealtimeOutput::Show { key, seg }]
             }
@@ -1069,13 +1173,27 @@ impl BleedSuppressor {
                 self.recent_speaker.push((now_ms, seg));
                 let far: Vec<&LabeledSegment> = self.recent_speaker.iter().map(|(_, s)| s).collect();
                 let mut out = vec![RealtimeOutput::Show { key, seg: out_seg }];
-                self.shown_mic.retain(|(_, mic_key, mic)| {
-                    let bleed = is_bleed_of(mic, &far);
-                    if bleed {
+                let mut reshown = Vec::new();
+                self.shown_mic.retain(|(at, mic_key, mic)| {
+                    if is_bleed_of(mic, &far) {
                         out.push(RealtimeOutput::Retract { key: *mic_key });
+                        return false;
                     }
-                    !bleed
+                    if let Some(kept) = trim_bleed(mic, &far) {
+                        // Part of a shown line was bleed: take the line back
+                        // and show what the user actually said.
+                        out.push(RealtimeOutput::Retract { key: *mic_key });
+                        reshown.push((*at, kept));
+                        return false;
+                    }
+                    true
                 });
+                for (at, kept) in reshown {
+                    let kept_key = self.next_key;
+                    self.next_key += 1;
+                    self.shown_mic.push((at, kept_key, kept.clone()));
+                    out.push(RealtimeOutput::Show { key: kept_key, seg: kept });
+                }
                 out
             }
             _ => vec![RealtimeOutput::Show { key, seg }],
@@ -1090,14 +1208,28 @@ impl BleedSuppressor {
 /// Where the realtime sockets connect. Production uses `DEEPGRAM`; tests point
 /// it at a local server to exercise failure paths.
 #[derive(Debug, Clone)]
-struct RealtimeEndpoints {
-    nova: String,
-    flux: String,
+pub(crate) struct RealtimeEndpoints {
+    pub(crate) nova: String,
+    pub(crate) flux: String,
+    /// Add `side=me|them|unknown` to each Flux lane's URL. Only the Pipecat
+    /// sidecar reads it (it runs live assist on the "them" lane); Deepgram
+    /// itself answers HTTP 400 to unknown query parameters, so DO NOT set it
+    /// for api.deepgram.com.
+    pub(crate) tag_lane_side: bool,
 }
 
 impl RealtimeEndpoints {
     fn deepgram() -> Self {
-        Self { nova: LISTEN_WS_URL.to_string(), flux: FLUX_WS_URL.to_string() }
+        Self { nova: LISTEN_WS_URL.to_string(), flux: FLUX_WS_URL.to_string(), tag_lane_side: false }
+    }
+}
+
+/// The `side` a lane's audio comes from, as the Pipecat sidecar names it.
+fn lane_side(layout: AudioLayout, lane: Lane) -> &'static str {
+    match channel_label(layout, lane.first_channel) {
+        Some(MIC_IN_LABEL) => "me",
+        Some(SPEAKER_OUT_LABEL) => "them",
+        _ => "unknown",
     }
 }
 
@@ -1117,32 +1249,60 @@ pub async fn run_realtime_transcription<R: Runtime>(
     let options = configured_options(&app).await.map_err(|e| e.to_string())?;
     let language = crate::get_language_preference_internal();
 
-    let emitter_app = app.clone();
-    // Only Mic-In lines are ever retracted, so only they are recorded.
-    let mut ledger = RetractionLedger::default();
-    let clock = std::time::Instant::now();
+    let receiver = if super::pipecat::load_engine(&app) == super::pipecat::LiveEngine::Pipecat {
+        match super::pipecat::run(&app, &api_key, &options, language.clone(), transcription_receiver).await {
+            super::pipecat::Outcome::Finished(result) => return result,
+            super::pipecat::Outcome::FallBack { receiver, reason } => {
+                warn!("Pipecat live engine: falling back to Direct for this recording: {reason}");
+                let _ = app.emit(
+                    "transcription-error",
+                    serde_json::json!({
+                        "error": reason,
+                        "userMessage": format!(
+                            "The Pipecat live engine stopped ({reason}). Transcribing with Direct ({}) for the rest of this recording.",
+                            options.model
+                        ),
+                        "actionable": false
+                    }),
+                );
+                receiver
+            }
+        }
+    } else {
+        transcription_receiver
+    };
+
     run_realtime_core(
         RealtimeEndpoints::deepgram(),
         api_key,
         options,
         language,
-        transcription_receiver,
-        move |out| match out {
-            RealtimeOutput::Show { key, seg } => {
-                let retractable = seg.speaker == Some(MIC_IN_LABEL);
-                let sequence_ids = emit_labeled_segment(&emitter_app, seg);
-                if retractable {
-                    ledger.record(clock.elapsed().as_secs_f64() * 1000.0, key, sequence_ids);
-                }
-            }
-            RealtimeOutput::Retract { key } => {
-                for sequence_id in ledger.take(key) {
-                    emit_transcript_retract(&emitter_app, sequence_id);
-                }
-            }
-        },
+        receiver,
+        realtime_emitter(app),
     )
     .await
+}
+
+/// Turns the core's output into transcript events: rows for shown lines,
+/// `transcript-retract` for Mic-In lines found to be bleed.
+pub(crate) fn realtime_emitter<R: Runtime>(app: AppHandle<R>) -> impl FnMut(RealtimeOutput) + Send + 'static {
+    // Only Mic-In lines are ever retracted, so only they are recorded.
+    let mut ledger = RetractionLedger::default();
+    let clock = std::time::Instant::now();
+    move |out| match out {
+        RealtimeOutput::Show { key, seg } => {
+            let retractable = seg.speaker == Some(MIC_IN_LABEL);
+            let sequence_ids = emit_labeled_segment(&app, seg);
+            if retractable {
+                ledger.record(clock.elapsed().as_secs_f64() * 1000.0, key, sequence_ids);
+            }
+        }
+        RealtimeOutput::Retract { key } => {
+            for sequence_id in ledger.take(key) {
+                emit_transcript_retract(&app, sequence_id);
+            }
+        }
+    }
 }
 
 /// The realtime session itself, free of Tauri state so it can be driven
@@ -1152,7 +1312,7 @@ pub async fn run_realtime_transcription<R: Runtime>(
 /// never called after this function returns, on success or error: the
 /// worker emits `transcription-error` after an Err, and a late transcript
 /// line after that would be out of order.
-async fn run_realtime_core<F>(
+pub(crate) async fn run_realtime_core<F>(
     endpoints: RealtimeEndpoints,
     api_key: String,
     options: DeepgramOptions,
@@ -1196,7 +1356,12 @@ where
     let mut sockets = Vec::with_capacity(lanes.len());
     for lane in &lanes {
         let url = if flux {
-            build_flux_url(&endpoints.flux, &options, language.clone())
+            let url = build_flux_url(&endpoints.flux, &options, language.clone());
+            if endpoints.tag_lane_side {
+                format!("{}&side={}", url, lane_side(layout, *lane))
+            } else {
+                url
+            }
         } else {
             build_realtime_url(&endpoints.nova, &options, language.clone(), lane.channels)
         };
@@ -1667,6 +1832,13 @@ fn build_flux_url(base: &str, options: &DeepgramOptions, language: Option<String
         ("encoding".to_string(), "linear16".to_string()),
         ("sample_rate".to_string(), PCM_SAMPLE_RATE.to_string()),
     ];
+    if options.mip_opt_out {
+        // Flux takes the same Model Improvement Program opt-out as nova
+        // (verified live 2026-11-18: the handshake accepts it). Before
+        // WORK-559 this was missing, so Flux recordings ignored the
+        // privacy-first default.
+        query.push(("mip_opt_out".to_string(), "true".to_string()));
+    }
     if options.model.ends_with("multi") {
         if let Some(hint) = language.as_deref().map(str::trim).filter(|l| {
             !l.is_empty() && *l != "auto" && *l != "auto-translate" && *l != "detect"
@@ -2248,8 +2420,10 @@ mod tests {
         assert!(flux_turn_to_final(&mk("EndOfTurn", "   ")).is_none());
         let seg = flux_turn_to_final(&mk("EndOfTurn", "Hello. This is a test.")).unwrap();
         assert_eq!(seg.transcript, "Hello. This is a test.");
+        // Timed by the words' span, not the 0-8.32 s window (see
+        // a_flux_turn_is_timed_by_its_words_not_its_window).
         assert_eq!(seg.start_ms, 0.0);
-        assert_eq!(seg.end_ms, 8320.0);
+        assert_eq!(seg.end_ms, 480.0);
     }
 
     #[test]
@@ -2296,6 +2470,117 @@ mod tests {
         assert!(!url.contains("diarize"));
         assert!(!url.contains("endpointing"));
         assert!(!url.contains("language=")); // no language tag; model selects language
+    }
+
+    #[test]
+    fn a_flux_turn_is_timed_by_its_words_not_its_window() {
+        let m: FluxTurnInfo = serde_json::from_value(serde_json::json!({
+            "type": "TurnInfo", "event": "EndOfTurn", "transcript": "Yes. We handle",
+            "audio_window_start": 0.0, "audio_window_end": 14.2,
+            "words": [
+                {"word": "Yes.", "confidence": 1.0, "start": 9.92, "end": 10.32},
+                {"word": "We", "confidence": 1.0, "start": 10.32, "end": 10.48},
+                {"word": "handle", "confidence": 1.0, "start": 10.48, "end": 10.8}
+            ]
+        }))
+        .unwrap();
+        let seg = flux_turn_to_final(&m).unwrap();
+        assert_eq!((seg.start_ms, seg.end_ms), (9920.0, 10800.0));
+        let untimed: FluxTurnInfo = serde_json::from_value(serde_json::json!({
+            "type": "TurnInfo", "event": "EndOfTurn", "transcript": "hi", "audio_window_start": 1.0, "audio_window_end": 2.0
+        }))
+        .unwrap();
+        assert_eq!(flux_turn_to_final(&untimed).map(|s| (s.start_ms, s.end_ms)), Some((1000.0, 2000.0)));
+    }
+
+    #[test]
+    fn flux_url_carries_the_mip_opt_out() {
+        let opts = DeepgramOptions { model: "flux-general-en".to_string(), ..DeepgramOptions::default() };
+        assert!(opts.mip_opt_out, "privacy-first default");
+        assert!(build_flux_url(FLUX_WS_URL, &opts, None).contains("mip_opt_out=true"));
+        let opted_in = DeepgramOptions { mip_opt_out: false, ..opts };
+        assert!(!build_flux_url(FLUX_WS_URL, &opted_in, None).contains("mip_opt_out"));
+    }
+
+    #[test]
+    fn sidecar_lanes_are_named_by_side() {
+        let stereo = plan_lanes(true, 2);
+        assert_eq!(lane_side(AudioLayout::MicSystemStereo, stereo[0]), "me");
+        assert_eq!(lane_side(AudioLayout::MicSystemStereo, stereo[1]), "them");
+        assert_eq!(lane_side(AudioLayout::MicOnly, plan_lanes(true, 1)[0]), "me");
+        assert_eq!(lane_side(AudioLayout::Mono, plan_lanes(true, 1)[0]), "unknown");
+        assert!(!RealtimeEndpoints::deepgram().tag_lane_side, "Deepgram rejects unknown query params");
+    }
+
+    /// WORK-559: the real sidecar (fake Flux, no network) behind the real
+    /// realtime core. Both lanes are labelled from the sidecar's TurnInfo, and
+    /// killing the sidecar mid-recording hands the rest of the audio back for
+    /// the Direct fallback instead of silently ending transcription.
+    #[tokio::test]
+    #[ignore = "starts the real sidecar process: needs uv and `uv sync` in pipecat-sidecar"]
+    async fn pipecat_sidecar_feeds_the_core_and_a_crash_falls_back() {
+        use crate::audio::pipecat::{relay, tests::{dev_command, TEST_STARTUP_TIMEOUT}, Sidecar};
+        let sidecar = Sidecar::spawn(dev_command(), "dg-test", TEST_STARTUP_TIMEOUT).await.expect("sidecar starts");
+        let pid = sidecar.pid().unwrap();
+        let options = DeepgramOptions { model: "flux-general-en".to_string(), ..DeepgramOptions::default() };
+        let (outer_tx, outer_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        let (inner_tx, inner_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel::<LabeledSegment>();
+        let core = run_realtime_core(sidecar.endpoints(), sidecar.token.clone(), options, None, inner_rx, move |out| {
+            if let RealtimeOutput::Show { seg, .. } = out {
+                let _ = seen_tx.send(seg);
+            }
+        });
+        // 0.1 s stereo chunks; the fake Flux commits one turn per 0.1 s per lane.
+        let send = |i: u64| {
+            let frames = 1600;
+            let data: Vec<f32> = (0..frames * 2).map(|n| if n % 2 == 0 { 0.1 } else { -0.1 }).collect();
+            outer_tx
+                .send(AudioChunk {
+                    data,
+                    sample_rate: 16_000,
+                    timestamp: i as f64 * 0.1,
+                    chunk_id: i,
+                    device_type: crate::audio::recording_state::DeviceType::Microphone,
+                    layout: AudioLayout::MicSystemStereo,
+                })
+                .is_ok()
+        };
+        let feeder = async {
+            let mut labels = std::collections::HashSet::new();
+            for i in 0..10 {
+                assert!(send(i));
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            while labels.len() < 2 {
+                let seg = tokio::time::timeout(Duration::from_secs(10), seen_rx.recv()).await.expect("a turn").expect("open");
+                assert!(seg.text.starts_with("turn "), "{}", seg.text);
+                assert!(!seg.words.is_empty(), "word timings survive the sidecar");
+                labels.insert(seg.speaker);
+            }
+            assert_eq!(labels, [Some(MIC_IN_LABEL), Some(SPEAKER_OUT_LABEL)].into_iter().collect());
+            // Crash the sidecar mid-recording.
+            assert!(std::process::Command::new("kill").args(["-9", &pid.to_string()]).status().unwrap().success());
+            for i in 10..60 {
+                if !send(i) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        let ((rest, result), ()) = tokio::time::timeout(Duration::from_secs(60), async {
+            tokio::join!(relay(outer_rx, inner_tx, core), feeder)
+        })
+        .await
+        .expect("the crash is noticed, not waited on forever");
+        assert!(result.is_err(), "a crashed sidecar is an error, not a quiet end: {result:?}");
+        let mut rest = rest.expect("the recording continues on Direct");
+        let mut leftover = 0;
+        while rest.try_recv().is_ok() {
+            leftover += 1;
+        }
+        assert!(leftover > 0, "audio after the crash is handed to the fallback");
+        sidecar.shutdown().await;
     }
 
     #[test]
@@ -2824,8 +3109,103 @@ mod tests {
         tokens
             .into_iter()
             .enumerate()
-            .map(|(i, token)| TimedWord { token, start_ms: start_ms + i as f64 * step, end_ms: start_ms + (i + 1) as f64 * step })
+            .map(|(i, token)| TimedWord {
+                word: token.clone(),
+                token,
+                start_ms: start_ms + i as f64 * step,
+                end_ms: start_ms + (i + 1) as f64 * step,
+                src: i,
+            })
             .collect()
+    }
+
+    // ---- bleed trimming (WORK-559: Flux merges own speech with bleed) ----
+
+    fn texts(out: &[RealtimeOutput]) -> Vec<String> {
+        out.iter()
+            .map(|o| match o {
+                RealtimeOutput::Show { seg, .. } => format!("show {:?}: {}", seg.speaker, seg.text),
+                RealtimeOutput::Retract { key } => format!("retract {key}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn own_words_followed_by_bleed_keep_only_the_own_words() {
+        let mut s = BleedSuppressor::default();
+        let far = "yes we handle about forty thousand calls a day mostly english and spanish";
+        s.push(timed_seg(far, 6_000.0, 13_000.0, SPEAKER_OUT_LABEL), 13_000.0);
+        let mic = format!("thanks for joining today i hear you are evaluating speech to text {far}");
+        // Own words 0-5.6 s, then the bleed copy 80 ms behind the far side.
+        let mut seg = timed_seg("thanks for joining today i hear you are evaluating speech to text", 0.0, 5_600.0, MIC_IN_LABEL);
+        let mut bleed = timed(far, 6_080.0, 13_080.0);
+        let n = seg.words.len();
+        bleed.iter_mut().for_each(|w| w.src += n);
+        seg.words.extend(bleed);
+        seg.text = mic;
+        seg.end_ms = 13_080.0;
+        let out = s.push(seg, 13_500.0);
+        assert_eq!(
+            texts(&out),
+            vec!["show Some(\"Mic-In\"): thanks for joining today i hear you are evaluating speech to text"]
+        );
+    }
+
+    #[test]
+    fn a_shown_line_whose_end_turns_out_to_be_bleed_is_replaced_by_its_own_words() {
+        let mut s = BleedSuppressor::default();
+        let mut seg = timed_seg("got it are those calls recorded", 0.0, 2_000.0, MIC_IN_LABEL);
+        let mut bleed = timed("both ideally real time for agent assist", 2_100.0, 5_100.0);
+        let n = seg.words.len();
+        bleed.iter_mut().for_each(|w| w.src += n);
+        seg.words.extend(bleed);
+        seg.text = "got it are those calls recorded both ideally real time for agent assist".into();
+        seg.end_ms = 5_100.0;
+        let shown = s.push(seg, 5_200.0);
+        assert_eq!(shown.len(), 1, "no far-side final yet: shown whole");
+        let RealtimeOutput::Show { key, .. } = shown[0] else { panic!() };
+        let out = s.push(timed_seg("both ideally real time for agent assist", 2_020.0, 5_020.0, SPEAKER_OUT_LABEL), 5_600.0);
+        assert_eq!(
+            texts(&out),
+            vec![
+                "show Some(\"Speaker-Out\"): both ideally real time for agent assist".to_string(),
+                format!("retract {key}"),
+                "show Some(\"Mic-In\"): got it are those calls recorded".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn bleed_at_the_start_is_trimmed_too() {
+        let mut s = BleedSuppressor::default();
+        s.push(timed_seg("and who would be our point of contact", 0.0, 3_000.0, SPEAKER_OUT_LABEL), 3_000.0);
+        let mut seg = timed_seg("and who would be our point of contact", 80.0, 3_080.0, MIC_IN_LABEL);
+        let mut own = timed("that would be me for the pilot", 3_500.0, 6_000.0);
+        let n = seg.words.len();
+        own.iter_mut().for_each(|w| w.src += n);
+        seg.words.extend(own);
+        seg.text = "and who would be our point of contact that would be me for the pilot".into();
+        seg.end_ms = 6_000.0;
+        let out = s.push(seg, 6_200.0);
+        assert_eq!(texts(&out), vec!["show Some(\"Mic-In\"): that would be me for the pilot"]);
+    }
+
+    #[test]
+    fn a_short_or_untimed_overlap_is_not_trimmed() {
+        let mut s = BleedSuppressor::default();
+        s.push(timed_seg("sounds good to me", 0.0, 1_500.0, SPEAKER_OUT_LABEL), 1_500.0);
+        // Shares three tokens with the far side at the same time: too few to cut.
+        let mut seg = timed_seg("okay great", 0.0, 800.0, MIC_IN_LABEL);
+        let mut tail = timed("good to me", 900.0, 1_500.0);
+        tail.iter_mut().for_each(|w| w.src += 2);
+        seg.words.extend(tail);
+        seg.text = "okay great good to me".into();
+        let out = s.push(seg, 2_000.0);
+        assert_eq!(texts(&out), vec!["show Some(\"Mic-In\"): okay great good to me"]);
+        // The same words said much later (a genuine repeat) stay whole.
+        let late = timed_seg("so forty thousand calls a day you said", 60_000.0, 63_000.0, MIC_IN_LABEL);
+        s.push(timed_seg("we run forty thousand calls a day", 0.0, 3_000.0, SPEAKER_OUT_LABEL), 3_000.0);
+        assert_eq!(texts(&s.push(late, 63_500.0)).len(), 1);
     }
 
     /// A mic segment with Deepgram-style word timings over its own text.
@@ -3071,7 +3451,7 @@ mod tests {
             serde_json::json!({ "type": "Error", "description": "boom" }).to_string(),
         ])])
         .await;
-        let endpoints = RealtimeEndpoints { nova: base.clone(), flux: base };
+        let endpoints = RealtimeEndpoints { nova: base.clone(), flux: base, tag_lane_side: false };
         let (result, emitted) = run_against_slow(
             endpoints,
             "nova-3".into(),
@@ -3092,7 +3472,7 @@ mod tests {
     #[tokio::test]
     async fn flux_second_lane_connect_failure_spawns_nothing() {
         let (base, _server) = mock_deepgram(vec![Ok(vec![]), Err(())]).await;
-        let endpoints = RealtimeEndpoints { nova: base.clone(), flux: base };
+        let endpoints = RealtimeEndpoints { nova: base.clone(), flux: base, tag_lane_side: false };
         let (result, emitted) = run_against(endpoints, "flux-general-en".into(), AudioLayout::MicSystemStereo, Emitted::default()).await;
         assert!(result.unwrap_err().contains("Failed to connect"));
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -3114,7 +3494,7 @@ mod tests {
             serde_json::json!({ "type": "Error", "description": "end" }).to_string(),
         ])])
         .await;
-        let endpoints = RealtimeEndpoints { nova: base.clone(), flux: base };
+        let endpoints = RealtimeEndpoints { nova: base.clone(), flux: base, tag_lane_side: false };
         let emitted = Emitted::default();
         let session = tokio::spawn(run_against(endpoints, "nova-3".into(), AudioLayout::MicOnly, emitted.clone()));
         // The Error that ends the session is 2s away; the line is already out.

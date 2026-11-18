@@ -10,6 +10,7 @@ import { ParakeetModelManager } from './ParakeetModelManager';
 import { Textarea } from './ui/textarea';
 import { Switch } from './ui/switch';
 import { LanguageSelection } from './LanguageSelection';
+import { LiveEngineSettings } from './LiveEngineSettings';
 import { toUiTranscriptProvider, type TranscriptProvider } from '@/lib/transcript-providers';
 
 
@@ -309,6 +310,9 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                     />
                                 </div>
                             )}
+                            <div className="mx-1">
+                                <LiveEngineSettings />
+                            </div>
                             <div>
                                 <Label className="block text-sm font-medium text-gray-700 mb-1">
                                     Keyterms (one per line)

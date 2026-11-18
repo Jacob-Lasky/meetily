@@ -5,6 +5,7 @@ pub mod encode;
 pub mod ffmpeg;
 pub mod vad;
 pub mod deepgram;
+pub mod pipecat; // WORK-559: Pipecat live engine (Flux per channel + turn-triggered live assist) via a Python sidecar
 
 // Modularized device management
 pub mod devices;

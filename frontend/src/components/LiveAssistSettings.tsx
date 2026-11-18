@@ -55,7 +55,8 @@ export function LiveAssistSettings() {
           </div>
           <p className="text-sm text-gray-600">
             While recording, shows short suggestion cards (answers, follow-up questions, facts, to-dos) after the
-            other side speaks. Uses the summary model above, at most one call every 5 seconds. Needs the Deepgram
+            other side speaks. Uses the summary model above: on the Direct live engine at most one call every 5
+            seconds, on the Pipecat engine one call each time the other side finishes a turn. Needs the Deepgram
             provider recording system audio, which is how the app tells your microphone from the other side.
           </p>
         </div>

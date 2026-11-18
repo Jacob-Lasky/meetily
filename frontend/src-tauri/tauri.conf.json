@@ -95,7 +95,11 @@
             "icons/app_icon.ico"
         ],
         "resources": [
-            "templates/*.json"
+            "templates/*.json",
+            "pipecat-sidecar/pyproject.toml",
+            "pipecat-sidecar/uv.lock",
+            "pipecat-sidecar/.python-version",
+            "pipecat-sidecar/meetily_sidecar/*.py"
         ],
         "externalBin": [
             "binaries/llama-helper",

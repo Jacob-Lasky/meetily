@@ -507,6 +507,10 @@ pub fn run() {
 
             log::info!("Application setup complete");
 
+            // Pipecat live engine: build its Python environment ahead of the
+            // first recording when it is the selected engine (WORK-559).
+            audio::pipecat::prepare_if_selected(_app.handle());
+
             // Initialize system tray
             if let Err(e) = tray::create_tray(_app.handle()) {
                 log::error!("Failed to create system tray: {}", e);
@@ -750,6 +754,9 @@ pub fn run() {
             live_assist::live_assist_dismiss,
             live_assist::live_assist_set_pinned,
             live_assist::live_assist_get_pinned,
+            audio::pipecat::live_engine_get,
+            audio::pipecat::live_engine_set,
+            audio::pipecat::live_engine_prepare,
             summary::commands::api_process_transcript,
             summary::commands::api_get_summary,
             summary::commands::api_save_meeting_summary,

@@ -211,6 +211,34 @@ pub fn normalize(text: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The Pipecat sidecar builds the same user prompt in Python
+    /// (`meetily_sidecar/prompt.py`); both test suites check this fixture.
+    #[test]
+    fn user_prompt_matches_the_fixture_shared_with_the_sidecar() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../pipecat-sidecar/tests/fixtures/user_prompt.json")).unwrap();
+        let cases = fixture["cases"].as_array().unwrap();
+        assert!(!cases.is_empty());
+        for case in cases {
+            let lines: Vec<(Side, String)> = case["lines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|pair| {
+                    let side = match pair[0].as_str().unwrap() {
+                        "me" => Side::Me,
+                        "them" => Side::Them,
+                        _ => Side::Unknown,
+                    };
+                    (side, pair[1].as_str().unwrap().to_string())
+                })
+                .collect();
+            let shown: Vec<&str> = case["shown"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
+            let got = user_prompt(lines.iter().map(|(s, t)| (*s, t.as_str())), shown);
+            assert_eq!(got, case["expected"].as_str().unwrap());
+        }
+    }
+
     fn card(kind: CardKind, text: &str, quote: &str) -> RawCard {
         RawCard { kind, text: text.into(), quote: quote.into() }
     }

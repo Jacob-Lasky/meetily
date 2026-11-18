@@ -61,6 +61,11 @@ const TICK: Duration = Duration::from_millis(100);
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
+/// The Pipecat sidecar's `/control` connection while the recording runs on
+/// the Pipecat engine (WORK-559). Set: the sidecar's Flux turn events trigger
+/// the calls and this session only applies their cards. Unset: the Rust
+/// timer triggers them, as on the Direct engine.
+static SIDECAR: Mutex<Option<mpsc::UnboundedSender<String>>> = Mutex::new(None);
 static HTTP: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
 
 struct Session {
@@ -79,7 +84,38 @@ enum Msg {
     Dismiss(String),
     Pin { id: String, pinned: bool, reply: oneshot::Sender<Result<Card, String>> },
     Cards(oneshot::Sender<Vec<Card>>),
+    SidecarAttached,
+    SidecarDetached,
+    Sidecar(SidecarEvent),
     Stop,
+}
+
+/// What the sidecar reports about its calls (`meetily_sidecar/assist.py`).
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum SidecarEvent {
+    AssistStarted {
+        call_id: u64,
+        trigger: String,
+    },
+    AssistCancelled {
+        call_id: u64,
+        reason: String,
+    },
+    AssistCards {
+        call_id: u64,
+        trigger: String,
+        cards: Vec<serde_json::Value>,
+        #[serde(default)]
+        since_end_of_turn_ms: Option<u64>,
+        #[serde(default)]
+        call_ms: Option<u64>,
+    },
+    AssistError {
+        #[serde(default)]
+        call_id: Option<u64>,
+        error: String,
+    },
 }
 
 #[derive(Serialize, Clone)]
@@ -137,6 +173,9 @@ pub fn start_session<R: Runtime>(app: &AppHandle<R>, meeting_folder: Option<Path
     });
 
     let calls_off = CancellationToken::new();
+    if SIDECAR.lock().unwrap().is_some() {
+        let _ = tx.send(Msg::SidecarAttached);
+    }
     tauri::async_runtime::spawn(run(app.clone(), rx, tx.clone(), meeting_folder, calls_off.clone()));
     *SESSION.lock().unwrap() = Some(Session { tx, listeners: vec![update_id, retract_id], calls_off });
     info!("live assist: session started (enabled={})", ENABLED.load(Ordering::SeqCst));
@@ -168,6 +207,91 @@ fn session_tx() -> Option<mpsc::UnboundedSender<Msg>> {
     SESSION.lock().unwrap().as_ref().map(|s| s.tx.clone())
 }
 
+// ============================================================================
+// PIPECAT SIDECAR BRIDGE (called by audio::pipecat)
+// ============================================================================
+
+/// The recording's transcription now runs through the Pipecat sidecar: its
+/// turn events trigger assist calls from here on.
+pub fn attach_sidecar<R: Runtime>(_app: &AppHandle<R>, control: mpsc::UnboundedSender<String>) {
+    *SIDECAR.lock().unwrap() = Some(control);
+    if let Some(tx) = session_tx() {
+        let _ = tx.send(Msg::SidecarAttached);
+    }
+}
+
+/// The sidecar is gone (recording over, or it failed and the recording fell
+/// back to Direct): the Rust timer triggers calls again.
+pub fn detach_sidecar<R: Runtime>(_app: &AppHandle<R>) {
+    SIDECAR.lock().unwrap().take();
+    if let Some(tx) = session_tx() {
+        let _ = tx.send(Msg::SidecarDetached);
+    }
+}
+
+/// One JSON message from the sidecar's `/control` connection.
+pub fn on_sidecar_message(text: &str) {
+    match serde_json::from_str::<SidecarEvent>(text) {
+        Ok(event) => {
+            if let Some(tx) = session_tx() {
+                let _ = tx.send(Msg::Sidecar(event));
+            }
+        }
+        Err(e) => warn!("live assist: unreadable sidecar message ({e}): {:.120}", text),
+    }
+}
+
+fn to_sidecar(message: serde_json::Value) {
+    if let Some(tx) = SIDECAR.lock().unwrap().as_ref() {
+        let _ = tx.send(message.to_string());
+    }
+}
+
+fn side_name(side: Side) -> &'static str {
+    match side {
+        Side::Me => "me",
+        Side::Them => "them",
+        Side::Unknown => "unknown",
+    }
+}
+
+fn send_shown(engine: &Engine) {
+    to_sidecar(serde_json::json!({ "type": "shown", "texts": engine.shown_texts() }));
+}
+
+/// The assist config for the sidecar: the summary provider, model and key
+/// (the same `LlmTarget` as Direct calls and summaries), the system prompt
+/// (its one home is `cards::SYSTEM_PROMPT`), and whether calls may run.
+async fn sidecar_config<R: Runtime>(app: &AppHandle<R>, enabled: bool) -> serde_json::Value {
+    let llm = async {
+        let state = app.try_state::<AppState>().ok_or("database not ready")?;
+        let pool = state.db_manager.pool();
+        let settings = SettingsRepository::get_model_config(pool)
+            .await
+            .map_err(|e| format!("could not read the summary model setting: {e}"))?
+            .ok_or("no summary model is configured (Settings > Summary)")?;
+        let target = LlmTarget::resolve(pool, &settings.provider).await?;
+        let endpoint = target.ollama_endpoint.or(target.custom_openai_endpoint);
+        Ok::<_, String>(serde_json::json!({
+            "provider": settings.provider,
+            "model": settings.model,
+            "api_key": target.api_key,
+            "endpoint": endpoint,
+        }))
+    }
+    .await;
+    let mut config = serde_json::json!({
+        "type": "assist_config",
+        "enabled": enabled,
+        "system_prompt": cards::SYSTEM_PROMPT,
+    });
+    match llm {
+        Ok(llm) => config["llm"] = llm,
+        Err(e) => config["llm_error"] = serde_json::Value::String(e),
+    }
+    config
+}
+
 async fn run<R: Runtime>(
     app: AppHandle<R>,
     mut rx: mpsc::UnboundedReceiver<Msg>,
@@ -183,6 +307,10 @@ async fn run<R: Runtime>(
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut was_enabled = ENABLED.load(Ordering::SeqCst);
+    // Pipecat engine: the sidecar triggers the calls (see SIDECAR).
+    let mut sidecar_mode = false;
+    // What the sidecar was last told about calls being allowed.
+    let mut sidecar_allowed: Option<bool> = None;
 
     loop {
         tokio::select! {
@@ -190,8 +318,16 @@ async fn run<R: Runtime>(
                 let Some(msg) = msg else { break };
                 match msg {
                     Msg::Stop => break,
-                    Msg::Line { seq, side, text } => engine.on_line(seq, side, &text, Instant::now()),
+                    Msg::Line { seq, side, text } => {
+                        if sidecar_mode {
+                            to_sidecar(serde_json::json!({ "type": "line", "seq": seq, "side": side_name(side), "text": text }));
+                        }
+                        engine.on_line(seq, side, &text, Instant::now());
+                    }
                     Msg::Retract(seq) => {
+                        if sidecar_mode {
+                            to_sidecar(serde_json::json!({ "type": "retract", "seq": seq }));
+                        }
                         let had_pins = !engine.pinned().is_empty();
                         let withdrawn = engine.on_retract(seq);
                         info!("live assist: transcript line {seq} retracted, withdrawing {} card(s)", withdrawn.len());
@@ -200,7 +336,39 @@ async fn run<R: Runtime>(
                             if had_pins {
                                 save_pins(folder.as_deref(), &engine.pinned());
                             }
+                            if sidecar_mode {
+                                send_shown(&engine);
+                            }
                         }
+                    }
+                    Msg::SidecarAttached => {
+                        info!("live assist: Pipecat engine attached; Flux turn events trigger calls");
+                        sidecar_mode = true;
+                        // A Rust-timer call in flight is dropped: the sidecar owns calls now.
+                        if let Some(token) = cancel.take() {
+                            token.cancel();
+                        }
+                        if let Some(id) = engine.in_flight() {
+                            engine.on_call_failed(id);
+                        }
+                        let allowed = calls_allowed(&calls_off);
+                        sidecar_allowed = Some(allowed);
+                        let config = sidecar_config(&app, allowed).await;
+                        to_sidecar(config);
+                        for line in engine.lines() {
+                            to_sidecar(serde_json::json!({ "type": "line", "seq": line.seq, "side": side_name(line.side), "text": line.text }));
+                        }
+                        send_shown(&engine);
+                    }
+                    Msg::SidecarDetached => {
+                        if sidecar_mode {
+                            info!("live assist: Pipecat engine detached; the Rust timer triggers calls");
+                        }
+                        sidecar_mode = false;
+                        sidecar_allowed = None;
+                    }
+                    Msg::Sidecar(event) => {
+                        apply_sidecar_event(&app, &mut engine, event, calls_allowed(&calls_off));
                     }
                     Msg::CallDone { call_id, result } => {
                         if engine.in_flight() == Some(call_id) {
@@ -216,8 +384,13 @@ async fn run<R: Runtime>(
                     }
                     Msg::Dismiss(id) => {
                         let was_pinned = engine.cards().iter().any(|c| c.id == id && c.pinned);
-                        if engine.dismiss(&id) && was_pinned {
-                            save_pins(folder.as_deref(), &engine.pinned());
+                        if engine.dismiss(&id) {
+                            if was_pinned {
+                                save_pins(folder.as_deref(), &engine.pinned());
+                            }
+                            if sidecar_mode {
+                                send_shown(&engine);
+                            }
                         }
                     }
                     Msg::Pin { id, pinned, reply } => {
@@ -247,7 +420,12 @@ async fn run<R: Runtime>(
             emit_status(&app, if enabled { "idle" } else { "off" }, None);
             was_enabled = enabled;
         }
-        if let Some(request) = engine.poll(Instant::now(), allowed) {
+        if sidecar_mode && sidecar_allowed != Some(allowed) {
+            // Turning assist off, or Stop, cancels the sidecar's call in flight.
+            to_sidecar(serde_json::json!({ "type": "assist_enabled", "enabled": allowed }));
+            sidecar_allowed = Some(allowed);
+        }
+        if let Some(request) = engine.poll(Instant::now(), allowed && !sidecar_mode) {
             let token = calls_off.child_token();
             cancel = Some(token.clone());
             let prompt = cards::user_prompt(
@@ -287,6 +465,54 @@ async fn run<R: Runtime>(
 /// Calls may run: assist is on and Stop has not been pressed.
 fn calls_allowed(calls_off: &CancellationToken) -> bool {
     ENABLED.load(Ordering::SeqCst) && !calls_off.is_cancelled()
+}
+
+/// Apply one of the sidecar's call reports. Cards that arrive after assist
+/// was turned off or Stop was pressed are dropped, as on the Direct engine.
+fn apply_sidecar_event<R: Runtime>(app: &AppHandle<R>, engine: &mut Engine, event: SidecarEvent, allowed: bool) {
+    match event {
+        SidecarEvent::AssistStarted { call_id, trigger } => {
+            info!("live assist: sidecar call {call_id} started ({trigger})");
+            if allowed {
+                emit_status(app, "thinking", None);
+            }
+        }
+        SidecarEvent::AssistCancelled { call_id, reason } => {
+            info!("live assist: sidecar call {call_id} cancelled ({reason})");
+            if allowed {
+                emit_status(app, "idle", None);
+            }
+        }
+        SidecarEvent::AssistError { call_id, error } => {
+            warn!("live assist: sidecar call {call_id:?} failed: {error}");
+            if allowed {
+                emit_status(app, "error", Some(error));
+            }
+        }
+        SidecarEvent::AssistCards { call_id, trigger, cards, since_end_of_turn_ms, call_ms } => {
+            if !allowed {
+                info!("live assist: dropping sidecar call {call_id}'s cards (assist off or stopped)");
+                return;
+            }
+            // Re-validate through the Rust parser (kinds, word limit, count).
+            let raw = parse_cards(&serde_json::json!({ "cards": cards }).to_string()).unwrap_or_default();
+            let applied = engine.on_external_cards(call_id, raw, chrono::Utc::now().timestamp_millis());
+            info!(
+                "live assist: sidecar call {call_id} ({trigger}) added {} card(s), {} ms after the Speaker-Out end of turn (call {} ms)",
+                applied.added.len(),
+                since_end_of_turn_ms.map_or("?".to_string(), |v| v.to_string()),
+                call_ms.map_or("?".to_string(), |v| v.to_string()),
+            );
+            if !applied.added.is_empty() {
+                if let Err(e) = app.emit(ASSIST_UPDATE_EVENT, serde_json::json!({ "cards": applied.added })) {
+                    error!("live assist: failed to emit cards: {e}");
+                }
+            }
+            emit_withdraw(app, applied.evicted, "evicted");
+            send_shown(engine);
+            emit_status(app, "idle", None);
+        }
+    }
 }
 
 fn apply_result<R: Runtime>(

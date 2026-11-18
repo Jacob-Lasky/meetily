@@ -161,13 +161,7 @@ impl Engine {
         let request = CallRequest {
             call_id: self.next_call_id,
             lines: self.lines.iter().cloned().collect(),
-            shown: self
-                .cards
-                .iter()
-                .take(MAX_SHOWN_IN_PROMPT)
-                .map(|c| c.text.clone())
-                .chain(self.dismissed.iter().cloned())
-                .collect(),
+            shown: self.shown_texts(),
         };
         self.in_flight = Some(request.clone());
         self.last_call = Some(now);
@@ -199,9 +193,42 @@ impl Engine {
         }
         let Some(call) = self.in_flight.take() else { return Applied::default() };
         let retracted = std::mem::take(&mut self.retracted_in_flight);
+        self.add_cards(&format!("assist-{call_id}"), &call.lines, &retracted, raw, created_at_ms)
+    }
+
+    /// Apply cards from a call this engine did not start: the Pipecat
+    /// sidecar's turn-triggered calls (WORK-559). Quotes are matched against
+    /// the window as it is now, which already holds the turn that triggered
+    /// the call (its line arrives while the model is still answering) and no
+    /// longer holds lines retracted meanwhile. Same dedup and eviction rules.
+    pub fn on_external_cards(&mut self, call_id: u64, raw: Vec<RawCard>, created_at_ms: i64) -> Applied {
+        let lines: Vec<Line> = self.lines.iter().cloned().collect();
+        self.add_cards(&format!("assist-p{call_id}"), &lines, &[], raw, created_at_ms)
+    }
+
+    /// Texts sent with a call so the model does not repeat itself: the cards
+    /// on screen (newest first, at most MAX_SHOWN_IN_PROMPT), then the ones
+    /// Me dismissed.
+    pub fn shown_texts(&self) -> Vec<String> {
+        self.cards
+            .iter()
+            .take(MAX_SHOWN_IN_PROMPT)
+            .map(|c| c.text.clone())
+            .chain(self.dismissed.iter().cloned())
+            .collect()
+    }
+
+    fn add_cards(
+        &mut self,
+        id_prefix: &str,
+        lines: &[Line],
+        retracted: &[u64],
+        raw: Vec<RawCard>,
+        created_at_ms: i64,
+    ) -> Applied {
         let mut added = Vec::new();
         for card in raw {
-            let Some(source_seq) = source_line(&call.lines, &card.quote) else { continue };
+            let Some(source_seq) = source_line(lines, &card.quote) else { continue };
             if retracted.contains(&source_seq) {
                 continue;
             }
@@ -213,7 +240,7 @@ impl Engine {
             }
             self.next_card_no += 1;
             added.push(Card {
-                id: format!("assist-{call_id}-{}", self.next_card_no),
+                id: format!("{id_prefix}-{}", self.next_card_no),
                 kind: card.kind,
                 text: card.text,
                 quote: card.quote,
@@ -325,6 +352,46 @@ mod tests {
 
     fn raw(kind: CardKind, text: &str, quote: &str) -> RawCard {
         RawCard { kind, text: text.into(), quote: quote.into() }
+    }
+
+    // ---- cards from the Pipecat sidecar (WORK-559) -----------------------
+
+    #[test]
+    fn sidecar_cards_map_to_the_current_window_and_dedup() {
+        let t0 = Instant::now();
+        let mut e = Engine::new(Config::default());
+        e.on_line(1, Side::Them, "We run forty thousand calls a day.", t0);
+        e.on_line(2, Side::Me, "Got it.", t0);
+        // The triggering turn's line lands while the sidecar's model answers.
+        e.on_line(3, Side::Them, "What does pricing look like?", t0);
+        let applied = e.on_external_cards(
+            7,
+            vec![
+                raw(CardKind::Ask, "Which plan?", "pricing look like"),
+                raw(CardKind::Fact, "40k calls a day", "forty thousand calls"),
+                raw(CardKind::Ask, "Which plan?", "pricing"),
+            ],
+            5,
+        );
+        let got: Vec<(&str, u64)> = applied.added.iter().map(|c| (c.text.as_str(), c.source_seq)).collect();
+        assert_eq!(got, vec![("Which plan?", 3), ("40k calls a day", 1)], "repeat dropped");
+        assert!(applied.added[0].id.starts_with("assist-p7-"), "sidecar ids cannot collide with timer ids");
+        assert_eq!(e.in_flight(), None, "no Rust call is involved");
+        e.dismiss(&applied.added[1].id.clone());
+        assert_eq!(e.shown_texts(), vec!["Which plan?".to_string(), "40k calls a day".to_string()]);
+        let again = e.on_external_cards(8, vec![raw(CardKind::Fact, "40k calls a day", "")], 6);
+        assert!(again.added.is_empty(), "a dismissed card is not shown again");
+    }
+
+    #[test]
+    fn sidecar_cards_quoting_a_retracted_line_fall_back_to_the_last_speaker_out() {
+        let t0 = Instant::now();
+        let mut e = Engine::new(Config::default());
+        e.on_line(1, Side::Them, "Send me the SOC 2 report.", t0);
+        e.on_line(2, Side::Me, "Send me the SOC 2 report.", t0); // bleed
+        e.on_retract(2);
+        let applied = e.on_external_cards(1, vec![raw(CardKind::Todo, "Send SOC 2", "Send me the SOC 2 report")], 0);
+        assert_eq!(applied.added[0].source_seq, 1, "never tied to the retracted Mic-In copy");
     }
 
     // ---- trigger and debounce -------------------------------------------

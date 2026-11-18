@@ -498,12 +498,14 @@ class Research:
         assert self._tools is not None and self._loop is not None
         tools, loop = self._tools, self._loop
         calls = 0
+        refused = 0
 
         async def call_tool(name: str, arguments: dict) -> str:
-            nonlocal calls
-            calls += 1
-            if calls > self.limits.max_tool_calls:
+            nonlocal calls, refused
+            if calls >= self.limits.max_tool_calls:
+                refused += 1
                 return "Error: tool call limit reached; answer from what you have."
+            calls += 1
             spec = next((t for t in specs if t.name == name), None)
             if spec is not None:
                 lookup.sources.add(spec.server)
@@ -541,7 +543,7 @@ class Research:
                 cards = []
             logger.info(
                 f"research: lookup {lookup.research_id} returned {len(cards)} card(s) in {call_ms} ms "
-                f"after {calls} tool call(s)"
+                f"after {calls} tool call(s)" + (f", {refused} more refused at the limit" if refused else "")
             )
             self._emit(
                 {

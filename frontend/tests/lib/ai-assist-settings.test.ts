@@ -36,7 +36,7 @@ describe('AI Assist settings helpers', () => {
 
   test('the DeepHive preset is the stdio relay limited to search_knowledge', () => {
     const s = deepHiveServer('/home/u/');
-    expect(s.command).toBe('/home/u/.claude/skills/happier/scripts/mcp-connector');
+    expect(s.command).toBe('/home/u/.claude/skills/mcp-connector/scripts/mcp-connector');
     expect(s.args).toEqual(['serve', 'deephive']);
     expect(s.transport).toBe('stdio');
     expect(s.allowedTools).toEqual(['search_knowledge']);

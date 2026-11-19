@@ -1330,16 +1330,30 @@ fn write_pins(folder: &Path, pinned: &[Card], brief: Option<&str>) -> std::io::R
     std::fs::rename(&tmp, &path)
 }
 
-fn read_pins(folder: &Path) -> Result<Vec<Card>, String> {
+/// The meeting folder's `live-assist.json`; None when there is none.
+fn read_pins_file(folder: &Path) -> Result<Option<PinsFile>, String> {
     let path = folder.join(PINS_FILE);
     let body = match std::fs::read(&path) {
         Ok(body) => body,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("could not read {}: {e}", path.display())),
     };
     serde_json::from_slice::<PinsFile>(&body)
-        .map(|f| f.cards)
+        .map(Some)
         .map_err(|e| format!("could not parse {}: {e}", path.display()))
+}
+
+fn read_pins(folder: &Path) -> Result<Vec<Card>, String> {
+    Ok(read_pins_file(folder)?.map(|f| f.cards).unwrap_or_default())
+}
+
+/// The brief a stopped recording ran with, as kept in its meeting folder
+/// (written by the session task when the recording stops), for the
+/// after-call summary (WORK-676). None: no file, or no brief in it.
+pub fn read_meeting_brief(folder: &Path) -> Result<Option<String>, String> {
+    Ok(read_pins_file(folder)?
+        .and_then(|f| f.brief)
+        .filter(|brief| !brief.trim().is_empty()))
 }
 
 // ============================================================================
@@ -1724,6 +1738,26 @@ mod tests {
         assert_eq!(read_pins(dir.path()), Ok(vec![]), "unpinning the last card empties the file");
         let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(leftovers, vec![std::ffi::OsString::from(PINS_FILE)], "no temp file left behind");
+    }
+
+    #[test]
+    fn the_summary_reads_the_brief_kept_with_the_meeting() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_meeting_brief(dir.path()), Ok(None), "no file: no brief");
+        write_pins(dir.path(), &[card("a")], None).unwrap();
+        assert_eq!(read_meeting_brief(dir.path()), Ok(None), "pins only: no brief");
+        write_pins(dir.path(), &[card("a")], Some("Interview plan")).unwrap();
+        assert_eq!(read_meeting_brief(dir.path()), Ok(Some("Interview plan".to_string())));
+        write_pins(dir.path(), &[], None).unwrap();
+        assert_eq!(
+            read_meeting_brief(dir.path()),
+            Ok(Some("Interview plan".to_string())),
+            "a later pin write keeps the brief"
+        );
+        write_pins(dir.path(), &[], Some("  \n")).unwrap();
+        assert_eq!(read_meeting_brief(dir.path()), Ok(None), "a blank brief is no brief");
+        std::fs::write(dir.path().join(PINS_FILE), b"{ not json").unwrap();
+        assert!(read_meeting_brief(dir.path()).is_err(), "a damaged file is an error, not an empty brief");
     }
 
     fn engine_with_one_card() -> (Engine, String) {

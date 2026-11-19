@@ -255,8 +255,16 @@ pub fn built_in_rules(parts: &PromptParts) -> String {
 /// built-in rules (a file holding `</knowledge>` then "Rules: ..."). The
 /// tags become `[/knowledge]`; nothing else in the text changes.
 fn fenced(text: &str) -> String {
+    fence_tags(text, &["about_me", "knowledge", "meeting_brief"])
+}
+
+/// `fenced` for another prompt's section tags: each `<tag` / `</tag` in
+/// `text` (any ASCII case) becomes `[tag` / `[/tag`, so the text cannot
+/// open or close one of those sections. The after-call summary fences the
+/// meeting brief with its own tags (WORK-676).
+pub(crate) fn fence_tags(text: &str, tags: &[&str]) -> String {
     let mut out = text.to_string();
-    for tag in ["about_me", "knowledge", "meeting_brief"] {
+    for tag in tags {
         for (from, to) in [(format!("</{tag}"), format!("[/{tag}")), (format!("<{tag}"), format!("[{tag}"))] {
             out = replace_ascii_case_insensitive(&out, &from, &to);
         }

@@ -155,7 +155,7 @@ export function deepHiveServer(home: string): McpServer {
     name: 'DeepHive',
     enabled: true,
     transport: 'stdio',
-    command: `${home.replace(/\/$/, '')}/.claude/skills/happier/scripts/mcp-connector`,
+    command: `${home.replace(/\/$/, '')}/.claude/skills/mcp-connector/scripts/mcp-connector`,
     args: ['serve', 'deephive'],
     env: {},
     url: '',

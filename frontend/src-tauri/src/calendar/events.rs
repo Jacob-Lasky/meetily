@@ -306,10 +306,12 @@ pub fn qualifies(ev: &CalEvent, rules: &Rules) -> Result<(), String> {
 /// (candidate data stays local, WORK-671), and only the calendar and earlier
 /// Meetily meetings feed the brief.
 pub fn is_interview(ev: &CalEvent) -> bool {
-    let title = ev.title.to_lowercase();
-    let details = format!("{} {}", ev.description, ev.location).to_lowercase();
-    ["interview", "candidate", "hiring"].iter().any(|w| title.contains(w))
-        || ["ashbyhq.com", "greenhouse.io", "lever.co", "workable.com"].iter().any(|d| details.contains(d))
+    // Any field: a false positive only skips the lookup, a miss sends a
+    // candidate's name out.
+    let text = format!("{} {} {}", ev.title, ev.description, ev.location).to_lowercase();
+    ["interview", "candidate", "hiring", "ashbyhq.com", "greenhouse.io", "lever.co", "workable.com"]
+        .iter()
+        .any(|w| text.contains(w))
 }
 
 #[cfg(test)]
@@ -481,5 +483,8 @@ mod tests {
         e.title = "Chat with Sam".into();
         e.location = "https://jobs.lever.co/acme/123".into();
         assert!(is_interview(&e), "a scheduler link in the location counts too");
+        e.location.clear();
+        e.description = "Second-round candidate interview".into();
+        assert!(is_interview(&e), "the description counts too");
     }
 }

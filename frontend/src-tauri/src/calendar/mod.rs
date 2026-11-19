@@ -347,12 +347,12 @@ async fn tick<R: Runtime>(app: &AppHandle<R>) {
     let settings = load_settings(app);
     let now = Utc::now();
     let recording = crate::audio::recording_commands::is_recording().await;
-    // A recording the calendar started is stopped by it even after both
-    // switches were turned off mid-meeting.
-    if recording {
-        auto_stop_check(app, &settings, now);
-    }
     if !settings.active() {
+        // A recording the calendar started is stopped by it even after both
+        // switches were turned off mid-meeting.
+        if recording {
+            auto_stop_check(app, &settings, now);
+        }
         return;
     }
     // Start and prep run on the events already read, before any refresh: a
@@ -375,6 +375,12 @@ async fn tick<R: Runtime>(app: &AppHandle<R>) {
                 busy = true;
             }
         }
+    }
+    // After the starts: at a back-to-back boundary `begin` hands the ending
+    // meeting's recording over to the next one; stopping it first would
+    // leave the next meeting looking like someone else's recording.
+    if recording {
+        auto_stop_check(app, &settings, now);
     }
     let due = {
         let mut st = STATE.lock().unwrap();

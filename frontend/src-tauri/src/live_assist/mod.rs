@@ -127,7 +127,10 @@ enum Msg {
     /// Settings › AI Assist or the meeting brief changed: the attached
     /// sidecar gets the new config (the Direct engine reads them per call).
     Reconfigure,
-    Stop,
+    /// End the session. `after_call`: Live Assist was on when it ended, so the
+    /// after-call summary runs. Read in `stop_session`, before a new session
+    /// (`start_session`) loads its own setting into ENABLED.
+    Stop { after_call: bool },
 }
 
 /// What the sidecar reports about its calls (`meetily_sidecar/assist.py`).
@@ -202,9 +205,11 @@ fn emit_withdraw<R: Runtime>(app: &AppHandle<R>, ids: Vec<String>, reason: &str)
 }
 
 /// One recording's card record (WORK-672): every card that reaches the
-/// panel goes through `shown`, every removal through `withdrawn`, so the
-/// panel and `record::CARDS_FILE` cannot disagree. DO NOT emit
-/// `ASSIST_UPDATE_EVENT` or `ASSIST_WITHDRAW_EVENT` around it.
+/// panel goes through `shown`, every removal through `withdrawn`, so no card
+/// path can skip the record. DO NOT emit `ASSIST_UPDATE_EVENT` or
+/// `ASSIST_WITHDRAW_EVENT` around it. Contract limit: a failed write (disk
+/// full, folder gone) is logged by `CardLog` and the card is still shown;
+/// the call matters more than its record.
 struct CallRecord {
     log: CardLog,
     /// Final transcript lines by sequence id, for the line each card cites.
@@ -354,7 +359,7 @@ pub fn stop_session<R: Runtime>(app: &AppHandle<R>) {
     for id in session.listeners {
         app.unlisten(id);
     }
-    let _ = session.tx.send(Msg::Stop);
+    let _ = session.tx.send(Msg::Stop { after_call: ENABLED.load(Ordering::SeqCst) });
     info!("live assist: session stopped");
 }
 
@@ -665,13 +670,18 @@ async fn run<R: Runtime>(
     let mut brief_reads: u64 = 0;
     let mut brief_cancel: Option<CancellationToken> = None;
     let mut call_record = CallRecord::new(folder.as_deref());
+    // Set by Msg::Stop: whether the after-call summary runs at the end.
+    let mut run_after_call_at_end = false;
 
     loop {
         tokio::select! {
             msg = rx.recv() => {
                 let Some(msg) = msg else { break };
                 match msg {
-                    Msg::Stop => break,
+                    Msg::Stop { after_call } => {
+                        run_after_call_at_end = after_call;
+                        break;
+                    }
                     Msg::Line { seq, side, text, start_s, end_s } => {
                         if attached.is_some() {
                             to_sidecar(serde_json::json!({ "type": "line", "seq": seq, "side": side_name(side), "text": text }));
@@ -964,16 +974,17 @@ async fn run<R: Runtime>(
     }
     emit_status(&app, "stopped", None);
     // One more call, over the whole transcript plus the brief (WORK-672).
-    // Only when assist is on: with it off, Live Assist makes no LLM call.
-    // This runs after the transcript drain (Msg::Stop comes from
-    // stop_session), so transcripts.json is complete.
-    if ENABLED.load(Ordering::SeqCst) {
+    // Only when assist was on as this session ended: with it off, Live
+    // Assist makes no LLM call. DO NOT read ENABLED here: by now a new
+    // recording may have loaded its own setting into it. This runs after
+    // the transcript drain (Msg::Stop comes from stop_session), so
+    // transcripts.json is complete.
+    if run_after_call_at_end {
         if let Some(folder) = folder {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = run_after_call(&app, &folder, Some(brief)).await {
-                    info!("live assist: no after-call summary for this recording: {e}");
-                }
+                // run_after_call logs its own failures.
+                let _ = run_after_call(&app, &folder, Some(brief)).await;
             });
         }
     }
@@ -1261,7 +1272,32 @@ fn emit_after_call<R: Runtime>(app: &AppHandle<R>, state: &str, folder: &Path, m
 /// this path. A failure is written to the file only when there is no good
 /// output yet: a retry that fails keeps the earlier output.
 async fn run_after_call<R: Runtime>(app: &AppHandle<R>, folder: &Path, brief: Option<String>) -> Result<AfterCall, String> {
-    let _slot = AfterCallSlot::claim(folder).ok_or("the after-call summary is already being written")?;
+    let Some(slot) = AfterCallSlot::claim(folder) else {
+        info!("live assist: an after-call summary for this meeting is already being written");
+        return Err("the after-call summary is already being written".into());
+    };
+    // From here on every outcome ends in "done" or "error": a page that saw
+    // "running" (or `after_call_running`) must not wait forever.
+    emit_after_call(app, "running", folder, None);
+    let result = write_after_call_now(app, folder, brief).await;
+    // Free the slot BEFORE the terminal event: a page that refreshes on it
+    // must read `after_call_running` false, or it shows "Writing" forever.
+    drop(slot);
+    match result {
+        Ok(after) => {
+            emit_after_call(app, "done", folder, None);
+            Ok(after)
+        }
+        Err(e) => {
+            warn!("live assist: after-call summary failed: {e}");
+            emit_after_call(app, "error", folder, Some(e.clone()));
+            Err(e)
+        }
+    }
+}
+
+/// The work of `run_after_call`, under its slot.
+async fn write_after_call_now<R: Runtime>(app: &AppHandle<R>, folder: &Path, brief: Option<String>) -> Result<AfterCall, String> {
     let brief = match brief {
         Some(b) => b,
         None => read_kept_brief(folder),
@@ -1270,7 +1306,6 @@ async fn run_after_call<R: Runtime>(app: &AppHandle<R>, folder: &Path, brief: Op
     if transcript.is_empty() {
         return Err("the recording has no transcript".into());
     }
-    emit_after_call(app, "running", folder, None);
     let settings = load_settings(app);
     let started = Instant::now();
     let (system, (prompt, clipped)) = {
@@ -1344,17 +1379,7 @@ async fn run_after_call<R: Runtime>(app: &AppHandle<R>, folder: &Path, brief: Op
         record::write_after_call(folder, &after)
             .map_err(|e| format!("could not save the after-call summary in {}: {e}", folder.display()))?;
     }
-    match result {
-        Ok(_) => {
-            emit_after_call(app, "done", folder, None);
-            Ok(after)
-        }
-        Err(e) => {
-            warn!("live assist: after-call summary failed: {e}");
-            emit_after_call(app, "error", folder, Some(e.clone()));
-            Err(e)
-        }
-    }
+    result.map(|_| after)
 }
 
 /// The brief kept with a meeting (`live-assist.json`), or empty.
@@ -1896,7 +1921,9 @@ pub async fn live_assist_get_record(state: tauri::State<'_, AppState>, meeting_i
 /// Write (or rewrite) a meeting's after-call summary now: the same call the
 /// end of a recording makes, over the saved transcript and the brief kept
 /// with the meeting. Also the way to get one for a recording made before
-/// this existed.
+/// this existed. Runs whatever the Live Assist switch says: that switch
+/// governs calls Live Assist makes on its own during and after a recording,
+/// and this one is made only when Me clicks for it.
 #[tauri::command]
 pub async fn live_assist_run_after_call<R: Runtime>(
     app: AppHandle<R>,
@@ -2134,6 +2161,20 @@ mod tests {
         assert_eq!(docs_kb_config(&settings, dir)["sources"], serde_json::json!(["pipecat", "daily"]));
         settings.builtin.pipecat_daily_docs = false;
         assert_eq!(docs_kb_config(&settings, dir)["sources"], serde_json::json!([]), "both off: no index");
+    }
+
+    #[test]
+    fn after_call_slot_is_one_per_folder_and_freed_on_drop() {
+        let a = Path::new("/tmp/w672-slot-test-a");
+        let b = Path::new("/tmp/w672-slot-test-b");
+        let held = AfterCallSlot::claim(a).expect("first claim");
+        assert!(after_call_running(a));
+        assert!(AfterCallSlot::claim(a).is_none(), "a second run for the same meeting is refused");
+        let other = AfterCallSlot::claim(b).expect("another meeting is independent");
+        drop(held);
+        assert!(!after_call_running(a), "dropping the slot is what the page reads as finished");
+        assert!(AfterCallSlot::claim(a).is_some());
+        drop(other);
     }
 
     #[test]

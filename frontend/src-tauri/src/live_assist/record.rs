@@ -170,8 +170,10 @@ pub struct RecordedCard {
 /// most a partial last line), and counted in the second value.
 pub fn read_cards(folder: &Path) -> Result<(Vec<RecordedCard>, usize), String> {
     let path = folder.join(CARDS_FILE);
-    let body = match std::fs::read_to_string(&path) {
-        Ok(body) => body,
+    let body = match std::fs::read(&path) {
+        // Lossy: a write cut off inside a multi-byte character must cost
+        // that one line (it then fails to parse), not the whole record.
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
         Err(e) => return Err(format!("could not read {}: {e}", path.display())),
     };
@@ -370,7 +372,8 @@ mod tests {
         let mut log = CardLog::new(Some(dir.path()));
         log.append(&CardEvent::Shown { at_ms: 1, card: card("a"), source: None, window: None });
         let mut f = std::fs::OpenOptions::new().append(true).open(dir.path().join(CARDS_FILE)).unwrap();
-        f.write_all(b"{\"event\":\"shown\",\"at_ms\":2,\"car").unwrap();
+        // Cut off inside a multi-byte character (the first byte of "é").
+        f.write_all(b"{\"event\":\"shown\",\"at_ms\":2,\"text\":\"caf\xc3").unwrap();
         let (cards, skipped) = read_cards(dir.path()).unwrap();
         assert_eq!(cards.len(), 1);
         assert_eq!(skipped, 1);

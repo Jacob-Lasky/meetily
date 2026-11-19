@@ -44,48 +44,42 @@ export function AssistRecord({ meetingId }: { meetingId: string }) {
     return { pins, rec };
   }, [meetingId]);
 
+  // The automatic after-call call finishes after the recording stopped,
+  // often while this page is already open: its events refresh the page.
   useEffect(() => {
     let cancelled = false;
+    // This meeting's folder, known once the first load lands.
+    let folder: string | null = null;
     setPinned([]);
     setRecord(null);
     setError(null);
-    load().then(({ pins, rec }) => {
-      if (cancelled) return;
-      setPinned(pins);
-      setRecord(rec);
-      setWriting(rec?.after_call_running ?? false);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [load]);
-
-  // The automatic after-call call finishes after the recording stopped,
-  // often while this page is already open.
-  const folder = record?.folder ?? null;
-  useEffect(() => {
-    if (!folder) return;
-    let cancelled = false;
-    const unlisten = listen<AssistAfterCallEvent>(ASSIST_AFTER_CALL_EVENT, (event) => {
-      if (cancelled || event.payload.folder !== folder) return;
-      if (event.payload.state === 'running') {
-        setWriting(true);
-        setError(null);
-        return;
-      }
-      setWriting(false);
-      if (event.payload.state === 'error') setError(event.payload.message ?? 'The after-call summary failed.');
+    setWriting(false);
+    const refresh = () =>
       load().then(({ pins, rec }) => {
         if (cancelled) return;
+        folder = rec?.folder ?? null;
         setPinned(pins);
-        if (rec) setRecord(rec);
+        setRecord(rec);
+        setWriting(rec?.after_call_running ?? false);
       });
+    const unlisten = listen<AssistAfterCallEvent>(ASSIST_AFTER_CALL_EVENT, (event) => {
+      // Another meeting's event is ignored; before the first load lands
+      // the folder is unknown, so refresh anyway.
+      if (cancelled || (folder !== null && event.payload.folder !== folder)) return;
+      if (event.payload.state === 'error') setError(event.payload.message ?? 'The after-call summary failed.');
+      if (event.payload.state === 'running') setError(null);
+      refresh();
+    });
+    // Load only once the listener is registered: a "done" between a load
+    // and the registration would otherwise leave "Writing" on screen.
+    unlisten.then(() => {
+      if (!cancelled) refresh();
     });
     return () => {
       cancelled = true;
       unlisten.then((fn) => fn());
     };
-  }, [folder, load]);
+  }, [load]);
 
   const writeNow = async () => {
     setWriting(true);

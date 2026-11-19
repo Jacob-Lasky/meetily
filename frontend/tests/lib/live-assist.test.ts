@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { type AssistCard, briefSize, mergeSynced, withAdded, withCard, withoutIds } from '../../src/lib/live-assist';
+import { type AssistCard, briefSize, clockFromSeconds, mergeSynced, withAdded, withCard, withoutIds } from '../../src/lib/live-assist';
 
 const card = (id: string, extra: Partial<AssistCard> = {}): AssistCard => ({
   id,
@@ -68,5 +68,14 @@ describe('briefSize', () => {
     expect(briefSize(640)).toBe('640 characters');
     expect(briefSize(7731)).toBe('7.7k characters');
     expect(briefSize(2000)).toBe('2k characters');
+  });
+});
+
+describe('clockFromSeconds', () => {
+  test('minutes and seconds, hours only when needed', () => {
+    expect(clockFromSeconds(0)).toBe('00:00');
+    expect(clockFromSeconds(65.9)).toBe('01:05');
+    expect(clockFromSeconds(3725)).toBe('1:02:05');
+    expect(clockFromSeconds(-3)).toBe('00:00');
   });
 });

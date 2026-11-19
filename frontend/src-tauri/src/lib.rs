@@ -875,6 +875,8 @@ pub fn run() {
             live_assist::live_assist_dismiss,
             live_assist::live_assist_set_pinned,
             live_assist::live_assist_get_pinned,
+            live_assist::live_assist_get_record,
+            live_assist::live_assist_run_after_call,
             live_assist::ai_assist_get_settings,
             live_assist::ai_assist_save_settings,
             live_assist::ai_assist_get_brief,

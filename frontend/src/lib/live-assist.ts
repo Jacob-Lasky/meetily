@@ -18,6 +18,8 @@ export const ASSIST_BRIEF_EVENT = 'assist-brief';
 export const BRIEF_ORIGIN = 'brief';
 /** The meeting brief was saved with the meeting that stopped and cleared. */
 export const ASSIST_BRIEF_CLEARED_EVENT = 'assist-brief-cleared';
+/** The after-call summary of a meeting folder is being written, or finished (WORK-672). */
+export const ASSIST_AFTER_CALL_EVENT = 'assist-after-call';
 
 export type AssistCardKind = 'answer' | 'ask' | 'fact' | 'todo';
 
@@ -134,3 +136,77 @@ export const KIND_LABEL: Record<AssistCardKind, string> = {
   fact: 'Fact',
   todo: 'To-do',
 };
+
+// ---------------------------------------------------------------------------
+// What Live Assist kept with a meeting (WORK-672): src-tauri/src/live_assist/record.rs.
+// DO NOT rename fields here alone: they are the serde names of RecordedCard,
+// Span, SpanLine, AfterCall and AssistRecord there.
+
+export interface AssistSpanLine {
+  seq: number;
+  side: 'me' | 'them' | 'unknown';
+  text: string;
+  /** Seconds from recording start. */
+  start_s: number;
+  end_s: number;
+}
+
+/** The transcript Live Assist was following when a card arrived. */
+export interface AssistSpan {
+  from_seq: number;
+  to_seq: number;
+  from_s: number;
+  to_s: number;
+  lines: number;
+}
+
+export interface RecordedAssistCard {
+  card: AssistCard;
+  shown_at_ms: number;
+  /** The transcript line the card's quote maps to (none for brief cards). */
+  source?: AssistSpanLine;
+  window?: AssistSpan;
+  /** Taken back: its line was the other side's audio picked up by the mic. */
+  retracted: boolean;
+  dismissed: boolean;
+  pinned: boolean;
+}
+
+export interface AfterCallSummary {
+  version: number;
+  status: 'done' | 'error';
+  created_at_ms: number;
+  provider: string;
+  model: string;
+  /** Markdown. */
+  output: string;
+  error?: string;
+  transcript_lines: number;
+  transcript_clipped: boolean;
+  had_brief: boolean;
+  call_ms: number;
+}
+
+export interface AssistRecordData {
+  cards: RecordedAssistCard[];
+  skipped: number;
+  after_call: AfterCallSummary | null;
+  after_call_running: boolean;
+  has_brief: boolean;
+  folder: string | null;
+}
+
+export interface AssistAfterCallEvent {
+  state: 'running' | 'done' | 'error';
+  folder: string;
+  message?: string;
+}
+
+/** "12:05" from seconds since the recording started. */
+export function clockFromSeconds(seconds: number): string {
+  const s = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const pad = (n: number) => n.toString().padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(s % 60)}` : `${pad(m)}:${pad(s % 60)}`;
+}

@@ -22,8 +22,10 @@
 pub mod cards;
 pub mod engine;
 pub mod mcp_probe;
+pub mod record;
 pub mod settings;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -42,7 +44,8 @@ use crate::state::AppState;
 use crate::summary::llm_client::{generate_completion, CompletionOptions};
 use crate::summary::llm_target::LlmTarget;
 use cards::{keep_kinds, parse_cards, PromptParts, Side};
-use engine::{Card, Config, Engine};
+use engine::{Card, Config, Engine, BRIEF_SOURCE_SEQ};
+use record::{AfterCall, AfterCallStatus, CardEvent, CardLog, Span, SpanLine};
 use settings::{AssistSettings, McpTransport, BRIEF_KEY, SETTINGS_KEY};
 
 /// New cards, newest first: `{ "cards": Card[] }`.
@@ -107,7 +110,8 @@ struct Session {
 }
 
 enum Msg {
-    Line { seq: u64, side: Side, text: String },
+    /// A final transcript line; `start_s`/`end_s` are recording-relative.
+    Line { seq: u64, side: Side, text: String, start_s: f64, end_s: f64 },
     Retract(u64),
     CallDone { call_id: u64, result: Result<String, String> },
     /// The meeting-brief read numbered `read` finished; `chars` is the
@@ -197,6 +201,67 @@ fn emit_withdraw<R: Runtime>(app: &AppHandle<R>, ids: Vec<String>, reason: &str)
     }
 }
 
+/// One recording's card record (WORK-672): every card that reaches the
+/// panel goes through `shown`, every removal through `withdrawn`, so the
+/// panel and `record::CARDS_FILE` cannot disagree. DO NOT emit
+/// `ASSIST_UPDATE_EVENT` or `ASSIST_WITHDRAW_EVENT` around it.
+struct CallRecord {
+    log: CardLog,
+    /// Final transcript lines by sequence id, for the line each card cites.
+    lines: HashMap<u64, SpanLine>,
+}
+
+impl CallRecord {
+    fn new(folder: Option<&Path>) -> Self {
+        Self { log: CardLog::new(folder), lines: HashMap::new() }
+    }
+
+    fn on_line(&mut self, seq: u64, side: Side, text: &str, start_s: f64, end_s: f64) {
+        let line = SpanLine { seq, side: record::side_name(side).into(), text: text.to_string(), start_s, end_s };
+        self.lines.insert(seq, line);
+    }
+
+    /// Record and show new cards (`added` is newest first, as the engine
+    /// returns them; the record is written oldest first).
+    fn shown<R: Runtime>(&mut self, app: &AppHandle<R>, engine: &Engine, added: &[Card]) {
+        if added.is_empty() {
+            return;
+        }
+        let window_lines: Vec<&SpanLine> = engine.lines().filter_map(|l| self.lines.get(&l.seq)).collect();
+        let window = Span::of(&window_lines);
+        let at_ms = chrono::Utc::now().timestamp_millis();
+        for card in added.iter().rev() {
+            let from_brief = card.source_seq == BRIEF_SOURCE_SEQ;
+            self.log.append(&CardEvent::Shown {
+                at_ms,
+                card: card.clone(),
+                source: if from_brief { None } else { self.lines.get(&card.source_seq).cloned() },
+                window: if from_brief { None } else { window.clone() },
+            });
+        }
+        log_cards_for_test(added);
+        if let Err(e) = app.emit(ASSIST_UPDATE_EVENT, serde_json::json!({ "cards": added })) {
+            error!("live assist: failed to emit cards: {e}");
+        }
+    }
+
+    fn withdrawn<R: Runtime>(&mut self, app: &AppHandle<R>, ids: Vec<String>, reason: &str) {
+        if ids.is_empty() {
+            return;
+        }
+        self.log.append(&CardEvent::Withdrawn {
+            at_ms: chrono::Utc::now().timestamp_millis(),
+            ids: ids.clone(),
+            reason: reason.to_string(),
+        });
+        emit_withdraw(app, ids, reason);
+    }
+
+    fn event(&mut self, event: CardEvent) {
+        self.log.append(&event);
+    }
+}
+
 // ============================================================================
 // SESSION LIFECYCLE (called by recording_commands)
 // ============================================================================
@@ -220,6 +285,8 @@ pub fn start_session<R: Runtime>(app: &AppHandle<R>, meeting_folder: Option<Path
             seq: update.sequence_id,
             side: Side::from_speaker(update.speaker.as_deref()),
             text: update.text,
+            start_s: update.audio_start_time,
+            end_s: update.audio_end_time,
         });
     });
     let retract_tx = tx.clone();
@@ -352,13 +419,7 @@ fn to_sidecar(message: serde_json::Value) {
     }
 }
 
-fn side_name(side: Side) -> &'static str {
-    match side {
-        Side::Me => "me",
-        Side::Them => "them",
-        Side::Unknown => "unknown",
-    }
-}
+use record::side_name;
 
 fn send_shown(engine: &Engine) {
     to_sidecar(serde_json::json!({ "type": "shown", "texts": engine.shown_texts() }));
@@ -603,6 +664,7 @@ async fn run<R: Runtime>(
     let mut brief_read: Option<String> = None;
     let mut brief_reads: u64 = 0;
     let mut brief_cancel: Option<CancellationToken> = None;
+    let mut call_record = CallRecord::new(folder.as_deref());
 
     loop {
         tokio::select! {
@@ -610,10 +672,11 @@ async fn run<R: Runtime>(
                 let Some(msg) = msg else { break };
                 match msg {
                     Msg::Stop => break,
-                    Msg::Line { seq, side, text } => {
+                    Msg::Line { seq, side, text, start_s, end_s } => {
                         if attached.is_some() {
                             to_sidecar(serde_json::json!({ "type": "line", "seq": seq, "side": side_name(side), "text": text }));
                         }
+                        call_record.on_line(seq, side, &text, start_s, end_s);
                         engine.on_line(seq, side, &text, Instant::now());
                     }
                     Msg::Retract(seq) => {
@@ -624,7 +687,7 @@ async fn run<R: Runtime>(
                         let withdrawn = engine.on_retract(seq);
                         info!("live assist: transcript line {seq} retracted, withdrawing {} card(s)", withdrawn.len());
                         if !withdrawn.is_empty() {
-                            emit_withdraw(&app, withdrawn, "retracted");
+                            call_record.withdrawn(&app, withdrawn, "retracted");
                             if had_pins {
                                 save_pins(folder.as_deref(), &engine.pinned());
                             }
@@ -663,7 +726,7 @@ async fn run<R: Runtime>(
                         // Only the attached connection's events: one queued
                         // before a detach, or from an earlier sidecar, is dropped.
                         if attached == Some(generation) {
-                            apply_sidecar_event(&app, &mut engine, event, calls_allowed(&calls_off));
+                            apply_sidecar_event(&app, &mut engine, &mut call_record, event, calls_allowed(&calls_off));
                         }
                     }
                     Msg::Reconfigure => {
@@ -685,7 +748,7 @@ async fn run<R: Runtime>(
                             brief_due = None;
                             let withdrawn = engine.withdraw_brief_cards();
                             if !withdrawn.is_empty() {
-                                emit_withdraw(&app, withdrawn, "evicted");
+                                call_record.withdrawn(&app, withdrawn, "evicted");
                                 if attached.is_some() {
                                     send_shown(&engine);
                                 }
@@ -711,7 +774,7 @@ async fn run<R: Runtime>(
                             }
                         }
                         let since_final = trigger.filter(|(id, _)| *id == call_id).map(|(_, at)| at.elapsed());
-                        apply_result(&app, &mut engine, call_id, result, since_final);
+                        apply_result(&app, &mut engine, &mut call_record, call_id, result, since_final);
                     }
                     Msg::BriefRead { read, chars, result } => {
                         if read != brief_reads || !calls_allowed(&calls_off) {
@@ -730,13 +793,8 @@ async fn run<R: Runtime>(
                                 let raw = keep_kinds(raw, &load_settings(&app).card_kinds.enabled());
                                 let applied = engine.on_brief_cards(raw, chrono::Utc::now().timestamp_millis());
                                 info!("live assist: brief read {read} added {} card(s)", applied.added.len());
-                                log_cards_for_test(&applied.added);
-                                if !applied.added.is_empty() {
-                                    if let Err(e) = app.emit(ASSIST_UPDATE_EVENT, serde_json::json!({ "cards": applied.added })) {
-                                        error!("live assist: failed to emit cards: {e}");
-                                    }
-                                }
-                                emit_withdraw(&app, applied.evicted, "evicted");
+                                call_record.shown(&app, &engine, &applied.added);
+                                call_record.withdrawn(&app, applied.evicted, "evicted");
                                 emit_brief(&app, "done", chars, Some(applied.added.len()), None);
                                 if attached.is_some() {
                                     send_shown(&engine);
@@ -751,6 +809,7 @@ async fn run<R: Runtime>(
                     Msg::Dismiss(id) => {
                         let was_pinned = engine.cards().iter().any(|c| c.id == id && c.pinned);
                         if engine.dismiss(&id) {
+                            call_record.event(CardEvent::Dismissed { at_ms: chrono::Utc::now().timestamp_millis(), id });
                             if was_pinned {
                                 save_pins(folder.as_deref(), &engine.pinned());
                             }
@@ -761,11 +820,18 @@ async fn run<R: Runtime>(
                     }
                     Msg::Pin { id, pinned, reply } => {
                         let result = pin_and_save(&mut engine, folder.as_deref(), &id, pinned);
+                        if let Ok(card) = &result {
+                            call_record.event(CardEvent::Pinned {
+                                at_ms: chrono::Utc::now().timestamp_millis(),
+                                id: card.id.clone(),
+                                pinned: card.pinned,
+                            });
+                        }
                         let unpinned = result.as_ref().is_ok_and(|c| !c.pinned);
                         let _ = reply.send(result);
                         if unpinned {
                             // An unpinned card counts toward the limit again.
-                            emit_withdraw(&app, engine.evict_overflow(), "evicted");
+                            call_record.withdrawn(&app, engine.evict_overflow(), "evicted");
                         }
                     }
                     Msg::Cards(reply) => {
@@ -897,6 +963,20 @@ async fn run<R: Runtime>(
         clear_brief_if(&app, &brief);
     }
     emit_status(&app, "stopped", None);
+    // One more call, over the whole transcript plus the brief (WORK-672).
+    // Only when assist is on: with it off, Live Assist makes no LLM call.
+    // This runs after the transcript drain (Msg::Stop comes from
+    // stop_session), so transcripts.json is complete.
+    if ENABLED.load(Ordering::SeqCst) {
+        if let Some(folder) = folder {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = run_after_call(&app, &folder, Some(brief)).await {
+                    info!("live assist: no after-call summary for this recording: {e}");
+                }
+            });
+        }
+    }
 }
 
 /// Calls may run: assist is on and Stop has not been pressed.
@@ -906,7 +986,13 @@ fn calls_allowed(calls_off: &CancellationToken) -> bool {
 
 /// Apply one of the sidecar's call reports. Cards that arrive after assist
 /// was turned off or Stop was pressed are dropped, as on the Direct engine.
-fn apply_sidecar_event<R: Runtime>(app: &AppHandle<R>, engine: &mut Engine, event: SidecarEvent, allowed: bool) {
+fn apply_sidecar_event<R: Runtime>(
+    app: &AppHandle<R>,
+    engine: &mut Engine,
+    call_record: &mut CallRecord,
+    event: SidecarEvent,
+    allowed: bool,
+) {
     match event {
         SidecarEvent::AssistStarted { call_id, trigger } => {
             info!("live assist: sidecar call {call_id} started ({trigger})");
@@ -941,13 +1027,8 @@ fn apply_sidecar_event<R: Runtime>(app: &AppHandle<R>, engine: &mut Engine, even
                 since_end_of_turn_ms.map_or("?".to_string(), |v| v.to_string()),
                 call_ms.map_or("?".to_string(), |v| v.to_string()),
             );
-            log_cards_for_test(&applied.added);
-            if !applied.added.is_empty() {
-                if let Err(e) = app.emit(ASSIST_UPDATE_EVENT, serde_json::json!({ "cards": applied.added })) {
-                    error!("live assist: failed to emit cards: {e}");
-                }
-            }
-            emit_withdraw(app, applied.evicted, "evicted");
+            call_record.shown(app, engine, &applied.added);
+            call_record.withdrawn(app, applied.evicted, "evicted");
             send_shown(engine);
             emit_status(app, "idle", None);
         }
@@ -983,13 +1064,8 @@ fn apply_sidecar_event<R: Runtime>(app: &AppHandle<R>, engine: &mut Engine, even
                 applied.added.len(),
                 call_ms.map_or("?".to_string(), |v| v.to_string()),
             );
-            log_cards_for_test(&applied.added);
-            if !applied.added.is_empty() {
-                if let Err(e) = app.emit(ASSIST_UPDATE_EVENT, serde_json::json!({ "cards": applied.added })) {
-                    error!("live assist: failed to emit cards: {e}");
-                }
-            }
-            emit_withdraw(app, applied.evicted, "evicted");
+            call_record.shown(app, engine, &applied.added);
+            call_record.withdrawn(app, applied.evicted, "evicted");
             send_shown(engine);
             emit_research(app, "done", &question, None, Some(applied.added.len()));
         }
@@ -1039,6 +1115,7 @@ fn emit_brief<R: Runtime>(app: &AppHandle<R>, state: &str, chars: usize, cards: 
 fn apply_result<R: Runtime>(
     app: &AppHandle<R>,
     engine: &mut Engine,
+    call_record: &mut CallRecord,
     call_id: u64,
     result: Result<String, String>,
     since_final: Option<Duration>,
@@ -1073,13 +1150,8 @@ fn apply_result<R: Runtime>(
         applied.added.len(),
         since_final.map_or(0, |d| d.as_millis())
     );
-    log_cards_for_test(&applied.added);
-    if !applied.added.is_empty() {
-        if let Err(e) = app.emit(ASSIST_UPDATE_EVENT, serde_json::json!({ "cards": applied.added })) {
-            error!("live assist: failed to emit cards: {e}");
-        }
-    }
-    emit_withdraw(app, applied.evicted, "evicted");
+    call_record.shown(app, engine, &applied.added);
+    call_record.withdrawn(app, applied.evicted, "evicted");
     emit_status(app, "idle", None);
 }
 
@@ -1089,19 +1161,33 @@ async fn call_llm<R: Runtime>(app: &AppHandle<R>, prompt: &str, cancel: &Cancell
     // The Direct engine has no research lane: never offer the field.
     let system = compose_prompt(&settings, &brief, false);
     let (_, model, target) = assist_target(app, &settings).await?;
-    let app_data_dir = app.path().app_data_dir().ok();
     let options = CompletionOptions {
         claude_max_tokens: CLAUDE_MAX_TOKENS,
         claude_thinking_off: true,
         claude_cache_system: true,
         timeout: CALL_TIMEOUT,
     };
+    complete(app, &target, &model, &system, prompt, Some(cancel), &options).await
+}
+
+/// One completion on `target`: the one place assist calls reach
+/// `generate_completion`.
+async fn complete<R: Runtime>(
+    app: &AppHandle<R>,
+    target: &LlmTarget,
+    model: &str,
+    system: &str,
+    prompt: &str,
+    cancel: Option<&CancellationToken>,
+    options: &CompletionOptions,
+) -> Result<String, String> {
+    let app_data_dir = app.path().app_data_dir().ok();
     let completion = generate_completion(
         &HTTP,
         &target.provider,
-        &model,
+        model,
         &target.api_key,
-        &system,
+        system,
         prompt,
         target.ollama_endpoint.as_deref(),
         target.custom_openai_endpoint.as_deref(),
@@ -1109,11 +1195,175 @@ async fn call_llm<R: Runtime>(app: &AppHandle<R>, prompt: &str, cancel: &Cancell
         target.custom_openai_temperature,
         target.custom_openai_top_p,
         app_data_dir.as_ref(),
-        Some(cancel),
-        &options,
+        cancel,
+        options,
     )
     .await?;
     Ok(completion.content)
+}
+
+// ============================================================================
+// AFTER-CALL OUTPUT (WORK-672)
+// ============================================================================
+
+/// `{ "state": "running" | "done" | "error", "folder": string, "message"?: string }`.
+pub const ASSIST_AFTER_CALL_EVENT: &str = "assist-after-call";
+
+/// A whole transcript plus a written answer of up to ~1,500 words: measured
+/// calls are well inside this, and a slow one is still worth waiting for
+/// (nobody is mid-sentence any more).
+const AFTER_CALL_TIMEOUT: Duration = Duration::from_secs(180);
+const AFTER_CALL_MAX_TOKENS: u32 = 4096;
+
+/// Meeting folders with an after-call call running: one at a time each, so
+/// "Write it again" during the automatic run does not start a second call.
+static AFTER_CALL_RUNNING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+struct AfterCallSlot(PathBuf);
+
+impl AfterCallSlot {
+    fn claim(folder: &Path) -> Option<Self> {
+        let mut running = AFTER_CALL_RUNNING.lock().unwrap();
+        if running.iter().any(|p| p == folder) {
+            return None;
+        }
+        running.push(folder.to_path_buf());
+        Some(Self(folder.to_path_buf()))
+    }
+}
+
+impl Drop for AfterCallSlot {
+    fn drop(&mut self) {
+        AFTER_CALL_RUNNING.lock().unwrap().retain(|p| p != &self.0);
+    }
+}
+
+fn after_call_running(folder: &Path) -> bool {
+    AFTER_CALL_RUNNING.lock().unwrap().iter().any(|p| p == folder)
+}
+
+fn emit_after_call<R: Runtime>(app: &AppHandle<R>, state: &str, folder: &Path, message: Option<String>) {
+    let mut payload = serde_json::json!({ "state": state, "folder": folder.to_string_lossy() });
+    if let Some(m) = message {
+        payload["message"] = serde_json::Value::String(m);
+    }
+    if let Err(e) = app.emit(ASSIST_AFTER_CALL_EVENT, payload) {
+        error!("live assist: failed to emit after-call status: {e}");
+    }
+}
+
+/// Once the recording has stopped: read the whole saved transcript plus
+/// the meeting brief and write `record::AFTER_CALL_FILE` in the meeting
+/// folder. `brief`: the brief the call ran with; None reads the one kept in
+/// the folder's `live-assist.json` (a later "Write it again").
+///
+/// The automatic run (end of `run`) and `live_assist_run_after_call` share
+/// this path. A failure is written to the file only when there is no good
+/// output yet: a retry that fails keeps the earlier output.
+async fn run_after_call<R: Runtime>(app: &AppHandle<R>, folder: &Path, brief: Option<String>) -> Result<AfterCall, String> {
+    let _slot = AfterCallSlot::claim(folder).ok_or("the after-call summary is already being written")?;
+    let brief = match brief {
+        Some(b) => b,
+        None => read_kept_brief(folder),
+    };
+    let transcript = record::read_transcript(folder)?;
+    if transcript.is_empty() {
+        return Err("the recording has no transcript".into());
+    }
+    emit_after_call(app, "running", folder, None);
+    let settings = load_settings(app);
+    let started = Instant::now();
+    let (system, (prompt, clipped)) = {
+        let parts = prompt_parts(&settings, &brief, false);
+        (
+            cards::after_call_system_prompt(&parts),
+            cards::after_call_user_prompt(
+                transcript.iter().map(|l| (record::side_from_name(&l.side), l.start_s, l.text.as_str())),
+                cards::AFTER_CALL_MAX_TRANSCRIPT_CHARS,
+            ),
+        )
+    };
+    let target = assist_target(app, &settings).await;
+    let (provider, model) = match &target {
+        Ok((provider, model, _)) => (provider.clone(), model.clone()),
+        Err(_) => (String::new(), String::new()),
+    };
+    let result = match target {
+        Ok((_, model, target)) => {
+            let options = CompletionOptions {
+                claude_max_tokens: AFTER_CALL_MAX_TOKENS,
+                claude_thinking_off: true,
+                claude_cache_system: false,
+                timeout: AFTER_CALL_TIMEOUT,
+            };
+            match tokio::time::timeout(
+                AFTER_CALL_TIMEOUT,
+                complete(app, &target, &model, &system, &prompt, None, &options),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(format!("timed out after {} s", AFTER_CALL_TIMEOUT.as_secs())),
+            }
+        }
+        Err(e) => Err(e),
+    };
+    let call_ms = started.elapsed().as_millis() as u64;
+    let result = result.and_then(|out| {
+        let out = out.trim().to_string();
+        if out.is_empty() {
+            Err("the model returned an empty reply".to_string())
+        } else {
+            Ok(out)
+        }
+    });
+    let after = AfterCall {
+        version: 1,
+        status: if result.is_ok() { AfterCallStatus::Done } else { AfterCallStatus::Error },
+        created_at_ms: chrono::Utc::now().timestamp_millis(),
+        provider,
+        model,
+        output: result.as_ref().cloned().unwrap_or_default(),
+        error: result.as_ref().err().cloned(),
+        transcript_lines: transcript.len(),
+        transcript_clipped: clipped,
+        had_brief: !brief.trim().is_empty(),
+        call_ms,
+    };
+    // DO NOT log the output: it is built from the meeting.
+    info!(
+        "live assist: after-call summary {} in {call_ms} ms ({} transcript lines{}, brief: {})",
+        if result.is_ok() { "written" } else { "failed" },
+        transcript.len(),
+        if clipped { ", oldest left out" } else { "" },
+        after.had_brief,
+    );
+    let keep_earlier = result.is_err()
+        && matches!(record::read_after_call(folder), Ok(Some(ref prev)) if prev.status == AfterCallStatus::Done);
+    if !keep_earlier {
+        record::write_after_call(folder, &after)
+            .map_err(|e| format!("could not save the after-call summary in {}: {e}", folder.display()))?;
+    }
+    match result {
+        Ok(_) => {
+            emit_after_call(app, "done", folder, None);
+            Ok(after)
+        }
+        Err(e) => {
+            warn!("live assist: after-call summary failed: {e}");
+            emit_after_call(app, "error", folder, Some(e.clone()));
+            Err(e)
+        }
+    }
+}
+
+/// The brief kept with a meeting (`live-assist.json`), or empty.
+fn read_kept_brief(folder: &Path) -> String {
+    std::fs::read(folder.join(PINS_FILE))
+        .ok()
+        .and_then(|body| serde_json::from_slice::<PinsFile>(&body).ok())
+        .and_then(|f| f.brief)
+        .unwrap_or_default()
 }
 
 // ============================================================================
@@ -1589,14 +1839,72 @@ pub async fn ai_assist_test_mcp(server: settings::McpServer) -> Result<Vec<mcp_p
 /// Pinned cards saved with a meeting (empty when it has none).
 #[tauri::command]
 pub async fn live_assist_get_pinned(state: tauri::State<'_, AppState>, meeting_id: String) -> Result<Vec<Card>, String> {
-    let meeting = MeetingsRepository::get_meeting_metadata(state.db_manager.pool(), &meeting_id)
+    match meeting_folder(&state, &meeting_id).await? {
+        Some(folder) => read_pins(&folder),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// A meeting's recording folder, if it has one.
+async fn meeting_folder(state: &AppState, meeting_id: &str) -> Result<Option<PathBuf>, String> {
+    let meeting = MeetingsRepository::get_meeting_metadata(state.db_manager.pool(), meeting_id)
         .await
         .map_err(|e| format!("Failed to load meeting metadata: {e}"))?
         .ok_or_else(|| format!("Meeting not found: {meeting_id}"))?;
-    match meeting.folder_path.filter(|p| !p.trim().is_empty()) {
-        Some(folder) => read_pins(Path::new(&folder)),
-        None => Ok(Vec::new()),
-    }
+    Ok(meeting.folder_path.filter(|p| !p.trim().is_empty()).map(PathBuf::from))
+}
+
+/// What Live Assist kept with a meeting (WORK-672): every card it showed,
+/// and the after-call summary.
+#[derive(Serialize)]
+pub struct AssistRecord {
+    cards: Vec<record::RecordedCard>,
+    /// Unreadable lines left out of `cards` (a crash mid-write).
+    skipped: usize,
+    after_call: Option<AfterCall>,
+    after_call_running: bool,
+    /// A meeting brief was kept with the meeting: Live Assist ran on it, so
+    /// the page offers to write the after-call summary when there is none.
+    has_brief: bool,
+    /// The folder, so the page can match `assist-after-call` events to it.
+    folder: Option<String>,
+}
+
+#[tauri::command]
+pub async fn live_assist_get_record(state: tauri::State<'_, AppState>, meeting_id: String) -> Result<AssistRecord, String> {
+    let Some(folder) = meeting_folder(&state, &meeting_id).await? else {
+        return Ok(AssistRecord {
+            cards: Vec::new(),
+            skipped: 0,
+            after_call: None,
+            after_call_running: false,
+            has_brief: false,
+            folder: None,
+        });
+    };
+    let (cards, skipped) = record::read_cards(&folder)?;
+    Ok(AssistRecord {
+        cards,
+        skipped,
+        after_call: record::read_after_call(&folder)?,
+        after_call_running: after_call_running(&folder),
+        has_brief: !read_kept_brief(&folder).trim().is_empty(),
+        folder: Some(folder.to_string_lossy().into_owned()),
+    })
+}
+
+/// Write (or rewrite) a meeting's after-call summary now: the same call the
+/// end of a recording makes, over the saved transcript and the brief kept
+/// with the meeting. Also the way to get one for a recording made before
+/// this existed.
+#[tauri::command]
+pub async fn live_assist_run_after_call<R: Runtime>(
+    app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    meeting_id: String,
+) -> Result<AfterCall, String> {
+    let folder = meeting_folder(&state, &meeting_id).await?.ok_or("this meeting has no recording folder")?;
+    run_after_call(&app, &folder, None).await
 }
 
 #[cfg(test)]
@@ -1840,7 +2148,7 @@ mod tests {
             })
         );
         let ts = include_str!("../../../src/lib/live-assist.ts");
-        for event in [ASSIST_UPDATE_EVENT, ASSIST_WITHDRAW_EVENT, ASSIST_STATUS_EVENT, ASSIST_RESEARCH_EVENT, ASSIST_BRIEF_EVENT] {
+        for event in [ASSIST_UPDATE_EVENT, ASSIST_WITHDRAW_EVENT, ASSIST_STATUS_EVENT, ASSIST_RESEARCH_EVENT, ASSIST_BRIEF_EVENT, ASSIST_AFTER_CALL_EVENT] {
             assert!(ts.contains(&format!("'{event}'")), "frontend does not listen for {event}");
         }
         assert!(ts.contains(&format!("BRIEF_ORIGIN = '{}'", engine::BRIEF_ORIGIN)), "frontend brief origin differs");

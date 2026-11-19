@@ -268,9 +268,15 @@ pub fn read_after_call(folder: &Path) -> Result<Option<AfterCall>, String> {
 }
 
 /// The saved transcript of a meeting folder (`transcripts.json`, which
-/// never keeps a retracted line), in file order: Meetily's sequence. The
-/// two channels' clocks can disagree, so this order, not the times, is the
-/// order of the conversation.
+/// never keeps a retracted line), in order of each line's START time.
+///
+/// DO NOT use the file order for the conversation: it is the order the
+/// finals ARRIVED, and a long turn on one side is finalised only when it
+/// ends, so it lands after the other side's short replies made during it.
+/// Measured on WORK-672's 45-minute interview: 51 of 289 lines started more
+/// than 3 s (up to 111 s) before the line above them in the file, while each
+/// channel's own times were monotonic and both spanned the whole recording
+/// (no clock offset between the channels). Time order is the conversation.
 pub fn read_transcript(folder: &Path) -> Result<Vec<SpanLine>, String> {
     #[derive(Deserialize)]
     struct Segment {
@@ -291,7 +297,7 @@ pub fn read_transcript(folder: &Path) -> Result<Vec<SpanLine>, String> {
     let path = folder.join("transcripts.json");
     let body = std::fs::read(&path).map_err(|e| format!("could not read {}: {e}", path.display()))?;
     let file: File = serde_json::from_slice(&body).map_err(|e| format!("could not parse {}: {e}", path.display()))?;
-    Ok(file
+    let mut lines: Vec<SpanLine> = file
         .segments
         .into_iter()
         .filter(|s| !s.text.trim().is_empty())
@@ -302,7 +308,10 @@ pub fn read_transcript(folder: &Path) -> Result<Vec<SpanLine>, String> {
             start_s: s.audio_start_time,
             end_s: s.audio_end_time,
         })
-        .collect())
+        .collect();
+    // Stable: lines with equal start times keep their arrival order.
+    lines.sort_by(|a, b| a.start_s.total_cmp(&b.start_s));
+    Ok(lines)
 }
 
 #[cfg(test)]
@@ -400,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn the_saved_transcript_is_read_in_file_order_with_sides() {
+    fn the_saved_transcript_is_read_in_start_time_order_with_sides() {
         let dir = tempfile::tempdir().unwrap();
         let body = serde_json::json!({
             "version": "1.0",
@@ -416,6 +425,7 @@ mod tests {
         });
         std::fs::write(dir.path().join("transcripts.json"), body.to_string()).unwrap();
         let lines = read_transcript(dir.path()).unwrap();
-        assert_eq!(lines.iter().map(|l| (l.seq, l.side.as_str())).collect::<Vec<_>>(), [(9, "them"), (11, "me")]);
+        // Line 11 arrived last but started first (a turn finalised late).
+        assert_eq!(lines.iter().map(|l| (l.seq, l.side.as_str())).collect::<Vec<_>>(), [(11, "me"), (9, "them")]);
     }
 }

@@ -357,7 +357,7 @@ what you write. The rest is reference information.\n",
 }
 
 /// User prompt of the after-call call: the whole transcript, one line each
-/// as `[mm:ss] Me|Them: text`, in Meetily's order. Returns the prompt and
+/// as `[mm:ss] Me|Them: text`, in start-time order (`record::read_transcript`). Returns the prompt and
 /// whether the oldest lines were left out to fit `max_chars`.
 pub fn after_call_user_prompt<'a>(
     lines: impl DoubleEndedIterator<Item = (Side, f64, &'a str)>,

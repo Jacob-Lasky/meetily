@@ -128,7 +128,10 @@ export function AssistRecord({ meetingId }: { meetingId: string }) {
       {error && !writing && <p className="text-sm text-red-700">{error}</p>}
       {!writing && after?.status === 'done' && (
         <>
-          <div className="prose prose-sm max-w-none text-gray-900">
+          {/* Every prose colour named from the app palette: the typography plugin's own
+              defaults are fixed hex values that dark mode cannot remap (gotcha 28 in the
+              meetily skill), so headings and bold text came out dark on dark. */}
+          <div className="prose prose-sm max-w-none text-gray-900 prose-headings:text-gray-900 prose-h1:text-lg prose-h2:text-base prose-h3:text-sm prose-strong:text-gray-900 prose-a:text-blue-700 prose-code:text-gray-900 prose-blockquote:text-gray-700 prose-li:marker:text-gray-500">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>{after.output}</ReactMarkdown>
           </div>
           <p className="mt-2 text-xs text-gray-500">

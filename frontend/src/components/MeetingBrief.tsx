@@ -6,7 +6,7 @@ import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 import { ChevronDown, ChevronRight, ClipboardList, Plus, Search } from 'lucide-react';
 import { briefEntry, type EarlierMeeting } from '@/lib/ai-assist-settings';
-import { ASSIST_BRIEF_CLEARED_EVENT } from '@/lib/live-assist';
+import { ASSIST_BRIEF_CLEARED_EVENT, ASSIST_BRIEF_LOADED_EVENT } from '@/lib/live-assist';
 
 const SAVE_DELAY_MS = 600;
 
@@ -44,8 +44,19 @@ export function MeetingBrief({ defaultOpen }: { defaultOpen: boolean }) {
       latest.current = '';
       setBrief('');
     });
+    // A brief prepared from the calendar went into the empty box as a
+    // recording started (WORK-677). The backend only loads it into an empty
+    // box; one typed here but not yet saved still wins, and its pending save
+    // replaces the prepared one.
+    const unlistenLoaded = listen<{ brief: string }>(ASSIST_BRIEF_LOADED_EVENT, (e) => {
+      if (latest.current.trim() !== '') return;
+      latest.current = e.payload.brief;
+      setBrief(e.payload.brief);
+      setOpen(true);
+    });
     return () => {
       unlisten.then((un) => un());
+      unlistenLoaded.then((un) => un());
       if (saveTimer.current) {
         clearTimeout(saveTimer.current);
         flush(latest.current);

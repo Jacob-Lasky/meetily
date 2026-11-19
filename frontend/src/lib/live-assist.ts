@@ -18,6 +18,8 @@ export const ASSIST_BRIEF_EVENT = 'assist-brief';
 export const BRIEF_ORIGIN = 'brief';
 /** The meeting brief was saved with the meeting that stopped and cleared. */
 export const ASSIST_BRIEF_CLEARED_EVENT = 'assist-brief-cleared';
+/** A brief prepared from the calendar was put into the empty box (WORK-677, live_assist::BRIEF_LOADED_EVENT). */
+export const ASSIST_BRIEF_LOADED_EVENT = 'assist-brief-loaded';
 
 export type AssistCardKind = 'answer' | 'ask' | 'fact' | 'todo';
 

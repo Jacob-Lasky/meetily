@@ -2,10 +2,12 @@
 //! list its tools, so a bad command, URL or header shows up before a call and
 //! the allowlist can be picked from the real tool names.
 //!
-//! This is only the settings check. The research lane itself connects from
-//! the Pipecat sidecar through Pipecat's `MCPClient` (stdio, SSE and
-//! streamable HTTP); this probe speaks the same JSON-RPC handshake for stdio
-//! and streamable HTTP. Legacy SSE servers are not probed.
+//! The research lane itself connects from the Pipecat sidecar through
+//! Pipecat's `MCPClient` (stdio, SSE and streamable HTTP); this module speaks
+//! the same JSON-RPC handshake for stdio and streamable HTTP. Legacy SSE
+//! servers are not supported here. `call_tool` makes one tool call over the
+//! same handshake: the calendar (WORK-677) reads events and looks up meeting
+//! context with it, outside any recording, so it cannot use the sidecar.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -27,12 +29,56 @@ pub struct ToolInfo {
 }
 
 pub async fn list_tools(server: &McpServer) -> Result<Vec<ToolInfo>, String> {
+    tools_from(&exchange(server, tools_list()).await?)
+}
+
+/// One `tools/call`: the call's `result` object, or why it failed (the
+/// server's JSON-RPC error, or a result marked `isError`, with its text).
+pub async fn call_tool(server: &McpServer, tool: &str, arguments: serde_json::Value) -> Result<serde_json::Value, String> {
+    let request = serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": { "name": tool, "arguments": arguments },
+    });
+    let reply = exchange(server, request).await?;
+    if let Some(err) = reply.get("error") {
+        return Err(format!("{} refused {tool}: {err}", server.name));
+    }
+    let result = reply.get("result").cloned().ok_or_else(|| format!("{}'s {tool} reply held no result", server.name))?;
+    if result.get("isError").and_then(|v| v.as_bool()) == Some(true) {
+        return Err(format!("{tool} failed: {}", clip(&result_text(&result), 400)));
+    }
+    Ok(result)
+}
+
+/// The text parts of a `tools/call` result, joined.
+pub fn result_text(result: &serde_json::Value) -> String {
+    result
+        .get("content")
+        .and_then(|c| c.as_array())
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+fn clip(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
+/// Initialize, then send `request` (JSON-RPC id 2) and return its response.
+async fn exchange(server: &McpServer, request: serde_json::Value) -> Result<serde_json::Value, String> {
     let timed_out = || format!("{} did not answer within {} s", server.name, PROBE_TIMEOUT.as_secs());
     match server.transport {
-        McpTransport::Stdio => stdio(server).await,
-        McpTransport::Http => tokio::time::timeout(PROBE_TIMEOUT, http(server)).await.map_err(|_| timed_out())?,
-        McpTransport::Sse => Err("Test only covers local and streamable-HTTP servers; an SSE server is \
-                                  checked when the first lookup runs"
+        McpTransport::Stdio => stdio(server, request).await,
+        McpTransport::Http => {
+            tokio::time::timeout(PROBE_TIMEOUT, http(server, request)).await.map_err(|_| timed_out())?
+        }
+        McpTransport::Sse => Err("only local and streamable-HTTP servers can be reached from here; an SSE \
+                                  server is checked when the first lookup runs"
             .to_string()),
     }
 }
@@ -76,7 +122,7 @@ fn tools_from(response: &serde_json::Value) -> Result<Vec<ToolInfo>, String> {
         .collect())
 }
 
-async fn stdio(server: &McpServer) -> Result<Vec<ToolInfo>, String> {
+async fn stdio(server: &McpServer, request: serde_json::Value) -> Result<serde_json::Value, String> {
     let mut cmd = tokio::process::Command::new(server.command.trim());
     cmd.args(&server.args)
         // DO NOT pass the app's whole environment: inside the AppImage it
@@ -105,7 +151,7 @@ async fn stdio(server: &McpServer) -> Result<Vec<ToolInfo>, String> {
         stdin.write_all(send(initialize()).as_bytes()).await.map_err(|e| format!("write failed: {e}"))?;
         read_reply(&mut lines, 1).await?;
         stdin.write_all(send(initialized()).as_bytes()).await.map_err(|e| format!("write failed: {e}"))?;
-        stdin.write_all(send(tools_list()).as_bytes()).await.map_err(|e| format!("write failed: {e}"))?;
+        stdin.write_all(send(request).as_bytes()).await.map_err(|e| format!("write failed: {e}"))?;
         read_reply(&mut lines, 2).await
     };
     let reply = tokio::time::timeout(PROBE_TIMEOUT, talk)
@@ -119,7 +165,7 @@ async fn stdio(server: &McpServer) -> Result<Vec<ToolInfo>, String> {
     #[cfg(not(unix))]
     let _ = group;
     let _ = child.kill().await;
-    tools_from(&reply??)
+    reply?
 }
 
 /// SIGKILL a process group (tokio has no group kill; `kill(1)` does).
@@ -152,7 +198,7 @@ async fn read_reply(
     Err("the server exited before it answered".into())
 }
 
-async fn http(server: &McpServer) -> Result<Vec<ToolInfo>, String> {
+async fn http(server: &McpServer, request: serde_json::Value) -> Result<serde_json::Value, String> {
     let client = reqwest::Client::new();
     let url = server.url.trim();
     let post = |body: serde_json::Value, session: Option<&str>| {
@@ -182,13 +228,14 @@ async fn http(server: &McpServer) -> Result<Vec<ToolInfo>, String> {
         return Err(format!("the server refused initialize: {err}"));
     }
     let _ = post(initialized(), session.as_deref()).await;
-    let resp = post(tools_list(), session.as_deref()).await.map_err(|e| format!("tools/list failed: {e}"))?;
+    let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("request").to_string();
+    let resp = post(request, session.as_deref()).await.map_err(|e| format!("{method} failed: {e}"))?;
     let status = resp.status();
     let body = resp.text().await.map_err(|e| format!("could not read the reply: {e}"))?;
     if !status.is_success() {
-        return Err(format!("tools/list returned HTTP {status}: {}", body.chars().take(300).collect::<String>()));
+        return Err(format!("{method} returned HTTP {status}: {}", body.chars().take(300).collect::<String>()));
     }
-    tools_from(&reply_with_id(&body, 2).ok_or("the tools/list reply held no JSON-RPC response")?)
+    reply_with_id(&body, 2).ok_or_else(|| format!("the {method} reply held no JSON-RPC response"))
 }
 
 /// The JSON-RPC response with `id` in a streamable-HTTP body: plain JSON, or

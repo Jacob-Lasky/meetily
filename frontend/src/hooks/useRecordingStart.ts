@@ -228,6 +228,10 @@ export function useRecordingStart(
           console.log('Auto-starting recording from navigation...');
           setIsAutoStarting(true);
           sessionStorage.removeItem('autoStartRecording'); // Clear the flag
+          // A start from the calendar (WORK-677) names the meeting after the
+          // calendar event; read it once, whatever happens next.
+          const calendarTitle = sessionStorage.getItem('autoStartMeetingTitle')?.trim() || null;
+          sessionStorage.removeItem('autoStartMeetingTitle');
 
           // Check the selected transcription model before starting.
           const modelReady = await checkModelReady();
@@ -239,8 +243,8 @@ export function useRecordingStart(
 
           // Start the actual backend recording
           try {
-            // Generate meeting title
-            const generatedMeetingTitle = generateMeetingTitle();
+            // The calendar event's title, else a generated one
+            const generatedMeetingTitle = calendarTitle ?? generateMeetingTitle();
 
             // Set STARTING status before initiating backend recording
             setStatus(RecordingStatus.STARTING, 'Initializing recording...');

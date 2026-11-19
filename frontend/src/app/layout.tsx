@@ -21,6 +21,7 @@ import { OnboardingProvider } from '@/contexts/OnboardingContext'
 import { OnboardingFlow } from '@/components/onboarding'
 import { loadBetaFeatures } from '@/types/betaFeatures'
 import { DownloadProgressToastProvider } from '@/components/shared/DownloadProgressToast'
+import { CalendarAutoRecordNotice } from '@/components/CalendarAutoRecordNotice'
 import { UpdateCheckProvider } from '@/components/UpdateCheckProvider'
 import { RecordingPostProcessingProvider } from '@/contexts/RecordingPostProcessingProvider'
 import { ImportAudioDialog, ImportDropOverlay } from '@/components/ImportAudio'
@@ -248,6 +249,8 @@ export default function RootLayout({
                             <ImportDialogProvider onOpen={handleOpenImportDialog}>
                               {/* Download progress toast provider - listens for background downloads */}
                               <DownloadProgressToastProvider />
+                              {/* Recordings the calendar starts or stops (WORK-677) */}
+                              <CalendarAutoRecordNotice />
 
                               {/* Show onboarding or main app */}
                               {showOnboarding ? (

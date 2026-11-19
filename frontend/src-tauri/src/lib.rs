@@ -39,6 +39,7 @@ macro_rules! perf_trace {
 pub mod analytics;
 pub mod api;
 pub mod audio;
+pub mod calendar;
 pub mod config;
 pub mod console_utils;
 pub mod database;
@@ -636,6 +637,10 @@ pub fn run() {
                 log::error!("Failed to create system tray: {}", e);
             }
 
+            // Calendar: auto-record and meeting prep (WORK-677). Idle until
+            // a calendar server is set and one of the two is on.
+            calendar::start(_app.handle());
+
             // Initialize notification system with proper defaults
             log::info!("Initializing notification system...");
             let app_for_notif = _app.handle().clone();
@@ -881,6 +886,11 @@ pub fn run() {
             live_assist::ai_assist_set_brief,
             live_assist::ai_assist_prompt_preview,
             live_assist::ai_assist_find_meetings,
+            calendar::calendar_get_settings,
+            calendar::calendar_save_settings,
+            calendar::calendar_upcoming,
+            calendar::calendar_prepare_now,
+            calendar::calendar_cancel_auto_record,
             live_assist::ai_assist_test_mcp,
             live_assist::ai_assist_test_builtin_docs,
             live_assist::ai_assist_test_builtin_pipecat_daily,

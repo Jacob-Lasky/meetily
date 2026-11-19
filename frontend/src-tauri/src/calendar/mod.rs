@@ -345,8 +345,36 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
 
 async fn tick<R: Runtime>(app: &AppHandle<R>) {
     let settings = load_settings(app);
+    let now = Utc::now();
+    let recording = crate::audio::recording_commands::is_recording().await;
+    // A recording the calendar started is stopped by it even after both
+    // switches were turned off mid-meeting.
+    if recording {
+        auto_stop_check(app, &settings, now);
+    }
     if !settings.active() {
         return;
+    }
+    // Start and prep run on the events already read, before any refresh: a
+    // slow calendar read must not delay a meeting's start.
+    let briefs = load_briefs(app);
+    let events: Vec<CalEvent> = STATE.lock().unwrap().events.clone();
+    // A start asked for but not begun yet counts as recording, so a second
+    // meeting due in the same moment is not started over it.
+    let mut busy = recording || STATE.lock().unwrap().pending.as_ref().is_some_and(|(_, at)| at.elapsed() < PENDING_TTL);
+    for ev in events.iter().filter(|e| qualifies(e, &settings.rules).is_ok()) {
+        if settings.auto_prep && prep_due(ev, now, &settings, briefs.contains_key(&ev.id)) {
+            spawn_prep(app, ev.clone(), false);
+        }
+        if settings.auto_record && start_due(ev, now) {
+            // Keyed by start time too: a meeting moved after its start was
+            // handled is started again at its new time.
+            let first = STATE.lock().unwrap().handled.insert(handled_key(ev));
+            if first {
+                begin(app, ev.clone(), busy).await;
+                busy = true;
+            }
+        }
     }
     let due = {
         let mut st = STATE.lock().unwrap();
@@ -357,25 +385,10 @@ async fn tick<R: Runtime>(app: &AppHandle<R>) {
     if due {
         refresh(app, &settings).await;
     }
-    let now = Utc::now();
-    let recording = crate::audio::recording_commands::is_recording().await;
-    let briefs = load_briefs(app);
-    let events: Vec<CalEvent> = STATE.lock().unwrap().events.clone();
+}
 
-    for ev in events.iter().filter(|e| qualifies(e, &settings.rules).is_ok()) {
-        if settings.auto_prep && prep_due(ev, now, &settings, briefs.contains_key(&ev.id)) {
-            spawn_prep(app, ev.clone(), false);
-        }
-        if settings.auto_record && start_due(ev, now) {
-            let first = STATE.lock().unwrap().handled.insert(ev.id.clone());
-            if first {
-                begin(app, ev.clone(), recording).await;
-            }
-        }
-    }
-    if recording {
-        auto_stop_check(app, &settings, now);
-    }
+fn handled_key(ev: &CalEvent) -> String {
+    format!("{}@{}", ev.id, ev.start.timestamp())
 }
 
 fn prep_due(ev: &CalEvent, now: DateTime<Utc>, settings: &CalendarSettings, have_brief: bool) -> bool {
@@ -782,7 +795,7 @@ pub async fn calendar_upcoming<R: Runtime>(
                 brief_state,
                 brief_error: failure.map(|f| f.2.clone()),
                 brief,
-                handled: st.handled.contains(&e.id),
+                handled: st.handled.contains(&handled_key(&e)),
                 id: e.id,
                 title: e.title,
                 start: e.start,

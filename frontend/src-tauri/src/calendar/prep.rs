@@ -178,7 +178,7 @@ pub fn user_prompt(ev: &CalEvent, earlier: &[EarlierMeeting], knowledge: Option<
         out.push_str(&format!("Invited ({}):\n", others.len()));
         for a in others.iter().take(MAX_LISTED) {
             let name = a.name.as_deref().map(|n| format!("{} ", fence(n))).unwrap_or_default();
-            out.push_str(&format!("- {name}<{}> {}{}\n", fence(&a.email), a.response, if a.optional { ", optional" } else { "" }));
+            out.push_str(&format!("- {name}<{}> {}{}\n", fence(&a.email), fence(&a.response), if a.optional { ", optional" } else { "" }));
         }
         if others.len() > MAX_LISTED {
             out.push_str(&format!("- and {} more\n", others.len() - MAX_LISTED));

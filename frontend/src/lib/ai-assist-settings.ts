@@ -148,20 +148,28 @@ export function joinCommand(command: string, args: string[]): string {
   return [command, ...args].filter((_, i) => i > 0 || command).map(q).join(' ');
 }
 
-/** The DeepHive MCP server on Jake's machines (mcp-connector stdio relay). */
-export function deepHiveServer(home: string): McpServer {
+/**
+ * The mcp-connector stdio relay on Jake's work machines, serving
+ * `connector` (it reads the shared credential itself; nothing secret here).
+ */
+export function connectorServer(home: string, name: string, connector: string, allowedTools: string[]): McpServer {
   return {
     id: newId('mcp'),
-    name: 'DeepHive',
+    name,
     enabled: true,
     transport: 'stdio',
     command: `${home.replace(/\/$/, '')}/.claude/skills/mcp-connector/scripts/mcp-connector`,
-    args: ['serve', 'deephive'],
+    args: ['serve', connector],
     env: {},
     url: '',
     headers: {},
-    allowedTools: ['search_knowledge'],
+    allowedTools,
   };
+}
+
+/** The DeepHive MCP server on Jake's machines (mcp-connector stdio relay). */
+export function deepHiveServer(home: string): McpServer {
+  return connectorServer(home, 'DeepHive', 'deephive', ['search_knowledge']);
 }
 
 /** Text appended to the brief for one earlier meeting. */

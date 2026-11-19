@@ -2,7 +2,8 @@
 // src-tauri/src/calendar (CalendarSettings, Rules, Lookup, PreparedBrief,
 // Upcoming, AutoRecordEvent); DO NOT rename a field or event here alone.
 
-import { newId, type McpServer } from '@/lib/ai-assist-settings';
+import { newId, type McpServer } from './ai-assist-settings';
+export { connectorServer } from './ai-assist-settings';
 
 /** Emitted when the calendar starts, stops or skips a recording (calendar::AUTO_RECORD_EVENT). */
 export const CALENDAR_AUTO_RECORD_EVENT = 'calendar-auto-record';
@@ -89,22 +90,6 @@ export const DEFAULT_CALENDAR_SETTINGS: CalendarSettings = {
   stopAfterSilenceMinutes: 3,
   lookup: null,
 };
-
-/** The mcp-connector relay on Jake's work machines, serving `connector`. */
-export function connectorServer(home: string, name: string, connector: string, allowedTools: string[]): McpServer {
-  return {
-    id: newId('mcp'),
-    name,
-    enabled: true,
-    transport: 'stdio',
-    command: `${home.replace(/\/$/, '')}/.claude/skills/mcp-connector/scripts/mcp-connector`,
-    args: ['serve', connector],
-    env: {},
-    url: '',
-    headers: {},
-    allowedTools,
-  };
-}
 
 /** A blank server for the calendar or lookup field. */
 export function blankServer(name: string): McpServer {

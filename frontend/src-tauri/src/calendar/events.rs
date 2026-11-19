@@ -307,9 +307,9 @@ pub fn qualifies(ev: &CalEvent, rules: &Rules) -> Result<(), String> {
 /// Meetily meetings feed the brief.
 pub fn is_interview(ev: &CalEvent) -> bool {
     let title = ev.title.to_lowercase();
-    let description = ev.description.to_lowercase();
-    title.contains("interview")
-        || ["ashbyhq.com", "greenhouse.io", "lever.co", "workable.com"].iter().any(|d| description.contains(d))
+    let details = format!("{} {}", ev.description, ev.location).to_lowercase();
+    ["interview", "candidate", "hiring"].iter().any(|w| title.contains(w))
+        || ["ashbyhq.com", "greenhouse.io", "lever.co", "workable.com"].iter().any(|d| details.contains(d))
 }
 
 #[cfg(test)]
@@ -476,5 +476,10 @@ mod tests {
         e.description.clear();
         e.title = "Final INTERVIEW: Sam".into();
         assert!(is_interview(&e));
+        e.title = "Candidate screen - Sam".into();
+        assert!(is_interview(&e));
+        e.title = "Chat with Sam".into();
+        e.location = "https://jobs.lever.co/acme/123".into();
+        assert!(is_interview(&e), "a scheduler link in the location counts too");
     }
 }

@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
@@ -74,6 +74,11 @@ struct SummaryCacheSource {
     max_tokens: Option<u32>,
     temperature: Option<f32>,
     top_p: Option<f32>,
+    /// The meeting brief the summary read (WORK-676). None, and absent from
+    /// the JSON, when there was no brief, so a cache written before briefs
+    /// existed still matches a meeting without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    brief_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -109,6 +114,7 @@ fn build_summary_cache_source(
     max_tokens: Option<u32>,
     temperature: Option<f32>,
     top_p: Option<f32>,
+    meeting_brief: Option<&str>,
 ) -> SummaryCacheSource {
     SummaryCacheSource {
         transcript_fingerprint: stable_text_fingerprint(text),
@@ -123,6 +129,7 @@ fn build_summary_cache_source(
         max_tokens,
         temperature,
         top_p,
+        brief_fingerprint: meeting_brief.map(stable_text_fingerprint),
     }
 }
 
@@ -266,30 +273,49 @@ impl SummaryService {
         }
     }
 
-    async fn read_detected_summary_language(
-        pool: &SqlitePool,
-        meeting_id: &str,
-    ) -> Option<String> {
+    /// The meeting's recording folder, if it has one.
+    async fn meeting_folder(pool: &SqlitePool, meeting_id: &str) -> Option<PathBuf> {
         let meeting = match MeetingsRepository::get_meeting_metadata(pool, meeting_id).await {
             Ok(Some(meeting)) => meeting,
             Ok(None) => {
-                warn!("Meeting not found while reading detected summary language: {}", meeting_id);
+                warn!("Meeting not found while reading its folder: {}", meeting_id);
                 return None;
             }
             Err(e) => {
                 warn!(
-                    "Failed to read meeting metadata for detected summary language (meeting_id={}): {}",
+                    "Failed to read meeting metadata for its folder (meeting_id={}): {}",
                     meeting_id, e
                 );
                 return None;
             }
         };
+        meeting
+            .folder_path
+            .filter(|p| !p.trim().is_empty())
+            .map(PathBuf::from)
+    }
 
-        let Some(folder_path) = meeting.folder_path.filter(|p| !p.trim().is_empty()) else {
-            return None;
-        };
+    /// The brief kept with the meeting when its recording stopped
+    /// (`live-assist.json` in its folder, WORK-676). Read on every run, so a
+    /// regenerate from the meeting page uses it too. A file that cannot be
+    /// read gives a summary without the brief, never a failed summary.
+    fn read_meeting_brief(folder: Option<&Path>, meeting_id: &str) -> Option<String> {
+        match crate::live_assist::read_meeting_brief(folder?) {
+            Ok(brief) => brief,
+            Err(e) => {
+                warn!(
+                    "Summary for meeting_id={} runs without its meeting brief: {}",
+                    meeting_id, e
+                );
+                None
+            }
+        }
+    }
 
-        match read_detected_summary_language_from_metadata(Path::new(&folder_path)) {
+    fn read_detected_summary_language(folder: Option<&Path>, meeting_id: &str) -> Option<String> {
+        let folder_path = folder?;
+
+        match read_detected_summary_language_from_metadata(folder_path) {
             Ok(language) => language,
             Err(e) => {
                 warn!(
@@ -422,10 +448,11 @@ impl SummaryService {
             info!("📝 Summary language preference: {}", code);
         }
 
+        let folder = Self::meeting_folder(&pool, &meeting_id).await;
         let detected_summary_language =
-            Self::read_detected_summary_language(&pool, &meeting_id)
-                .await
+            Self::read_detected_summary_language(folder.as_deref(), &meeting_id)
                 .or_else(|| Self::detect_summary_language_from_text(&text));
+        let meeting_brief = Self::read_meeting_brief(folder.as_deref(), &meeting_id);
 
         if let Some(code) = &detected_summary_language {
             info!("📝 Detected transcript summary language: {}", code);
@@ -454,6 +481,7 @@ impl SummaryService {
             custom_openai_max_tokens,
             custom_openai_temperature,
             custom_openai_top_p,
+            meeting_brief.as_deref(),
         );
 
         let cached_english = match SummaryProcessesRepository::get_summary_data(&pool, &meeting_id).await {
@@ -504,6 +532,7 @@ impl SummaryService {
             summary_language.as_deref(),
             detected_summary_language.as_deref(),
             cached_english.as_deref(),
+            meeting_brief.as_deref(),
         )
         .await;
 
@@ -741,6 +770,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -849,6 +879,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ),
             build_summary_cache_source(
                 "transcript body",
@@ -859,6 +890,7 @@ mod tests {
                 "ollama",
                 "gemma3:1b",
                 Some("http://localhost:11434"),
+                None,
                 None,
                 None,
                 None,
@@ -877,6 +909,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ),
             build_summary_cache_source(
                 "transcript body",
@@ -887,6 +920,7 @@ mod tests {
                 "openai",
                 "gemma3:1b",
                 Some("http://localhost:11434"),
+                None,
                 None,
                 None,
                 None,
@@ -905,6 +939,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ),
             build_summary_cache_source(
                 "transcript body",
@@ -915,6 +950,7 @@ mod tests {
                 "ollama",
                 "gemma3:1b",
                 Some("http://localhost:11500"),
+                None,
                 None,
                 None,
                 None,
@@ -933,6 +969,7 @@ mod tests {
                 Some(2048),
                 Some(0.2),
                 Some(0.9),
+                None,
             ),
         ];
 
@@ -1041,6 +1078,61 @@ mod tests {
         .unwrap();
         assert_eq!(result["reasoning_stripped"], true);
         assert!(result.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn a_changed_brief_rejects_the_cached_english_summary() {
+        let source = sample_cache_source();
+        let raw = build_summary_result_json(
+            "# Reunion\n## Points\nBonjour",
+            "# Meeting\n## Points\nHello",
+            source.clone(),
+            Some("fr"),
+            false,
+            false,
+        )
+        .unwrap()
+        .to_string();
+        let with_brief = SummaryCacheSource {
+            brief_fingerprint: Some(stable_text_fingerprint("Interview plan")),
+            ..source.clone()
+        };
+        assert_eq!(extract_cached_english_markdown(&raw, &with_brief, Some("de")).unwrap(), None);
+
+        let raw_with_brief = build_summary_result_json(
+            "# Reunion\n## Points\nBonjour",
+            "# Meeting\n## Points\nHello",
+            with_brief.clone(),
+            Some("fr"),
+            false,
+            false,
+        )
+        .unwrap()
+        .to_string();
+        let edited_brief = SummaryCacheSource {
+            brief_fingerprint: Some(stable_text_fingerprint("Interview plan, edited")),
+            ..source
+        };
+        assert_eq!(extract_cached_english_markdown(&raw_with_brief, &edited_brief, Some("de")).unwrap(), None);
+        assert!(extract_cached_english_markdown(&raw_with_brief, &with_brief, Some("de")).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_cache_written_before_briefs_still_matches_a_meeting_without_one() {
+        let source = sample_cache_source();
+        assert_eq!(source.brief_fingerprint, None);
+        let mut value = build_summary_result_json(
+            "# Reunion\n## Points\nBonjour",
+            "# Meeting\n## Points\nHello",
+            source.clone(),
+            Some("fr"),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(value["english_cache"]["source"].get("brief_fingerprint").is_none(), "no brief: the field is not written");
+        value["english_cache"]["source"].as_object_mut().unwrap().remove("brief_fingerprint");
+        assert!(extract_cached_english_markdown(&value.to_string(), &source, Some("de")).unwrap().is_some());
     }
 
     #[test]

@@ -1300,7 +1300,13 @@ async fn run_after_call<R: Runtime>(app: &AppHandle<R>, folder: &Path, brief: Op
 async fn write_after_call_now<R: Runtime>(app: &AppHandle<R>, folder: &Path, brief: Option<String>) -> Result<AfterCall, String> {
     let brief = match brief {
         Some(b) => b,
-        None => read_meeting_brief(folder)?.unwrap_or_default(),
+        // A damaged live-assist.json costs the brief, not the summary.
+        None => read_meeting_brief(folder)
+            .unwrap_or_else(|e| {
+                warn!("live assist: after-call summary without the brief: {e}");
+                None
+            })
+            .unwrap_or_default(),
     };
     let transcript = record::read_transcript(folder)?;
     if transcript.is_empty() {

@@ -85,12 +85,7 @@ export function tail(text: string, max: number): string {
   return `…${space > 0 && space < max / 3 ? cut.slice(space + 1) : cut}`;
 }
 
-/**
- * The card shown large: the newest unpinned card (pinned cards are the ones
- * Me already kept), or the newest pinned one when every card is pinned.
- */
+/** The card shown large: the newest one, pinned or not. */
 export function featuredCard(cards: readonly AssistCard[]): AssistCard | null {
-  const newest = (list: readonly AssistCard[]) =>
-    list.reduce<AssistCard | null>((best, c) => (!best || c.created_at_ms > best.created_at_ms ? c : best), null);
-  return newest(cards.filter((c) => !c.pinned)) ?? newest(cards);
+  return cards.reduce<AssistCard | null>((best, c) => (!best || c.created_at_ms > best.created_at_ms ? c : best), null);
 }

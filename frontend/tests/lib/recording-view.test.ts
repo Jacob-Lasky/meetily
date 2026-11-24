@@ -88,12 +88,12 @@ describe('transcript strip', () => {
 });
 
 describe('featured card', () => {
-  test('the newest unpinned card is the large one', () => {
-    expect(featuredCard([card('pin', 30, true), card('new', 20), card('old', 10)])?.id).toBe('new');
+  test('the newest card is the large one, pinned or not', () => {
+    expect(featuredCard([card('pin', 30, true), card('new', 20), card('old', 10)])?.id).toBe('pin');
+    expect(featuredCard([card('pin', 5, true), card('new', 20), card('old', 10)])?.id).toBe('new');
   });
 
-  test('all pinned: the newest pinned card; none: nothing', () => {
-    expect(featuredCard([card('a', 10, true), card('b', 20, true)])?.id).toBe('b');
+  test('no cards: nothing', () => {
     expect(featuredCard([])).toBe(null);
   });
 });

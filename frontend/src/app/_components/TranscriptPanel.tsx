@@ -46,6 +46,14 @@ export function TranscriptPanel({
   useEffect(() => {
     if (interimText) followBottom();
   }, [interimText, followBottom]);
+  // A panel mounted mid-call (back from another page, a layout switch, AI
+  // Assist mode's expanded transcript) starts at the top: join the bottom if
+  // the reader was following it. Same 150 ms wait as TranscriptContext's
+  // auto-scroll, so the rows are laid out first.
+  useEffect(() => {
+    const t = setTimeout(followBottom, 150);
+    return () => clearTimeout(t);
+  }, [followBottom]);
 
   // Convert transcripts to segments for virtualized view
   const segments = useMemo(() =>

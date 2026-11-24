@@ -93,6 +93,14 @@ describe('featured card', () => {
     expect(featuredCard([card('pin', 5, true), card('new', 20), card('old', 10)])?.id).toBe('new');
   });
 
+  test('one call\'s cards share a time: the first it made, and a pin does not move another into the slot', () => {
+    const batch = [card('assist-4-7', 50), card('assist-4-8', 50), card('assist-3-6', 40)];
+    expect(featuredCard(batch)?.id).toBe('assist-4-7');
+    // Pinning the batch's second card moves it to the front of the list.
+    const pinned = [{ ...batch[1], pinned: true }, batch[0], batch[2]];
+    expect(featuredCard(pinned)?.id).toBe('assist-4-7');
+  });
+
   test('no cards: nothing', () => {
     expect(featuredCard([])).toBe(null);
   });

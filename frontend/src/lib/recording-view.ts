@@ -85,7 +85,25 @@ export function tail(text: string, max: number): string {
   return `…${space > 0 && space < max / 3 ? cut.slice(space + 1) : cut}`;
 }
 
-/** The card shown large: the newest one, pinned or not. */
+/**
+ * Card number from its id: the engine numbers every card of a session in the
+ * order it made them (`{prefix}-{n}`, engine.rs `add_cards_with`). Pinning
+ * does not change it, unlike the list order.
+ */
+function cardNo(id: string): number {
+  const m = /-(\d+)$/.exec(id);
+  return m ? Number(m[1]) : Number.MAX_SAFE_INTEGER;
+}
+
+/**
+ * The card shown large: the newest one, pinned or not. Cards from one model
+ * call share `created_at_ms`; among those it is the first the call made (the
+ * top of that batch), so pinning a card never moves it into the large slot.
+ */
 export function featuredCard(cards: readonly AssistCard[]): AssistCard | null {
-  return cards.reduce<AssistCard | null>((best, c) => (!best || c.created_at_ms > best.created_at_ms ? c : best), null);
+  return cards.reduce<AssistCard | null>((best, c) => {
+    if (!best || c.created_at_ms > best.created_at_ms) return c;
+    if (c.created_at_ms === best.created_at_ms && cardNo(c.id) < cardNo(best.id)) return c;
+    return best;
+  }, null);
 }

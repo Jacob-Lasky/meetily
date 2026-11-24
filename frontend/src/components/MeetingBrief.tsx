@@ -15,21 +15,27 @@ const SAVE_DELAY_MS = 600;
  * (`ai_assist_set_brief`). Earlier meetings can be pulled in by searching
  * their titles and summaries. When the recording stops the brief is saved
  * with that meeting and the box is cleared for the next call.
+ *
+ * `autoOpen` (default true) opens the box when it holds a brief; AI Assist
+ * mode turns it off during a call so the brief does not push the cards down
+ * (WORK-757).
  */
-export function MeetingBrief({ defaultOpen }: { defaultOpen: boolean }) {
+export function MeetingBrief({ defaultOpen, autoOpen = true }: { defaultOpen: boolean; autoOpen?: boolean }) {
   const [brief, setBrief] = useState('');
   const [open, setOpen] = useState(defaultOpen);
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<EarlierMeeting[] | null>(null);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const latest = useRef('');
+  const autoOpenRef = useRef(autoOpen);
+  autoOpenRef.current = autoOpen;
 
   useEffect(() => {
     invoke<string>('ai_assist_get_brief')
       .then((b) => {
         latest.current = b;
         setBrief(b);
-        if (b) setOpen(true);
+        if (b && autoOpenRef.current) setOpen(true);
       })
       .catch((e) => console.error('ai assist: could not load the brief', e));
     // Only the brief that was kept with the stopped meeting is cleared: a
@@ -52,7 +58,7 @@ export function MeetingBrief({ defaultOpen }: { defaultOpen: boolean }) {
       if (latest.current.trim() !== '') return;
       latest.current = e.payload.brief;
       setBrief(e.payload.brief);
-      setOpen(true);
+      if (autoOpenRef.current) setOpen(true);
     });
     return () => {
       unlisten.then((un) => un());

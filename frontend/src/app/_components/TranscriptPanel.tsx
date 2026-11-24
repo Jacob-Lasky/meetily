@@ -24,12 +24,15 @@ interface TranscriptPanelProps {
   isProcessingStop: boolean;
   isStopping: boolean;
   showModal: (name: ModalType, message?: string) => void;
+  /** Narrow column (AI Assist mode's expanded transcript): use the full width. */
+  compact?: boolean;
 }
 
 export function TranscriptPanel({
   isProcessingStop,
   isStopping,
-  showModal
+  showModal,
+  compact = false,
 }: TranscriptPanelProps) {
   // Contexts
   const { transcripts, transcriptContainerRef, copyTranscript, followBottom } = useTranscripts();
@@ -112,7 +115,7 @@ export function TranscriptPanel({
       {/* Transcript content */}
       <div className="pb-20">
         <div className="flex justify-center">
-          <div className="w-2/3 max-w-[750px]">
+          <div className={compact ? 'w-full px-3' : 'w-2/3 max-w-[750px]'}>
             <VirtualizedTranscriptView
               segments={segments}
               isRecording={isRecording}

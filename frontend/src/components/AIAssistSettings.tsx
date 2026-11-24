@@ -11,6 +11,7 @@ import { Input } from './ui/input';
 import { Switch } from './ui/switch';
 import { Textarea } from './ui/textarea';
 import { LiveAssistSettings } from './LiveAssistSettings';
+import { RecordingViewSettings } from './RecordingViewSettings';
 import {
   AssistSettings,
   DEFAULT_SETTINGS,
@@ -158,6 +159,7 @@ export function AIAssistSettings() {
   return (
     <div className="space-y-6 mt-6 pb-24" data-testid="ai-assist-settings">
       <LiveAssistSettings />
+      <RecordingViewSettings />
 
       <ModelSection form={form} update={update} summaryModel={summaryModel} />
 

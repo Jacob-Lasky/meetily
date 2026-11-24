@@ -12,6 +12,10 @@ import Analytics from '@/lib/analytics';
 import { SettingsModals } from './_components/SettingsModal';
 import { TranscriptPanel } from './_components/TranscriptPanel';
 import { LiveAssistPanel } from '@/components/LiveAssistPanel';
+import { AssistModeView } from '@/components/AssistModeView';
+import { useLiveAssist } from '@/hooks/useLiveAssist';
+import { useRecordingView } from '@/hooks/useRecordingView';
+import { effectiveView } from '@/lib/recording-view';
 import { useModalState } from '@/hooks/useModalState';
 import { useRecordingStateSync } from '@/hooks/useRecordingStateSync';
 import { useRecordingStart } from '@/hooks/useRecordingStart';
@@ -61,6 +65,12 @@ export default function Home() {
   } = useTranscriptRecovery();
 
   const router = useRouter();
+
+  // Live assist state lives here, not in a layout, so switching between the
+  // transcript-first layout and AI Assist mode mid-call keeps every card.
+  const assist = useLiveAssist(recordingState.isRecording);
+  const [recordingView, setRecordingView] = useRecordingView();
+  const layout = effectiveView(recordingView, assist.enabled);
 
   useEffect(() => {
     // Track page view
@@ -208,12 +218,33 @@ export default function Home() {
         onLoadPreview={loadMeetingTranscripts}
       />
       <div className="flex flex-1 overflow-hidden">
-        <TranscriptPanel
-          isProcessingStop={isProcessingStop}
-          isStopping={isStopping}
-          showModal={showModal}
-        />
-        <LiveAssistPanel isRecording={recordingState.isRecording} />
+        {layout === 'assist' ? (
+          <AssistModeView
+            isRecording={recordingState.isRecording}
+            assist={assist}
+            view={recordingView}
+            onViewChange={setRecordingView}
+            isProcessingStop={isProcessingStop}
+            isStopping={isStopping}
+            showModal={showModal}
+          />
+        ) : (
+          <>
+            <TranscriptPanel
+              isProcessingStop={isProcessingStop}
+              isStopping={isStopping}
+              showModal={showModal}
+            />
+            {assist.enabled && (
+              <LiveAssistPanel
+                isRecording={recordingState.isRecording}
+                assist={assist}
+                view={recordingView}
+                onViewChange={setRecordingView}
+              />
+            )}
+          </>
+        )}
 
         {/* Recording controls - only show when permissions are granted or already recording and not showing status messages */}
         {(hasMicrophone || isRecording) &&

@@ -20,6 +20,8 @@ export const BRIEF_ORIGIN = 'brief';
 export const ASSIST_BRIEF_CLEARED_EVENT = 'assist-brief-cleared';
 /** The after-call summary of a meeting folder is being written, or finished (WORK-672). */
 export const ASSIST_AFTER_CALL_EVENT = 'assist-after-call';
+/** A brief prepared from the calendar was put into the empty box (WORK-677, live_assist::BRIEF_LOADED_EVENT). */
+export const ASSIST_BRIEF_LOADED_EVENT = 'assist-brief-loaded';
 
 export type AssistCardKind = 'answer' | 'ask' | 'fact' | 'todo';
 

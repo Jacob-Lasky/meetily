@@ -1213,6 +1213,46 @@ async fn complete<R: Runtime>(
     Ok(completion.content)
 }
 
+/// One completion with the AI Assist model (default: the summary model),
+/// outside any call: the calendar's meeting prep (WORK-677). Thinking stays
+/// on (a brief is written once, minutes ahead, so quality beats speed) and
+/// nothing is cached.
+pub async fn complete_with_assist_model<R: Runtime>(
+    app: &AppHandle<R>,
+    system: &str,
+    prompt: &str,
+    max_tokens: u32,
+    timeout: Duration,
+) -> Result<String, String> {
+    let settings = load_settings(app);
+    let (_, model, target) = assist_target(app, &settings).await?;
+    let app_data_dir = app.path().app_data_dir().ok();
+    let options = CompletionOptions {
+        claude_max_tokens: max_tokens,
+        claude_thinking_off: false,
+        claude_cache_system: false,
+        timeout,
+    };
+    let completion = generate_completion(
+        &HTTP,
+        &target.provider,
+        &model,
+        &target.api_key,
+        system,
+        prompt,
+        target.ollama_endpoint.as_deref(),
+        target.custom_openai_endpoint.as_deref(),
+        target.custom_openai_max_tokens,
+        target.custom_openai_temperature,
+        target.custom_openai_top_p,
+        app_data_dir.as_ref(),
+        None,
+        &options,
+    )
+    .await?;
+    Ok(completion.content)
+}
+
 // ============================================================================
 // AFTER-CALL OUTPUT (WORK-672)
 // ============================================================================
@@ -1485,6 +1525,38 @@ pub fn set_brief<R: Runtime>(app: &AppHandle<R>, brief: &str) -> Result<(), Stri
     Ok(())
 }
 
+/// Put a brief prepared for a calendar meeting (WORK-677) into the box, but
+/// only while the box is empty: a brief Me typed always wins over a prepared
+/// one. Compare-and-set under `CONTEXT_SAVE`, so a brief typed and saved in
+/// the meantime is never overwritten. Returns whether it was loaded; on a
+/// load the frontend's box is told through `BRIEF_LOADED_EVENT`.
+pub fn load_prepared_brief<R: Runtime>(app: &AppHandle<R>, brief: &str) -> Result<bool, String> {
+    {
+        let _guard = CONTEXT_SAVE.lock().unwrap();
+        if !load_brief(app).trim().is_empty() {
+            return Ok(false);
+        }
+        let total = load_settings(app).context_chars(brief.chars().count());
+        if total > settings::MAX_CONTEXT_CHARS {
+            return Err(format!(
+                "the prepared brief would bring about me, the knowledge and the brief to {total} characters; the limit is {}",
+                settings::MAX_CONTEXT_CHARS
+            ));
+        }
+        let store = app.store(SETTINGS_STORE).map_err(|e| format!("settings store unavailable: {e}"))?;
+        store.set(BRIEF_KEY, serde_json::Value::String(brief.to_string()));
+        store.save().map_err(|e| format!("could not save the meeting brief: {e}"))?;
+    }
+    reconfigure_session();
+    if let Err(e) = app.emit(BRIEF_LOADED_EVENT, serde_json::json!({ "brief": brief })) {
+        error!("live assist: failed to emit brief-loaded: {e}");
+    }
+    Ok(true)
+}
+
+/// A prepared brief was put into the empty box (WORK-677).
+pub const BRIEF_LOADED_EVENT: &str = "assist-brief-loaded";
+
 /// Held while settings or the brief are checked against the shared context
 /// limit and stored.
 static CONTEXT_SAVE: Mutex<()> = Mutex::new(());
@@ -1727,13 +1799,13 @@ pub async fn ai_assist_prompt_preview<R: Runtime>(app: AppHandle<R>, settings: A
 }
 
 /// An earlier meeting the brief can draw on.
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Debug)]
 pub struct EarlierMeeting {
-    id: String,
-    title: String,
-    created_at: String,
+    pub id: String,
+    pub title: String,
+    pub created_at: String,
     /// The summary's opening, plain text; empty when it has no summary yet.
-    summary: String,
+    pub summary: String,
 }
 
 /// Most characters of one earlier meeting's summary put in the brief.
@@ -1749,25 +1821,38 @@ pub async fn ai_assist_find_meetings(
     query: String,
 ) -> Result<Vec<EarlierMeeting>, String> {
     let words: Vec<String> = query.split_whitespace().take(6).map(|w| w.to_lowercase()).collect();
+    Ok(recent_meetings(state.db_manager.pool())
+        .await?
+        .into_iter()
+        .filter(|m| {
+            let haystack = format!("{} {}", m.title.to_lowercase(), m.summary.to_lowercase());
+            words.iter().all(|w| haystack.contains(w.as_str()))
+        })
+        .take(12)
+        .map(|m| EarlierMeeting { summary: clip_chars(&m.summary, EARLIER_SUMMARY_CHARS), ..m })
+        .collect())
+}
+
+/// The newest 400 meetings with their full plain summary text (empty when
+/// there is none yet), newest first. Shared by the brief's search and the
+/// calendar's meeting prep (WORK-677).
+pub async fn recent_meetings(pool: &sqlx::SqlitePool) -> Result<Vec<EarlierMeeting>, String> {
     let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
         "SELECT m.id, m.title, m.created_at, sp.result FROM meetings m \
          LEFT JOIN summary_processes sp ON sp.meeting_id = m.id \
          ORDER BY m.created_at DESC LIMIT 400",
     )
-    .fetch_all(state.db_manager.pool())
+    .fetch_all(pool)
     .await
     .map_err(|e| format!("could not read meetings: {e}"))?;
     Ok(rows
         .into_iter()
-        .filter_map(|(id, title, created_at, result)| {
-            let summary = result.as_deref().map(summary_text).unwrap_or_default();
-            let haystack = format!("{} {}", title.to_lowercase(), summary.to_lowercase());
-            if !words.iter().all(|w| haystack.contains(w.as_str())) {
-                return None;
-            }
-            Some(EarlierMeeting { id, title, created_at, summary: clip_chars(&summary, EARLIER_SUMMARY_CHARS) })
+        .map(|(id, title, created_at, result)| EarlierMeeting {
+            id,
+            title,
+            created_at,
+            summary: result.as_deref().map(summary_text).unwrap_or_default(),
         })
-        .take(12)
         .collect())
 }
 
@@ -1790,7 +1875,7 @@ fn summary_text(result: &str) -> String {
         .to_string()
 }
 
-fn clip_chars(text: &str, max: usize) -> String {
+pub(crate) fn clip_chars(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
     }
@@ -2220,7 +2305,16 @@ mod tests {
             })
         );
         let ts = include_str!("../../../src/lib/live-assist.ts");
-        for event in [ASSIST_UPDATE_EVENT, ASSIST_WITHDRAW_EVENT, ASSIST_STATUS_EVENT, ASSIST_RESEARCH_EVENT, ASSIST_BRIEF_EVENT, ASSIST_AFTER_CALL_EVENT] {
+        for event in [
+            ASSIST_UPDATE_EVENT,
+            ASSIST_WITHDRAW_EVENT,
+            ASSIST_STATUS_EVENT,
+            ASSIST_RESEARCH_EVENT,
+            ASSIST_BRIEF_EVENT,
+            ASSIST_AFTER_CALL_EVENT,
+            BRIEF_CLEARED_EVENT,
+            BRIEF_LOADED_EVENT,
+        ] {
             assert!(ts.contains(&format!("'{event}'")), "frontend does not listen for {event}");
         }
         assert!(ts.contains(&format!("BRIEF_ORIGIN = '{}'", engine::BRIEF_ORIGIN)), "frontend brief origin differs");

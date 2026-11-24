@@ -114,16 +114,33 @@ fn toggle_recording_handler<R: Runtime>(app: &AppHandle<R>) {
                 }
             }
         } else {
-            // Immediately show starting state
-            set_tray_state(&app_clone, RecordingState::Starting);
-
             log::info!("Emitting start recording event from tray");
-            if let Some(window) = app_clone.get_webview_window("main") {
-                let _ = window.eval("sessionStorage.setItem('autoStartRecording', 'true')"); // Set the flag to start recording automatically
-                let _ = window.eval("window.location.assign('/')");
-            }
+            request_start(&app_clone, None);
         }
     });
+}
+
+/// Start a recording through the frontend's own start path (the one the
+/// Record button and the tray use): flag `autoStartRecording` and load `/`.
+/// `title` names the meeting (the calendar's event title, WORK-677); None
+/// keeps the generated `Meeting <timestamp>` title. Returns false when there
+/// is no main window to start it in.
+pub fn request_start<R: Runtime>(app: &AppHandle<R>, title: Option<&str>) -> bool {
+    let Some(window) = app.get_webview_window("main") else {
+        log::error!("Recording start requested but there is no main window");
+        return false;
+    };
+    // Immediately show starting state
+    set_tray_state(app, RecordingState::Starting);
+    if let Some(title) = title {
+        // serde_json writes a valid, fully escaped JS string literal, so an
+        // event title cannot break out of it.
+        let literal = serde_json::to_string(title).unwrap_or_else(|_| "\"\"".to_string());
+        let _ = window.eval(&format!("sessionStorage.setItem('autoStartMeetingTitle', {literal})"));
+    }
+    let _ = window.eval("sessionStorage.setItem('autoStartRecording', 'true')"); // Set the flag to start recording automatically
+    let _ = window.eval("window.location.assign('/')");
+    true
 }
 
 fn pause_recording_handler<R: Runtime>(app: &AppHandle<R>) {
@@ -162,10 +179,20 @@ fn resume_recording_handler<R: Runtime>(app: &AppHandle<R>) {
 }
 
 fn stop_recording_handler<R: Runtime>(app: &AppHandle<R>) {
+    request_stop(app, true);
+}
+
+/// Stop the recording the way the tray's Stop does (save, then the frontend's
+/// post-processing through `recording-stop-complete`). `focus` raises the
+/// main window first, as a click on Stop does; the calendar's automatic stop
+/// (WORK-677) passes false so it does not pull the window over another app.
+pub fn request_stop<R: Runtime>(app: &AppHandle<R>, focus: bool) {
     // Immediately show stopping state
     set_tray_state(app, RecordingState::Stopping);
 
-    focus_main_window(app);
+    if focus {
+        focus_main_window(app);
+    }
     let app_clone = app.clone();
     tauri::async_runtime::spawn(async move {
         log::info!("Tray: Stopping recording...");

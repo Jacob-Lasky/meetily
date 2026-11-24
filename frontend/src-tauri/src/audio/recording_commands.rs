@@ -646,6 +646,9 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     // Keep the recording manager's transcript (history sync, transcripts.json)
     // in step with the live events. Listener IDs are removed in stop_recording.
     register_transcript_listeners(&app, transcript_log);
+    // A brief prepared for the calendar meeting now on goes into an empty
+    // brief box before live assist reads it (WORK-677).
+    crate::calendar::on_recording_start(&app);
     // Live assist follows the same events; it is stopped first thing in
     // stop_recording. Pinned cards go to the meeting folder.
     crate::live_assist::start_session(&app, meeting_folder);
@@ -848,6 +851,9 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     // Keep the recording manager's transcript (history sync, transcripts.json)
     // in step with the live events. Listener IDs are removed in stop_recording.
     register_transcript_listeners(&app, transcript_log);
+    // A brief prepared for the calendar meeting now on goes into an empty
+    // brief box before live assist reads it (WORK-677).
+    crate::calendar::on_recording_start(&app);
     // Live assist follows the same events; it is stopped first thing in
     // stop_recording. Pinned cards go to the meeting folder.
     crate::live_assist::start_session(&app, meeting_folder);
@@ -913,6 +919,8 @@ async fn stop_recording_for_session<R: Runtime>(
     // call, not for the transcript drain below. The session itself keeps
     // following retractions until the drain ends (stop_session below).
     crate::live_assist::stop_calls(&app);
+    // A recording the calendar started is no longer its to stop (WORK-677).
+    crate::calendar::on_recording_stop();
 
     // Emit shutdown progress to frontend
     let _ = app.emit(

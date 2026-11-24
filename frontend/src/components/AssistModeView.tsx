@@ -11,12 +11,17 @@ import { useInterimTranscripts } from '@/hooks/useInterimTranscripts';
 import type { LiveAssist } from '@/hooks/useLiveAssist';
 import type { ModalType } from '@/hooks/useModalState';
 import { RecordingView, Side, featuredCard, stripLines, tail } from '@/lib/recording-view';
+import { MIC_IN_LABEL, SPEAKER_OUT_LABEL, speakerLabelClass } from '@/lib/transcript-speakers';
 
 const TRANSCRIPT_OPEN_KEY = 'assistModeTranscriptOpen';
 
 const SIDE_LABEL: Record<Side, string> = { them: 'Them', me: 'Me', other: 'Audio' };
-// Same channel colours as the transcript (lib/transcript-speakers).
-const SIDE_STYLE: Record<Side, string> = { them: 'text-emerald-600', me: 'text-blue-600', other: 'text-gray-500' };
+// The transcript's own channel colours.
+const SIDE_STYLE: Record<Side, string> = {
+  them: speakerLabelClass(SPEAKER_OUT_LABEL),
+  me: speakerLabelClass(MIC_IN_LABEL),
+  other: speakerLabelClass(''),
+};
 
 /**
  * The transcript shrunk to a strip: the latest words from each side, live

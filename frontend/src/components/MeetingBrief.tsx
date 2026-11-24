@@ -16,9 +16,9 @@ const SAVE_DELAY_MS = 600;
  * their titles and summaries. When the recording stops the brief is saved
  * with that meeting and the box is cleared for the next call.
  *
- * `autoOpen` (default true) opens the box when it holds a brief; AI Assist
- * mode turns it off during a call so the brief does not push the cards down
- * (WORK-757).
+ * `autoOpen` (default true) opens the box when it holds a brief. AI Assist
+ * mode passes false during a call, which also closes a box left open before
+ * the call, so the brief does not push the cards down (WORK-757).
  */
 export function MeetingBrief({ defaultOpen, autoOpen = true }: { defaultOpen: boolean; autoOpen?: boolean }) {
   const [brief, setBrief] = useState('');
@@ -29,6 +29,9 @@ export function MeetingBrief({ defaultOpen, autoOpen = true }: { defaultOpen: bo
   const latest = useRef('');
   const autoOpenRef = useRef(autoOpen);
   autoOpenRef.current = autoOpen;
+  useEffect(() => {
+    if (!autoOpen) setOpen(false);
+  }, [autoOpen]);
 
   useEffect(() => {
     invoke<string>('ai_assist_get_brief')

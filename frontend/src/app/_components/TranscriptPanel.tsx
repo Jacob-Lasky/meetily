@@ -69,9 +69,12 @@ export function TranscriptPanel({
   );
 
   return (
-    <div ref={transcriptContainerRef} className="w-full border-r border-gray-200 bg-white flex flex-col overflow-y-auto">
-      {/* Title area - Sticky header */}
-      <div className="sticky top-0 z-10 bg-white p-4 border-gray-200">
+    <div className="w-full border-r border-gray-200 bg-white flex flex-col overflow-hidden">
+      {/* Title area: above the scroller, not sticky inside it. DO NOT move it
+          back into the scroller as a sticky header: the recording status bar
+          is sticky top-0 in the same scroller, and the two stacked over each
+          other once the transcript scrolled (the bar hid Copy, WORK-757). */}
+      <div className="flex-shrink-0 bg-white p-4 border-gray-200">
         <div className="flex flex-col space-y-3">
           <div className="flex  flex-col space-y-2">
             <div className="flex justify-center  items-center space-x-2">
@@ -108,32 +111,34 @@ export function TranscriptPanel({
         </div>
       </div>
 
-      {/* Permission Warning - Not needed on Linux */}
-      {!isRecording && !isChecking && !isLinux && (
-        <div className="flex justify-center px-4 pt-4">
-          <PermissionWarning
-            hasMicrophone={hasMicrophone}
-            hasSystemAudio={hasSystemAudio}
-            onRecheck={checkPermissions}
-            isRechecking={isChecking}
-          />
-        </div>
-      )}
-
-      {/* Transcript content */}
-      <div className="pb-20">
-        <div className="flex justify-center">
-          <div className={compact ? 'w-full px-3' : 'w-2/3 max-w-[750px]'}>
-            <VirtualizedTranscriptView
-              segments={segments}
-              isRecording={isRecording}
-              isPaused={isPaused}
-              isProcessing={isProcessingStop}
-              isStopping={isStopping}
-              enableStreaming={isRecording && !interimReceiving}
-              showConfidence={true}
-              interimLines={interimLines}
+      <div ref={transcriptContainerRef} className="flex-1 min-h-0 overflow-y-auto">
+        {/* Permission Warning - Not needed on Linux */}
+        {!isRecording && !isChecking && !isLinux && (
+          <div className="flex justify-center px-4 pt-4">
+            <PermissionWarning
+              hasMicrophone={hasMicrophone}
+              hasSystemAudio={hasSystemAudio}
+              onRecheck={checkPermissions}
+              isRechecking={isChecking}
             />
+          </div>
+        )}
+
+        {/* Transcript content */}
+        <div className="pb-20">
+          <div className="flex justify-center">
+            <div className={compact ? 'w-full px-3' : 'w-2/3 max-w-[750px]'}>
+              <VirtualizedTranscriptView
+                segments={segments}
+                isRecording={isRecording}
+                isPaused={isPaused}
+                isProcessing={isProcessingStop}
+                isStopping={isStopping}
+                enableStreaming={isRecording && !interimReceiving}
+                showConfidence={true}
+                interimLines={interimLines}
+              />
+            </div>
           </div>
         </div>
       </div>

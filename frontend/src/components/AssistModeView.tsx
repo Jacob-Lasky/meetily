@@ -53,7 +53,7 @@ function TranscriptStrip({ onExpand }: { onExpand: () => void }) {
         className="flex-shrink-0 flex items-center gap-1 text-xs text-gray-500 hover:text-gray-900 mt-0.5"
       >
         <PanelRightOpen className="w-4 h-4" />
-        Transcript
+        Full transcript
       </button>
     </div>
   );

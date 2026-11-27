@@ -1,5 +1,6 @@
 import { VirtualizedTranscriptView } from '@/components/VirtualizedTranscriptView';
 import { PermissionWarning } from '@/components/PermissionWarning';
+import { RecordingStatusBar } from '@/components/RecordingStatusBar';
 import { Button } from '@/components/ui/button';
 import { ButtonGroup } from '@/components/ui/button-group';
 import { Copy, GlobeIcon } from 'lucide-react';
@@ -55,6 +56,10 @@ export function TranscriptPanel({
     return () => clearTimeout(t);
   }, [followBottom]);
 
+  // The transcript column: full width in a narrow column (AI Assist mode's
+  // expanded transcript), centred otherwise. The recording bar uses it too.
+  const column = compact ? 'w-full px-3' : 'w-2/3 max-w-[750px]';
+
   // Convert transcripts to segments for virtualized view
   const segments = useMemo(() =>
     transcripts.map(t => ({
@@ -70,10 +75,11 @@ export function TranscriptPanel({
 
   return (
     <div className="w-full border-r border-gray-200 bg-white flex flex-col overflow-hidden">
-      {/* Title area: above the scroller, not sticky inside it. DO NOT move it
-          back into the scroller as a sticky header: the recording status bar
-          is sticky top-0 in the same scroller, and the two stacked over each
-          other once the transcript scrolled (the bar hid Copy, WORK-757). */}
+      {/* Title area and recording bar: above the scroller, not sticky inside
+          it. DO NOT move them back into the scroller: as two sticky top-0
+          elements there the bar covered Copy once the transcript scrolled,
+          and as a sticky child of VirtualizedTranscriptView (whose own
+          overflow box does not scroll here) the bar scrolled away (WORK-757). */}
       <div className="flex-shrink-0 bg-white p-4 border-gray-200">
         <div className="flex flex-col space-y-3">
           <div className="flex  flex-col space-y-2">
@@ -109,6 +115,13 @@ export function TranscriptPanel({
             </div>
           </div>
         </div>
+        {isRecording && (
+          <div className="flex justify-center pt-3">
+            <div className={`${column} px-4`}>
+              <RecordingStatusBar isPaused={isPaused} />
+            </div>
+          </div>
+        )}
       </div>
 
       <div ref={transcriptContainerRef} className="flex-1 min-h-0 overflow-y-auto">
@@ -127,11 +140,12 @@ export function TranscriptPanel({
         {/* Transcript content */}
         <div className="pb-20">
           <div className="flex justify-center">
-            <div className={compact ? 'w-full px-3' : 'w-2/3 max-w-[750px]'}>
+            <div className={column}>
               <VirtualizedTranscriptView
                 segments={segments}
                 isRecording={isRecording}
                 isPaused={isPaused}
+                showStatusBar={false}
                 isProcessing={isProcessingStop}
                 isStopping={isStopping}
                 enableStreaming={isRecording && !interimReceiving}
